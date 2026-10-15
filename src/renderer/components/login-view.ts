@@ -1,43 +1,44 @@
 /*
  * Grungus — <login-view>: Matrix login card.
- * Emits "grungus:login" with { homeserver, username, password, accessToken }.
- * All actual client work happens in app.js.
+ * Emits "grungus:login" with LoginDetail. All client work happens in app.ts.
  */
-"use strict";
+import { el } from "./ui.ts";
 
-class LoginView extends HTMLElement {
-  constructor() {
-    super();
-    this._busy = false;
-    this._tokenMode = false;
-  }
+export interface LoginDetail {
+  homeserver: string;
+  username: string;
+  password: string;
+  accessToken: string | null;
+}
 
-  connectedCallback() {
+export class LoginView extends HTMLElement {
+  private _busy = false;
+  private _tokenMode = false;
+
+  connectedCallback(): void {
     this._render();
   }
 
-  setBusy(busy) {
+  setBusy(busy: boolean): void {
     this._busy = busy;
-    var btn = this.querySelector(".btn-primary");
+    const btn = this.querySelector<HTMLButtonElement>(".btn-primary");
     if (btn) btn.disabled = busy;
-    this.querySelectorAll(".field input").forEach(function (input) {
+    this.querySelectorAll<HTMLInputElement>(".field input").forEach((input) => {
       input.disabled = busy;
     });
   }
 
-  setStatus(message, isError) {
-    var status = this.querySelector(".login-status");
+  setStatus(message: string, isError: boolean): void {
+    const status = this.querySelector<HTMLElement>(".login-status");
     if (!status) return;
-    status.textContent = message || "";
+    status.textContent = message;
     status.classList.toggle("info", !isError);
   }
 
-  _render() {
-    var self = this;
+  private _render(): void {
     this.textContent = "";
-    this.classList.add("login-root");
 
-    var form = el("form", { class: "login-card", novalidate: true });
+    const form = el("form", { class: "login-card", novalidate: true }) as HTMLFormElement;
 
     form.appendChild(el("h1", { class: "login-logo", text: "Grungus" }));
     form.appendChild(
@@ -47,14 +48,15 @@ class LoginView extends HTMLElement {
       })
     );
 
-    var homeserverInput = el("input", {
+    const homeserverInput = el("input", {
       type: "text",
       id: "login-homeserver",
       value: "matrix.org",
       autocomplete: "url",
       spellcheck: "false",
-    });
-    var hsField = el("div", { class: "field" });
+    }) as HTMLInputElement;
+
+    const hsField = el("div", { class: "field" });
     hsField.appendChild(el("label", { for: "login-homeserver", text: "Homeserver" }));
     hsField.appendChild(homeserverInput);
     hsField.appendChild(
@@ -65,39 +67,39 @@ class LoginView extends HTMLElement {
     );
     form.appendChild(hsField);
 
-    var userInput = el("input", {
+    const userInput = el("input", {
       type: "text",
       id: "login-username",
       autocomplete: "username",
       spellcheck: "false",
       placeholder: this._tokenMode ? "" : "e.g. alice:matrix.org or alice",
-    });
-    var passInput = el("input", {
+    }) as HTMLInputElement;
+    const passInput = el("input", {
       type: "password",
       id: "login-password",
       autocomplete: "current-password",
       placeholder: "••••••••",
-    });
-    var tokenInput = el("input", {
+    }) as HTMLInputElement;
+    const tokenInput = el("input", {
       type: "password",
       id: "login-token",
       autocomplete: "off",
       spellcheck: "false",
       placeholder: "access token (syt_… / syj_… / MDAx…)",
-    });
+    }) as HTMLInputElement;
 
     if (!this._tokenMode) {
-      var userField = el("div", { class: "field" });
+      const userField = el("div", { class: "field" });
       userField.appendChild(el("label", { for: "login-username", text: "Username" }));
       userField.appendChild(userInput);
       form.appendChild(userField);
 
-      var passField = el("div", { class: "field" });
+      const passField = el("div", { class: "field" });
       passField.appendChild(el("label", { for: "login-password", text: "Password" }));
       passField.appendChild(passInput);
       form.appendChild(passField);
     } else {
-      var tokenField = el("div", { class: "field" });
+      const tokenField = el("div", { class: "field" });
       tokenField.appendChild(el("label", { for: "login-token", text: "Access token" }));
       tokenField.appendChild(tokenInput);
       tokenField.appendChild(
@@ -109,37 +111,35 @@ class LoginView extends HTMLElement {
       form.appendChild(tokenField);
     }
 
-    var submit = el(
-      "button",
-      { class: "btn-primary", type: "submit", disabled: this._busy },
-      "Log In"
+    form.appendChild(
+      el("button", { class: "btn-primary", type: "submit" }, "Log In")
     );
-    form.appendChild(submit);
     form.appendChild(el("div", { class: "login-status" }));
 
-    var toggle = el("div", { class: "login-toggle" });
-    var toggleLink = el(
-      "a",
-      { text: this._tokenMode ? "Log in with password instead" : "Log in with an access token instead" }
-    );
+    const toggle = el("div", { class: "login-toggle" });
+    const toggleLink = el("a", {
+      text: this._tokenMode
+        ? "Log in with password instead"
+        : "Log in with an access token instead",
+    });
     toggle.appendChild(toggleLink);
     form.appendChild(toggle);
 
-    toggleLink.addEventListener("click", function () {
-      self._tokenMode = !self._tokenMode;
-      self._render();
+    toggleLink.addEventListener("click", () => {
+      this._tokenMode = !this._tokenMode;
+      this._render();
     });
 
-    form.addEventListener("submit", function (event) {
+    form.addEventListener("submit", (event) => {
       event.preventDefault();
-      if (self._busy) return;
-      self.dispatchEvent(
-        new CustomEvent("grungus:login", {
+      if (this._busy) return;
+      this.dispatchEvent(
+        new CustomEvent<LoginDetail>("grungus:login", {
           detail: {
             homeserver: homeserverInput.value.trim(),
             username: userInput.value.trim(),
             password: passInput.value,
-            accessToken: self._tokenMode ? tokenInput.value.trim() : null,
+            accessToken: this._tokenMode ? tokenInput.value.trim() : null,
           },
           bubbles: true,
         })
@@ -151,3 +151,9 @@ class LoginView extends HTMLElement {
 }
 
 customElements.define("login-view", LoginView);
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "login-view": LoginView;
+  }
+}

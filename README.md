@@ -25,32 +25,44 @@ for an open protocol.
   a connection indicator; messages arrive live.
 - **Local echo** — sent messages render instantly, then reconcile with
   the server event (no duplicates, "failed to send" marking on errors).
+- **Images and GIFs** — `m.image` / `m.sticker` messages render inline
+  via authenticated media downloads; GIFs animate natively.
 - **Unread badges** — per-room counters, cleared when you open the room.
 - **Room creation** — inline "new room" form in the sidebar.
-- **Zero runtime dependencies** — the entire Matrix client is a single
-  dependency-free module; Electron is the only (dev) dependency.
+- **Strict TypeScript throughout** — typed Matrix event/sync shapes and
+  a typed client event bus; `tsc --noEmit` is the CI lint gate. The only
+  runtime dependency is Electron itself.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ Electron main process            src/main/                  │
-│   window lifecycle, session vault (safeStorage), IPC       │
-└───────────────┬─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ Electron main process   src/main/   →  dist/main.cjs           │
+│   window lifecycle, session vault (safeStorage), IPC           │
+└───────────────┬──────────────────────────────────────────────┘
                 │ contextBridge (contextIsolation, sandbox on)
-┌───────────────┴─────────────────────────────────────────────┐
-│ Renderer                        src/renderer/               │
-│                                                             │
-│   app.js ── orchestrates state and wiring                   │
-│     ├── services/matrix-client.js   Matrix CS API client    │
-│     └── components/*.js              custom elements:        │
-│           login-view, app-shell, space-rail, room-list,     │
-│           chat-view, message-item, member-list, g-avatar     │
-└─────────────────────────────────────────────────────────────┘
+┌───────────────┴──────────────────────────────────────────────┐
+│ Renderer                 src/renderer/ → dist/renderer.js     │
+│                                                               │
+│   app.ts ── orchestrates state and wiring                       │
+│     ├── services/matrix-client.ts  typed Matrix CS API client │
+│     └── components/*.ts             custom elements:           │
+│           login-view, app-shell, space-rail, room-list,        │
+│           chat-view, message-item, member-list, g-avatar       │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-- No build step, no bundler, no framework: classic scripts and native
-  custom elements. `src/renderer` also runs as a plain web page.
+- **esbuild** produces three outputs in `dist/`: the main process and
+  preload (CJS, `.cjs` because package.json is `type: module`) and the
+  renderer as ONE classic-script IIFE. A bundle is required: Chromium and
+  Electron block ES modules loaded from `file://` (CORS).
+- **Strict TypeScript end to end**: typed Matrix event/sync wire shapes,
+  a typed client event bus, a timeline item union
+  (`MessageItem | SystemItem`), and `HTMLElementTagNameMap` entries so
+  `document.createElement("chat-view")` returns the right element class.
+- **Tests and examples run the .ts sources directly** on Node ≥ 24 via
+  native type stripping — no separate build for the test suite.
+- No framework: native custom elements, one stylesheet.
 - The session (homeserver, user, access token) is stored encrypted via
   Electron's `safeStorage` when the platform keychain is available.
 - CSP: scripts and styles only from the app; `connect-src *` because the
@@ -74,6 +86,7 @@ Client-Server API (v3 paths, spec v1.x):
 | Join / invite | `POST /join/{idOrAlias}`, `POST /rooms/{id}/invite` |
 | Logout | `POST /_matrix/client/v3/logout` |
 | Avatars | `GET /_matrix/media/v3/thumbnail/…` (Bearer-authenticated media) |
+| Images / GIFs | `GET /_matrix/media/v3/download/…` (Bearer-authenticated media) |
 
 Room state (names, topics, members, spaces) is derived from
 `m.room.*` state events in the sync response, following the same model
@@ -83,18 +96,29 @@ Element uses.
 
 ```bash
 npm install
-npm start        # launch the desktop app
+npm start        # build + launch the desktop app
 ```
 
 Log in with your Matrix credentials (e.g. `matrix.org` + username +
 password), or with an access token from Element: Settings → Help & About.
 
-### Web demo mode
-
-The renderer is plain web tech — you can serve it without Electron:
+Other scripts:
 
 ```bash
-cd src/renderer && python3 -m http.server 8080
+npm run build      # esbuild -> dist/
+npm run typecheck  # tsc --noEmit (strict)
+npm test           # client suite vs the in-repo mock homeserver
+npm run smoke      # build + boot the app, then exit (--smoke)
+```
+
+### Web demo mode
+
+The renderer bundle is plain web tech and `dist/` is self-contained, so
+you can serve it without Electron:
+
+```bash
+npm run build
+cd dist && python3 -m http.server 8080
 # open http://localhost:8080
 ```
 
@@ -111,20 +135,24 @@ use the desktop app for day-to-day).
 - E2EE (Olm/Megolm) is **not** implemented yet — treat messages as
   server-readable until it lands (see roadmap).
 - Messages render as text only; HTML from other clients is not executed.
+- Media is fetched with authenticated requests (Bearer header) and
+  rendered from blob object URLs — compatible with homeservers that
+  require authenticated media (e.g. matrix.org).
 
 ## Testing
 
-Four layers, all driving the same client module that ships in the app:
+Four layers, all driving the same typed client module that ships in the app:
 
-1. **Syntax gate** — `npm run check` (`node --check` over every JS file).
+1. **Typecheck** — `npm run typecheck` (`tsc --noEmit`, strict, across
+   src/tests/examples).
 2. **Integration tests vs an in-repo mock homeserver** — `npm test`
    (login, sync, bidirectional messages, local echo, unread, DM
-   resolution, spaces, auth-error handling).
-3. **Real-homeserver e2e** — `tests/e2e-real-homeserver.js` (run manually
+   resolution, spaces, media metadata, auth-error handling).
+3. **Real-homeserver e2e** — `tests/e2e-real-homeserver.ts` (run manually
    against conduwuit/Synapse/matrix.org-style servers; exercises UIA
-   registration, real sync, real state events). See the header of that
-   file for the env vars.
-4. **CI** — syntax + tests + an Electron boot smoke test
+   registration, real sync, real state events, and authenticated media).
+   See the header of that file for the env vars.
+4. **CI** — typecheck + tests + an Electron boot smoke test
    (`electron . --smoke` under xvfb on ubuntu-latest).
 
 Small CLI tools in `examples/` (list-rooms, tail-room, send-message) use
@@ -132,11 +160,21 @@ the same client from Node — handy for debugging and demos.
 
 ## Roadmap
 
-- E2EE (Olm/Megolm) via libolm/WebAssembly
-- Invites UI (rooms.invite in sync), space management UI
-- Server-side read markers, presence, typing notifications
-- Media sending, message editing/reactions, reply chains
-- Notifications (Electron + Push Gateway)
+- **E2EE (Olm/Megolm)** — the highest-value item; blocks most call work
+  (see below) and private-room usability against other clients.
+- **Voice/video calls** — not supported today, and the largest feature on
+  this list. Native Matrix group calls (MSC3401, what Element Call uses)
+  sit on top of E2EE (call member auth and media keys flow through
+  Olm/Megolm) plus WebRTC media transport. Realistic sequence: E2EE →
+  call signaling over to-device events → WebRTC (ideally via an SFU).
+  Interim option: embed Element Call in a `<webview>` window before
+  native calls land. Legacy 1:1 calls (`m.call` events) are possible
+  without the full group-call stack but are deprecated in the ecosystem
+  and still need WebRTC — not worth doing before the MSC3401 path.
+- Invites UI (rooms.invite in sync), space management UI, media sending
+  from the composer, message editing/reactions, reply chains.
+- Server-side read markers, presence, typing notifications.
+- Notifications (Electron + Push Gateway).
 
 ## License
 

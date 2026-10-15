@@ -1,14 +1,16 @@
 {
   "name": "grungus",
   "productName": "Grungus",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "A Discord-style desktop chat client that speaks the Matrix protocol",
-  "main": "src/main/main.js",
+  "type": "module",
+  "main": "dist/main.cjs",
   "scripts": {
-    "start": "electron .",
-    "smoke": "electron . --smoke",
-    "check": "node scripts/check.js",
+    "start": "npm run build && electron .",
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "smoke": "npm run build && electron . --smoke",
     "test": "node --test"
   },
   "repository": {
@@ -16,11 +18,14 @@
     "url": "https://github.com/fletch13/grungus.git"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
   },
   "author": "fletch13",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^44.7.2"
+    "@types/node": "^26.6.5",
+    "electron": "^44.7.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
   }
 }

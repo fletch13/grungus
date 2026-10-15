@@ -639,6 +639,40 @@ message-item .avatar-col {
   color: #00a8fc;
 }
 
+/* inline media (images, GIFs, stickers) */
+
+.msg-media {
+  margin-top: 4px;
+  max-width: 400px;
+}
+
+.msg-media img {
+  max-width: 100%;
+  border-radius: 8px;
+  display: block;
+}
+
+.msg-media .msg-media-loading {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.msg-media-caption {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.msg-error {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-style: italic;
+}
+
+message-item.failed .msg-error {
+  color: var(--danger);
+}
+
 /* composer */
 
 .composer-wrap {

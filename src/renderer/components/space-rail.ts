@@ -3,31 +3,25 @@
  * Matrix Spaces map onto Discord servers; Home shows all joined rooms.
  * Emits "grungus:select-space" with { spaceId: string | null }.
  */
-"use strict";
+import { el } from "./ui.ts";
+import type { MatrixClient, Room } from "../services/matrix-client.ts";
 
-class SpaceRail extends HTMLElement {
-  constructor() {
-    super();
-    this._sig = "";
-  }
+export class SpaceRail extends HTMLElement {
+  private _spaces: Room[] = [];
+  private _selectedId: string | null = null;
+  private _client: MatrixClient | null = null;
+  private _sig = "";
 
-  connectedCallback() {
+  connectedCallback(): void {
     this._render();
   }
 
-  /**
-   * @param {Array} spaces  joined m.space rooms
-   * @param {string|null} selectedId  currently selected space id (null=Home)
-   * @param {MatrixClient} client
-   */
-  update(spaces, selectedId, client) {
-    var sig =
-      (selectedId || "null") +
+  update(spaces: Room[], selectedId: string | null, client: MatrixClient | null): void {
+    const sig =
+      (selectedId ?? "null") +
       "|" +
       spaces
-        .map(function (s) {
-          return [s.id, s.title, s.avatarMxc || ""].join(":");
-        })
+        .map((space) => [space.id, space.title, space.avatarMxc ?? ""].join(":"))
         .join(",");
     if (sig === this._sig) return;
     this._sig = sig;
@@ -37,34 +31,31 @@ class SpaceRail extends HTMLElement {
     this._render();
   }
 
-  _render() {
-    var self = this;
-    var spaces = this._spaces || [];
-    var client = this._client;
+  private _render(): void {
+    const spaces = this._spaces;
+    const client = this._client;
     this.textContent = "";
 
-    var home = el("button", {
+    const home = el("button", {
       class: "rail-btn" + (this._selectedId ? "" : " active"),
       title: "Home — all rooms",
       "aria-label": "Home",
     });
     home.appendChild(el("span", { class: "rail-indicator" }));
     home.appendChild(el("span", { text: "G" }));
-    home.addEventListener("click", function () {
-      self._select(null);
-    });
+    home.addEventListener("click", () => this._select(null));
     this.appendChild(home);
 
     this.appendChild(el("div", { class: "rail-sep" }));
 
-    spaces.forEach(function (space) {
-      var btn = el("button", {
-        class: "rail-btn" + (self._selectedId === space.id ? " active" : ""),
+    for (const space of spaces) {
+      const btn = el("button", {
+        class: "rail-btn" + (this._selectedId === space.id ? " active" : ""),
         title: space.title,
         "aria-label": space.title,
       });
       btn.appendChild(el("span", { class: "rail-indicator" }));
-      var av = document.createElement("g-avatar");
+      const av = document.createElement("g-avatar");
       av.update({
         name: space.title,
         userId: space.id,
@@ -73,18 +64,16 @@ class SpaceRail extends HTMLElement {
         load: client ? client.avatarSrc(space.avatarMxc, 48) : null,
       });
       btn.appendChild(av);
-      btn.addEventListener("click", function () {
-        self._select(space.id);
-      });
-      self.appendChild(btn);
-    });
+      btn.addEventListener("click", () => this._select(space.id));
+      this.appendChild(btn);
+    }
   }
 
-  _select(spaceId) {
-    if (spaceId === (this._selectedId || null)) return;
+  private _select(spaceId: string | null): void {
+    if (spaceId === (this._selectedId ?? null)) return;
     this.dispatchEvent(
       new CustomEvent("grungus:select-space", {
-        detail: { spaceId: spaceId },
+        detail: { spaceId },
         bubbles: true,
       })
     );
@@ -92,3 +81,9 @@ class SpaceRail extends HTMLElement {
 }
 
 customElements.define("space-rail", SpaceRail);
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "space-rail": SpaceRail;
+  }
+}

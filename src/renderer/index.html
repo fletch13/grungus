@@ -4,8 +4,8 @@
   <meta charset="utf-8" />
   <!--
     CSP: scripts/styles only from this app; images from blob/data (generated
-    avatars); network connections allowed to any origin because the
-    homeserver URL is user-configured.
+    avatars and media); network connections allowed to any origin because
+    the homeserver URL is user-configured.
   -->
   <meta
     http-equiv="Content-Security-Policy"
@@ -16,21 +16,11 @@
 </head>
 <body>
   <div id="root"></div>
-
   <!--
-    Classic scripts (no build step). Top-level classes/consts are shared
-    across scripts through the global lexical environment. Load order is
-    the dependency order.
+    One classic-script bundle (dist/renderer.js) built by esbuild. Kept as a
+    classic script — not type="module" — so Electron's loadFile (file://)
+    works: Chromium blocks ES modules from file:// origins.
   -->
-  <script src="services/matrix-client.js"></script>
-  <script src="components/ui.js"></script>
-  <script src="components/login-view.js"></script>
-  <script src="components/space-rail.js"></script>
-  <script src="components/room-list.js"></script>
-  <script src="components/message-item.js"></script>
-  <script src="components/chat-view.js"></script>
-  <script src="components/member-list.js"></script>
-  <script src="components/app-shell.js"></script>
-  <script src="app.js"></script>
+  <script src="./renderer.js"></script>
 </body>
 </html>

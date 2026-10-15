@@ -1,0 +1,243 @@
+/*
+ * Grungus — <room-list>: sidebar with rooms, direct messages, the local
+ * user footer, connection indicator, and the inline "new room" form.
+ * Events: "grungus:select-room" {roomId}, "grungus:create-room" {name},
+ * "grungus:logout".
+ */
+import { el } from "./ui.ts";
+import type { ConnectionState, MatrixClient, Room } from "../services/matrix-client.ts";
+
+export interface UserInfo {
+  userId: string;
+  displayname: string | null;
+  avatarMxc: string | null;
+}
+
+export class RoomList extends HTMLElement {
+  private _rooms: Room[] = [];
+  private _spaces: Room[] = [];
+  private _selectedRoomId: string | null = null;
+  private _spaceId: string | null = null;
+  private _client: MatrixClient | null = null;
+  private _showForm = false;
+  private _user: UserInfo | null = null;
+  private _connection: ConnectionState = "connecting";
+
+  connectedCallback(): void {
+    this._render();
+  }
+
+  update(
+    rooms: Room[],
+    spaces: Room[],
+    selectedRoomId: string | null,
+    spaceId: string | null,
+    client: MatrixClient | null
+  ): void {
+    this._rooms = rooms;
+    this._spaces = spaces;
+    this._selectedRoomId = selectedRoomId;
+    this._spaceId = spaceId;
+    this._client = client;
+    this._render();
+  }
+
+  setUser(user: UserInfo | null): void {
+    this._user = user;
+    this._renderFooter();
+  }
+
+  setConnection(state: ConnectionState): void {
+    this._connection = state;
+    this._renderFooter();
+  }
+
+  private _currentSpace(): Room | null {
+    return this._spaces.find((space) => space.id === this._spaceId) ?? null;
+  }
+
+  private _render(): void {
+    const space = this._currentSpace();
+    this.textContent = "";
+
+    /* header */
+    const head = el("div", { class: "sidebar-head" });
+    head.appendChild(
+      el("span", { class: "head-title", text: space ? space.title : "Home" })
+    );
+    const addBtn = el("button", {
+      class: "add-btn",
+      title: "Create a room",
+      "aria-label": "Create a room",
+      text: "+",
+    });
+    addBtn.addEventListener("click", () => {
+      this._showForm = !this._showForm;
+      this._render();
+      if (this._showForm) {
+        const input = this.querySelector<HTMLInputElement>(".new-room-form input");
+        input?.focus();
+      }
+    });
+    head.appendChild(addBtn);
+    this.appendChild(head);
+
+    /* inline create-room form */
+    if (this._showForm) {
+      const form = el("div", { class: "new-room-form" });
+      const input = el("input", {
+        type: "text",
+        placeholder: "new-room-name",
+        maxlength: "80",
+        spellcheck: "false",
+      }) as HTMLInputElement;
+      const create = el("button", { text: "Create" });
+      form.appendChild(input);
+      form.appendChild(create);
+
+      const submitNewRoom = (): void => {
+        const name = input.value.trim();
+        if (!name) return;
+        input.value = "";
+        this._showForm = false;
+        this.dispatchEvent(
+          new CustomEvent("grungus:create-room", {
+            detail: { name },
+            bubbles: true,
+          })
+        );
+        this._render();
+      };
+      create.addEventListener("click", submitNewRoom);
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          submitNewRoom();
+        }
+      });
+      this.appendChild(form);
+    }
+
+    /* scrollable room sections */
+    const scroll = el("div", { class: "room-scroll" });
+    const roomsSection = this._rooms.filter((room) => !room.isDirect);
+    const dmSection = this._rooms.filter((room) => room.isDirect);
+
+    this._renderSection(scroll, "Rooms", roomsSection);
+    if (!space) {
+      this._renderSection(scroll, "Direct Messages", dmSection);
+    }
+
+    if (this._rooms.length === 0) {
+      scroll.appendChild(
+        el("div", {
+          class: "empty-state",
+          text: space
+            ? "No rooms in this space yet."
+            : "No rooms yet — create one with the + button.",
+        })
+      );
+    }
+
+    this.appendChild(scroll);
+    this.appendChild(this._buildFooter());
+  }
+
+  private _renderSection(container: HTMLElement, label: string, rooms: Room[]): void {
+    if (rooms.length === 0) return;
+    container.appendChild(el("div", { class: "sidebar-section", text: label }));
+    for (const room of rooms) container.appendChild(this._buildRoomRow(room));
+  }
+
+  private _buildRoomRow(room: Room): HTMLElement {
+    const row = el("div", {
+      class:
+        "room-row" +
+        (room.id === this._selectedRoomId ? " active" : "") +
+        (room.unread > 0 ? " has-unread" : ""),
+      dataset: { roomId: room.id },
+    });
+    const av = document.createElement("g-avatar");
+    av.update({
+      name: room.title,
+      userId: room.directUserId ?? room.id,
+      size: 32,
+      load: this._client ? this._client.avatarSrc(room.avatarMxc, 32) : null,
+    });
+    row.appendChild(av);
+    row.appendChild(el("span", { class: "room-name", text: room.title }));
+    if (room.unread > 0) {
+      row.appendChild(el("span", { class: "unread-badge", text: String(room.unread) }));
+    }
+    row.addEventListener("click", () => {
+      this.dispatchEvent(
+        new CustomEvent("grungus:select-room", {
+          detail: { roomId: room.id },
+          bubbles: true,
+        })
+      );
+    });
+    return row;
+  }
+
+  private _buildFooter(): HTMLElement {
+    const footer = el("div", { class: "app-user" });
+
+    const av = document.createElement("g-avatar");
+    av.update({
+      name: this._user?.displayname ?? this._user?.userId ?? "?",
+      userId: this._user?.userId ?? "?",
+      size: 32,
+      load:
+        this._user && this._client && this._user.avatarMxc
+          ? this._client.avatarSrc(this._user.avatarMxc, 32)
+          : null,
+    });
+    footer.appendChild(av);
+
+    const meta = el("div", { class: "user-meta" });
+    meta.appendChild(
+      el("div", {
+        class: "user-name",
+        text: this._user?.displayname ?? "Not logged in",
+      })
+    );
+    meta.appendChild(
+      el("div", { class: "user-id", text: this._user?.userId ?? "" })
+    );
+    footer.appendChild(meta);
+
+    let dotClass = "conn-dot";
+    if (this._connection === "online") dotClass += " online";
+    else if (this._connection === "connecting") dotClass += " connecting";
+    footer.appendChild(
+      el("span", { class: dotClass, title: `Connection: ${this._connection}` })
+    );
+
+    const logout = el("button", {
+      class: "logout-btn",
+      title: "Log out",
+      "aria-label": "Log out",
+      text: "Log out",
+    });
+    logout.addEventListener("click", () => {
+      this.dispatchEvent(new CustomEvent("grungus:logout", { bubbles: true }));
+    });
+    footer.appendChild(logout);
+
+    return footer;
+  }
+
+  private _renderFooter(): void {
+    const existing = this.querySelector(".app-user");
+    if (existing) existing.replaceWith(this._buildFooter());
+  }
+}
+
+customElements.define("room-list", RoomList);
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "room-list": RoomList;
+  }
+}

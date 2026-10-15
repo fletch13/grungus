@@ -2,10 +2,10 @@
  * Grungus — <app-shell>: four-pane layout.
  * [ space rail | room list | chat | member list ]
  */
-"use strict";
+import { el } from "./ui.ts";
 
-class AppShell extends HTMLElement {
-  connectedCallback() {
+export class AppShell extends HTMLElement {
+  connectedCallback(): void {
     this.textContent = "";
     this.appendChild(el("space-rail"));
     this.appendChild(el("room-list"));
@@ -14,9 +14,15 @@ class AppShell extends HTMLElement {
   }
 
   /** Hide the member pane (e.g. no room selected) — chat takes the space. */
-  setMembersVisible(visible) {
+  setMembersVisible(visible: boolean): void {
     this.classList.toggle("no-members", !visible);
   }
 }
 
 customElements.define("app-shell", AppShell);
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "app-shell": AppShell;
+  }
+}
