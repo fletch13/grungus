@@ -43,8 +43,8 @@ jobs:
       - name: Install xvfb
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
-      - name: Download Electron binary (postinstall download is skipped on runners)
-        run: npx electron --version
+      - name: Download Electron binary without executing it (postinstall download is skipped on runners)
+        run: node node_modules/electron/install.js
 
       - name: Configure Electron's SUID sandbox helper (per Electron CI docs)
         run: |
