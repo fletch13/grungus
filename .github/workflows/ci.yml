@@ -43,5 +43,10 @@ jobs:
       - name: Install xvfb
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
+      - name: Configure Electron's SUID sandbox helper (per Electron CI docs)
+        run: |
+          sudo chown root node_modules/electron/dist/chrome-sandbox
+          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
+
       - name: Boot the app headlessly and exit
         run: xvfb-run -a npm run smoke
