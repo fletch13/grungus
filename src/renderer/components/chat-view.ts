@@ -91,7 +91,13 @@ export class ChatView extends HTMLElement {
       this._header.appendChild(el("span", { class: "title", text: "Grungus" }));
       return;
     }
-    this._header.appendChild(el("span", { class: "title", text: room.title }));
+    this._header.appendChild(
+      el("span", {
+        class: "title",
+        text: `${room.isEncrypted ? "🔒 " : ""}${room.title}`,
+        title: room.isEncrypted ? "End-to-end encrypted (megolm)" : undefined,
+      })
+    );
     const sub = room.topic
       ? `${room.topic}  ·  ${room.joinedMemberCount} members`
       : `${room.joinedMemberCount} members`;

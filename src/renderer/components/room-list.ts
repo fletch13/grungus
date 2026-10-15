@@ -165,7 +165,12 @@ export class RoomList extends HTMLElement {
       load: this._client ? this._client.avatarSrc(room.avatarMxc, 32) : null,
     });
     row.appendChild(av);
-    row.appendChild(el("span", { class: "room-name", text: room.title }));
+    row.appendChild(
+      el("span", {
+        class: "room-name",
+        text: `${room.isEncrypted ? "🔒 " : ""}${room.title}`,
+      })
+    );
     if (room.unread > 0) {
       row.appendChild(el("span", { class: "unread-badge", text: String(room.unread) }));
     }

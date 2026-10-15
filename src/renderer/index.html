@@ -3,13 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <!--
-    CSP: scripts/styles only from this app; images from blob/data (generated
-    avatars and media); network connections allowed to any origin because
-    the homeserver URL is user-configured.
+    CSP: scripts/styles only from this app; 'wasm-unsafe-eval' permits
+    WebAssembly (libolm) without allowing eval(); images from blob/data
+    (generated avatars and media); network connections allowed to any
+    origin because the homeserver URL is user-configured.
   -->
   <meta
     http-equiv="Content-Security-Policy"
-    content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src *"
+    content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; connect-src *"
   />
   <title>Grungus</title>
   <link rel="stylesheet" href="styles/theme.css" />

@@ -68,6 +68,58 @@ ipcMain.handle("session:clear", (): boolean => {
   return true;
 });
 
+/* ---- E2EE crypto vault (olm pickles — sensitive, keychain-encrypted) ---- */
+
+const CRYPTO_VAULT_FILE = "grungus-crypto-vault.json";
+
+function cryptoVaultPath(): string {
+  return path.join(app.getPath("userData"), CRYPTO_VAULT_FILE);
+}
+
+function readCryptoVault(): Record<string, string> {
+  try {
+    const raw = fs.readFileSync(cryptoVaultPath(), "utf8");
+    const parsed = JSON.parse(raw) as {
+      v?: number;
+      encrypted?: boolean;
+      data?: string;
+    };
+    if (!parsed || typeof parsed.data !== "string") return {};
+    const payload = parsed.encrypted
+      ? safeStorage.decryptString(Buffer.from(parsed.data, "base64"))
+      : parsed.data;
+    const map = JSON.parse(payload) as Record<string, string>;
+    return map && typeof map === "object" ? map : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeCryptoVault(map: Record<string, string>): void {
+  const payload = JSON.stringify(map);
+  const stored = safeStorage.isEncryptionAvailable()
+    ? JSON.stringify({
+        v: 1,
+        encrypted: true,
+        data: safeStorage.encryptString(payload).toString("base64"),
+      })
+    : JSON.stringify({ v: 1, encrypted: false, data: payload });
+  fs.writeFileSync(cryptoVaultPath(), stored, { mode: 0o600 });
+}
+
+ipcMain.handle("crypto:get", (_event, key: string): string | null => {
+  const map = readCryptoVault();
+  const k = String(key);
+  return Object.prototype.hasOwnProperty.call(map, k) ? map[k]! : null;
+});
+
+ipcMain.handle("crypto:put", (_event, key: string, value: string): boolean => {
+  const map = readCryptoVault();
+  map[String(key)] = String(value);
+  writeCryptoVault(map);
+  return true;
+});
+
 /* ---- window lifecycle ---- */
 
 function createWindow(): BrowserWindow {

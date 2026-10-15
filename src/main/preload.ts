@@ -17,4 +17,9 @@ contextBridge.exposeInMainWorld("grungusPlatform", {
   loadSession: (): Promise<unknown> => ipcRenderer.invoke("session:load"),
   /** Delete the persisted session. */
   clearSession: (): Promise<unknown> => ipcRenderer.invoke("session:clear"),
+  /** E2EE key-value store — olm pickles (OS-keychain-encrypted in main). */
+  cryptoGet: (key: string): Promise<string | null> =>
+    ipcRenderer.invoke("crypto:get", key),
+  cryptoPut: (key: string, value: string): Promise<void> =>
+    ipcRenderer.invoke("crypto:put", key, value),
 });

@@ -13,6 +13,8 @@
  * Written against Matrix spec v1.x (Client-Server API, v3 paths).
  */
 
+import type { E2eeCrypto } from "./e2ee.ts";
+
 /* ------------------------------- wire types ------------------------------ */
 
 export interface MatrixEventContent {
@@ -47,6 +49,15 @@ interface SyncJoinedRoom {
 export interface SyncResponse {
   next_batch?: string;
   rooms?: { join?: Record<string, SyncJoinedRoom> };
+  to_device?: { events?: ToDeviceEvent[] };
+  device_one_time_keys_count?: Record<string, number>;
+  device_lists?: { changed?: string[]; new?: string[] };
+}
+
+export interface ToDeviceEvent {
+  type: string;
+  sender: string;
+  content: unknown;
 }
 
 export interface MemberRecord {
@@ -114,6 +125,8 @@ export interface Room {
   isSpace: boolean;
   creator: string | null;
   joinRule: string | null;
+  isEncrypted: boolean;
+  encryptionAlgorithm: string | null;
   children: Set<string>;
   members: Map<string, MemberRecord>;
   timeline: TimelineItem[];
@@ -180,6 +193,8 @@ export interface CreateRoomOptions {
   topic?: string;
   isPublic?: boolean;
   isSpace?: boolean;
+  /** Enable megolm encryption in the room (initial m.room.encryption state). */
+  encrypted?: boolean;
 }
 
 interface ApiOptions {
@@ -222,6 +237,8 @@ export class MatrixClient {
   deviceId: string | null;
   readonly rooms = new Map<string, Room>();
   connectionState: ConnectionState = "connecting";
+  /** E2EE layer — attached by the app after login; null in plain mode. */
+  crypto: E2eeCrypto | null = null;
 
   private _since: string | null = null;
   private _seen = new Set<string>();
@@ -328,12 +345,12 @@ export class MatrixClient {
   }
 
   versions(): Promise<{ versions?: string[] }> {
-    return this._api("GET", "/_matrix/client/versions", { auth: false });
+    return this.api("GET", "/_matrix/client/versions", { auth: false });
   }
 
   /* ------------------------------- HTTP ---------------------------------- */
 
-  private async _api<T>(
+  async api<T>(
     method: string,
     path: string,
     opts: ApiOptions = {}
@@ -402,7 +419,7 @@ export class MatrixClient {
     if (!username || !password) {
       throw new Error("Username and password are required");
     }
-    const res = await this._api<LoginResult>("POST", `${CLIENT_PREFIX}/login`, {
+    const res = await this.api<LoginResult>("POST", `${CLIENT_PREFIX}/login`, {
       auth: false,
       body: {
         type: "m.login.password",
@@ -422,7 +439,7 @@ export class MatrixClient {
 
   /** Validate an access token; resolves the whoami payload or throws. */
   async whoami(): Promise<{ user_id: string }> {
-    const res = await this._api<{ user_id?: string }>(
+    const res = await this.api<{ user_id?: string }>(
       "GET",
       `${CLIENT_PREFIX}/account/whoami`
     );
@@ -432,7 +449,7 @@ export class MatrixClient {
   }
 
   async getProfile(userId: string): Promise<{ displayname?: string; avatar_url?: string }> {
-    return this._api(
+    return this.api(
       "GET",
       `${CLIENT_PREFIX}/profile/${encodeURIComponent(userId)}`,
       { auth: false }
@@ -441,7 +458,7 @@ export class MatrixClient {
 
   async logout(): Promise<void> {
     this.stopSync();
-    await this._api("POST", `${CLIENT_PREFIX}/logout`, { body: {} }).catch(() => {
+    await this.api("POST", `${CLIENT_PREFIX}/logout`, { body: {} }).catch(() => {
       /* best effort — the token is being discarded anyway */
     });
     this.accessToken = null;
@@ -463,7 +480,7 @@ export class MatrixClient {
         const query: Record<string, string | number> = { timeout: SYNC_TIMEOUT_MS };
         if (this._since) query.since = this._since;
         try {
-          const data = await this._api<SyncResponse>(
+          const data = await this.api<SyncResponse>(
             "GET",
             `${CLIENT_PREFIX}/sync`,
             {
@@ -476,8 +493,10 @@ export class MatrixClient {
           this._backoffMs = 0;
           this.connectionState = "online";
           this.emit("connection", "online");
-          this._since = data.next_batch || this._since;
+          /* process BEFORE advancing the token: a throw mid-batch must not
+             permanently skip events */
           this._applySync(data);
+          this._since = data.next_batch || this._since;
           if (!this._readyEmitted) {
             this._readyEmitted = true;
             this.emit("ready");
@@ -527,6 +546,8 @@ export class MatrixClient {
         isSpace: false,
         creator: null,
         joinRule: null,
+        isEncrypted: false,
+        encryptionAlgorithm: null,
         children: new Set(),
         members: new Map(),
         timeline: [],
@@ -568,6 +589,13 @@ export class MatrixClient {
         room.joinRule =
           typeof content.join_rule === "string" ? content.join_rule : null;
         break;
+      case "m.room.encryption": {
+        const algorithm =
+          typeof content.algorithm === "string" ? content.algorithm : null;
+        room.isEncrypted = algorithm !== null;
+        room.encryptionAlgorithm = algorithm;
+        break;
+      }
       case "m.room.member": {
         if (typeof ev.state_key !== "string") break;
         room.members.set(ev.state_key, {
@@ -734,6 +762,30 @@ export class MatrixClient {
     return null;
   }
 
+  /**
+   * Decrypt an m.room.encrypted room event into a timeline item. Returns
+   * a "unable to decrypt" system line when the room key is not (yet) known
+   * to this device.
+   */
+  private _decryptedTimelineItem(room: Room, ev: MatrixEvent): TimelineItem | null {
+    if (!this.crypto) return null;
+    const decrypted = this.crypto.decryptRoomEvent(ev);
+    if (!decrypted) {
+      return {
+        kind: "system",
+        id: ev.event_id ?? null,
+        ts: ev.origin_server_ts ?? Date.now(),
+        text: "🔒 Unable to decrypt this message (key not shared with this device)",
+      };
+    }
+    const inner: MatrixEvent = {
+      ...ev,
+      type: decrypted.type,
+      content: decrypted.content,
+    };
+    return this._toTimelineItem(room, inner);
+  }
+
   private _removeEcho(room: Room, txnId: string): boolean {
     for (let i = 0; i < room.timeline.length; i++) {
       const entry = room.timeline[i];
@@ -746,6 +798,22 @@ export class MatrixClient {
   }
 
   private _applySync(data: SyncResponse): void {
+    /* to-device first: room keys must be processed before encrypted room
+       events arriving in the same sync batch are handled. A crypto error
+       must never abort room processing. */
+    if (this.crypto) {
+      try {
+        const toDevice = data.to_device?.events ?? [];
+        if (toDevice.length > 0) this.crypto.onToDeviceEvents(toDevice);
+        const keyCounts = data.device_one_time_keys_count;
+        if (keyCounts) void this.crypto.onOneTimeKeyCounts(keyCounts);
+        const changed = data.device_lists?.changed;
+        if (changed && changed.length > 0) this.crypto.onDeviceListChange(changed);
+      } catch (err) {
+        console.error("[grungus] crypto sync handling failed:", err);
+      }
+    }
+
     const joined = data.rooms?.join ?? {};
     const changedRooms: RoomUpdate[] = [];
 
@@ -771,7 +839,17 @@ export class MatrixClient {
           this._acked.delete(evId);
           newEvents.push({ kind: "echo-replaced", txnId: echoTxn });
         }
-        const item = this._toTimelineItem(room, ev);
+        const item =
+          room.isEncrypted && ev.type === "m.room.encrypted"
+            ? this.crypto
+              ? this._decryptedTimelineItem(room, ev)
+              : {
+                  kind: "system" as const,
+                  id: ev.event_id ?? null,
+                  ts: ev.origin_server_ts ?? Date.now(),
+                  text: "🔒 Unable to decrypt (E2EE unavailable)",
+                }
+            : this._toTimelineItem(room, ev);
         if (item) {
           room.timeline.push(item);
           newEvents.push(item);
@@ -854,11 +932,24 @@ export class MatrixClient {
       this.emit("room", { room, newEvents: [echo] });
       this.emit("rooms", this.getRooms());
     }
+    const encrypted = room?.isEncrypted === true;
+    if (encrypted && !this.crypto) {
+      /* fail closed: never send plaintext into an encrypted room */
+      throw new Error("Cannot send: E2EE is unavailable in this encrypted room");
+    }
+    const sendType = encrypted ? "m.room.encrypted" : "m.room.message";
+    let content: Record<string, unknown>;
     try {
-      const res = await this._api<{ event_id?: string }>(
+      content = encrypted
+        ? await this.crypto!.encryptRoomMessage(roomId, {
+            msgtype: "m.text",
+            body: text,
+          })
+        : { msgtype: "m.text", body: text };
+      const res = await this.api<{ event_id?: string }>(
         "PUT",
-        `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(txnId)}`,
-        { body: { msgtype: "m.text", body: text } }
+        `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/${sendType}/${encodeURIComponent(txnId)}`,
+        { body: content }
       );
       if (res?.event_id) {
         echo.eventId = res.event_id;
@@ -886,7 +977,16 @@ export class MatrixClient {
     };
     if (opts.topic) body.topic = opts.topic;
     if (opts.isSpace) body.creation_content = { type: "m.space" };
-    const res = await this._api<{ room_id?: string }>(
+    if (opts.encrypted) {
+      body.initial_state = [
+        {
+          type: "m.room.encryption",
+          state_key: "",
+          content: { algorithm: "m.megolm.v1.aes-sha2" },
+        },
+      ];
+    }
+    const res = await this.api<{ room_id?: string }>(
       "POST",
       `${CLIENT_PREFIX}/createRoom`,
       { body }
@@ -896,7 +996,7 @@ export class MatrixClient {
   }
 
   async joinRoom(roomIdOrAlias: string): Promise<string> {
-    const res = await this._api<{ room_id?: string }>(
+    const res = await this.api<{ room_id?: string }>(
       "POST",
       `${CLIENT_PREFIX}/join/${encodeURIComponent(roomIdOrAlias)}`,
       { body: {} }
@@ -905,7 +1005,7 @@ export class MatrixClient {
   }
 
   async invite(roomId: string, userId: string): Promise<void> {
-    await this._api(
+    await this.api(
       "POST",
       `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/invite`,
       { body: { user_id: userId } }

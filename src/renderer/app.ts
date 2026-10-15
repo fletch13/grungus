@@ -13,6 +13,7 @@ import type { ChatView } from "./components/chat-view.ts";
 import type { MemberList } from "./components/member-list.ts";
 import type { AppShell } from "./components/app-shell.ts";
 import { MatrixClient, type Room } from "./services/matrix-client.ts";
+import { E2eeCrypto, type CryptoStore } from "./services/e2ee.ts";
 
 export interface SavedSession {
   baseUrl: string;
@@ -26,6 +27,9 @@ export interface GrungusPlatform {
   saveSession(session: SavedSession): Promise<boolean>;
   loadSession(): Promise<SavedSession | null>;
   clearSession(): Promise<boolean>;
+  /** Present in Electron — olm pickle storage in the main-process vault. */
+  cryptoGet?(key: string): Promise<string | null>;
+  cryptoPut?(key: string, value: string): Promise<void>;
 }
 
 /* Exposed by the preload bridge when running inside Electron. */
@@ -117,6 +121,11 @@ function handleLogin(detail: LoginDetail, view: LoginView): Promise<void> {
       return storage.saveSession(session).then(() => session);
     })
     .then(() => {
+      const active = client;
+      if (!active) throw new Error("Login failed");
+      return attachCrypto(active);
+    })
+    .then(() => {
       startShell();
     })
     .catch((err: unknown) => {
@@ -129,6 +138,44 @@ function handleLogin(detail: LoginDetail, view: LoginView): Promise<void> {
           : "Login failed";
       view.setStatus(message, true);
     });
+}
+
+function makeCryptoStore(): CryptoStore {
+  const platform = window.grungusPlatform;
+  if (platform?.cryptoGet && platform?.cryptoPut) {
+    return {
+      get: (key) => platform.cryptoGet!(key),
+      put: (key, value) => platform.cryptoPut!(key, value),
+    };
+  }
+  /* Browser dev mode: localStorage — dev/testing only, documented in README. */
+  return {
+    async get(key) {
+      try {
+        return localStorage.getItem("grungus-crypto:" + key);
+      } catch {
+        return null;
+      }
+    },
+    async put(key, value) {
+      try {
+        localStorage.setItem("grungus-crypto:" + key, value);
+      } catch {
+        /* ignore */
+      }
+    },
+  };
+}
+
+/** Attach the E2EE layer; the app degrades gracefully when it fails. */
+async function attachCrypto(c: MatrixClient): Promise<void> {
+  try {
+    const crypto = new E2eeCrypto({ host: c, store: makeCryptoStore() });
+    await crypto.init();
+    c.crypto = crypto;
+  } catch (err) {
+    console.error("[grungus] E2EE init failed (continuing without):", err);
+  }
 }
 
 function logout(): void {
@@ -299,6 +346,11 @@ function boot(): void {
         });
         return client
           .whoami()
+          .then(() => {
+            const active = client;
+            if (active) return attachCrypto(active);
+            return undefined;
+          })
           .then(() => {
             startShell();
           })

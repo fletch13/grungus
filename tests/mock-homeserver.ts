@@ -41,6 +41,13 @@ interface MockRoom {
   events: MockEvent[];
 }
 
+interface MockDevice {
+  deviceId: string;
+  deviceKeys: Record<string, unknown>;
+  /** "signed_curve25519/<id>" -> signed key object ({ key, signatures }) */
+  oneTimeKeys: Map<string, Record<string, unknown>>;
+}
+
 interface CreateRoomOptions {
   name: string | null;
   topic: string | null;
@@ -52,6 +59,13 @@ export class MockHomeserver {
   readonly users = new Map<string, MockUser>();
   readonly tokens = new Map<string, string>(); /* token -> username */
   readonly rooms = new Map<string, MockRoom>();
+  /** username -> deviceId -> device (keys + one-time keys). */
+  readonly devices = new Map<string, Map<string, MockDevice>>();
+  /** username -> queued to-device events (with global seq for sync wakeups). */
+  private readonly toDeviceQueue = new Map<
+    string,
+    { seq: number; event: Record<string, unknown> }[]
+  >();
   baseUrl: string | null = null;
   port: number | null = null;
   private _server: http.Server | null = null;
@@ -332,7 +346,112 @@ export class MockHomeserver {
         isPublic: body.preset === "public_chat",
         isSpace: creation.type === "m.space",
       });
+      const initialState =
+        (body.initial_state as
+          | { type: string; state_key?: string; content?: Record<string, unknown> }[]
+          | undefined) ?? [];
+      for (const stateInit of initialState) {
+        this._appendEvent(
+          room,
+          stateInit.type,
+          user.userId,
+          stateInit.content ?? {},
+          { state_key: stateInit.state_key ?? "" }
+        );
+      }
       this._send(res, 200, { room_id: room.id });
+      return;
+    }
+
+    /* E2EE endpoints */
+
+    if (req.method === "POST" && route === "keys/upload") {
+      const deviceKeys = (body.device_keys as Record<string, unknown>) ?? {};
+      const deviceId = String(deviceKeys.device_id ?? "");
+      if (!deviceId) {
+        this._err(res, 400, "M_BAD_JSON", "device_id required");
+        return;
+      }
+      const userDevices = this.devices.get(user.username) ?? new Map<string, MockDevice>();
+      const device: MockDevice =
+        userDevices.get(deviceId) ?? {
+          deviceId,
+          deviceKeys: {},
+          oneTimeKeys: new Map(),
+        };
+      device.deviceKeys = deviceKeys;
+      const otkMap =
+        (body.one_time_keys as Record<string, Record<string, unknown>> | undefined) ?? {};
+      for (const [keyId, keyObject] of Object.entries(otkMap)) {
+        device.oneTimeKeys.set(keyId, keyObject);
+      }
+      userDevices.set(deviceId, device);
+      this.devices.set(user.username, userDevices);
+      const total = [...userDevices.values()].reduce(
+        (n, d) => n + d.oneTimeKeys.size,
+        0
+      );
+      this._send(res, 200, { one_time_key_counts: { signed_curve25519: total } });
+      return;
+    }
+
+    if (req.method === "POST" && route === "keys/query") {
+      const requested = (body.device_keys as Record<string, unknown[]>) ?? {};
+      const deviceKeys: Record<string, Record<string, unknown>> = {};
+      for (const userId of Object.keys(requested)) {
+        const username = this._usernameForUserId(userId);
+        const userDevices = username ? this.devices.get(username) : undefined;
+        if (!userDevices) continue;
+        const byDevice: Record<string, unknown> = {};
+        for (const device of userDevices.values()) {
+          byDevice[device.deviceId] = device.deviceKeys;
+        }
+        deviceKeys[userId] = byDevice;
+      }
+      this._send(res, 200, { device_keys: deviceKeys });
+      return;
+    }
+
+    if (req.method === "POST" && route === "keys/claim") {
+      const requested = (body.one_time_keys as Record<string, Record<string, string>>) ?? {};
+      const claimed: Record<string, Record<string, Record<string, unknown>>> = {};
+      for (const [userId, deviceMap] of Object.entries(requested)) {
+        const username = this._usernameForUserId(userId);
+        const userDevices = username ? this.devices.get(username) : undefined;
+        if (!userDevices) continue;
+        for (const deviceId of Object.keys(deviceMap)) {
+          const device = userDevices.get(deviceId);
+          if (!device || device.oneTimeKeys.size === 0) continue;
+          const first = device.oneTimeKeys.entries().next().value as [
+            string,
+            Record<string, unknown>,
+          ];
+          device.oneTimeKeys.delete(first[0]);
+          if (!claimed[userId]) claimed[userId] = {};
+          claimed[userId]![deviceId] = { [first[0]]: first[1] };
+        }
+      }
+      this._send(res, 200, { one_time_keys: claimed });
+      return;
+    }
+
+    const sendToDeviceMatch = route.match(/^sendToDevice\/([^/]+)\/([^/]+)$/);
+    if (req.method === "PUT" && sendToDeviceMatch) {
+      const type = sendToDeviceMatch[1]!;
+      const messages = (body.messages as Record<string, Record<string, unknown>>) ?? {};
+      for (const [userId, deviceMap] of Object.entries(messages)) {
+        const username = this._usernameForUserId(userId);
+        if (!username) continue;
+        const queue = this.toDeviceQueue.get(username) ?? [];
+        for (const [_deviceId, content] of Object.entries(deviceMap)) {
+          queue.push({
+            seq: ++this._seq,
+            event: { type, sender: user.userId, content },
+          });
+        }
+        this.toDeviceQueue.set(username, queue);
+      }
+      this._send(res, 200, {});
       return;
     }
 
@@ -413,6 +532,13 @@ export class MockHomeserver {
     this._err(res, 404, "M_UNRECOGNIZED", `Unknown endpoint: ${route}`);
   }
 
+  private _usernameForUserId(userId: string): string | null {
+    for (const candidate of this.users.values()) {
+      if (candidate.userId === userId) return candidate.username;
+    }
+    return null;
+  }
+
   /* ------------------------------- sync ------------------------------- */
 
   private _joinedRooms(user: MockUser): MockRoom[] {
@@ -424,6 +550,8 @@ export class MockHomeserver {
   }
 
   private _hasNew(user: MockUser, sinceNum: number): boolean {
+    const toDevice = this.toDeviceQueue.get(user.username) ?? [];
+    if (toDevice.some((entry) => entry.seq > sinceNum)) return true;
     return this._joinedRooms(user).some((room) =>
       room.events.some((event) => event.seq > sinceNum)
     );
@@ -481,6 +609,31 @@ export class MockHomeserver {
         },
       };
     }
-    return { next_batch: String(this._seq), rooms: { join } };
+
+    /* to-device: deliver queued events once (initial sync delivers all). */
+    const queue = this.toDeviceQueue.get(user.username) ?? [];
+    let delivered: { seq: number; event: Record<string, unknown> }[];
+    if (sinceNum === null) {
+      delivered = queue.splice(0, queue.length);
+    } else {
+      delivered = queue.filter((entry) => entry.seq > sinceNum);
+      this.toDeviceQueue.set(
+        user.username,
+        queue.filter((entry) => entry.seq <= sinceNum)
+      );
+    }
+
+    const userDevices = this.devices.get(user.username);
+    const totalOtks = [...(userDevices?.values() ?? [])].reduce(
+      (n, d) => n + d.oneTimeKeys.size,
+      0
+    );
+
+    return {
+      next_batch: String(this._seq),
+      rooms: { join },
+      to_device: { events: delivered.map((entry) => entry.event) },
+      device_one_time_keys_count: { signed_curve25519: totalOtks },
+    };
   }
 }

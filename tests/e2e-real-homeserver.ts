@@ -17,7 +17,15 @@
  * and run without GRUNGUS_E2E_REGISTER.
  */
 import assert from "node:assert/strict";
-import { MatrixClient, type Room, type MessageItem } from "../src/renderer/services/matrix-client.ts";
+import {
+  MatrixClient,
+  type MessageItem,
+  type Room,
+} from "../src/renderer/services/matrix-client.ts";
+import {
+  E2eeCrypto,
+  MemoryCryptoStore,
+} from "../src/renderer/services/e2ee.ts";
 
 const HOME = process.env.GRUNGUS_E2E_HOMESERVER ?? "";
 const USER1 = process.env.GRUNGUS_E2E_USER1 ?? "grungus_a";
@@ -157,6 +165,16 @@ async function main(): Promise<void> {
   await b.loginWithPassword({ username: USER2, password: PASS2 });
   log("logged in as", a.userId, "and", b.userId);
 
+  /* attach the E2EE layer (same wiring app.ts performs) — this exercises
+     device key upload + signatures against the real homeserver */
+  const cryptoA = new E2eeCrypto({ host: a, store: new MemoryCryptoStore() });
+  await cryptoA.init();
+  a.crypto = cryptoA;
+  const cryptoB = new E2eeCrypto({ host: b, store: new MemoryCryptoStore() });
+  await cryptoB.init();
+  b.crypto = cryptoB;
+  log("E2EE devices initialized and keys uploaded ✓");
+
   const stamp = Date.now();
   const roomId = await a.createRoom({ name: `grungus-e2e-${stamp}`, isPublic: true });
   log("created public room:", roomId);
@@ -235,6 +253,63 @@ async function main(): Promise<void> {
     "space + child visible to the client"
   );
   log("space with child room visible to the client ✓");
+
+  /* 4. E2EE: megolm-encrypted room against the REAL homeserver */
+  const encRoomId = await a.createRoom({
+    name: `grungus-e2ee-${stamp}`,
+    isPublic: true,
+    encrypted: true,
+  });
+  await b.joinRoom(encRoomId);
+  await waitFor(
+    () =>
+      a.getRoom(encRoomId)?.isEncrypted === true &&
+      b.getRoom(encRoomId)?.isEncrypted === true,
+    "both clients see the room as encrypted"
+  );
+  log("encrypted room created and joined ✓");
+
+  const secret = `secret-${stamp}-via-e2ee`;
+  const secretEventId = await a.sendMessage(encRoomId, secret);
+  await waitFor(
+    () =>
+      (b.getRoom(encRoomId)?.timeline ?? []).some(
+        (item) => item.kind === "message" && (item as MessageItem).body === secret
+      ),
+    "b decrypts a's encrypted message"
+  );
+  log("encrypted message decrypted by the other client ✓");
+
+  /* the server never saw the plaintext: fetch the raw event back */
+  if (secretEventId) {
+    const raw = await api(
+      "GET",
+      `/_matrix/client/v3/rooms/${encodeURIComponent(encRoomId)}/event/${encodeURIComponent(secretEventId)}`,
+      { token: a.accessToken ?? "" }
+    );
+    if (raw.status !== 200) {
+      fail(`could not fetch raw event: ${JSON.stringify(raw.data)}`);
+    }
+    const rawContent = JSON.stringify(raw.data.content ?? {});
+    assert.ok(rawContent.includes("m.megolm.v1.aes-sha2"), "stored event is megolm");
+    assert.ok(
+      !rawContent.includes(secret),
+      "plaintext absent from the stored ciphertext"
+    );
+    log("server-side event is opaque ciphertext (no plaintext) ✓");
+  }
+
+  /* reverse direction */
+  const reply = `encrypted-reply-${stamp}`;
+  await b.sendMessage(encRoomId, reply);
+  await waitFor(
+    () =>
+      (a.getRoom(encRoomId)?.timeline ?? []).some(
+        (item) => item.kind === "message" && (item as MessageItem).body === reply
+      ),
+    "a decrypts b's encrypted reply"
+  );
+  log("reverse-direction encrypted message decrypted ✓");
 
   a.stopSync();
   b.stopSync();

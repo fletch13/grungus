@@ -15,6 +15,11 @@ for an open protocol.
 
 - **Matrix login** — password or access-token, with
   `.well-known/matrix/client` homeserver discovery, exactly like Element.
+- **End-to-end encryption (Olm/Megolm)** — messages in encrypted rooms
+  are megolm-encrypted via libolm (WASM); room keys are shared over olm
+  to-device messages to every member device, including your own.
+  Encrypted rooms show a 🔒 badge; sends fail closed rather than leaking
+  plaintext; undecryptable history shows an explicit notice.
 - **Discord-style layout** — space rail (servers), room/channel list,
   chat with grouped messages and day dividers, member list, composer.
 - **Spaces as servers** — Matrix Spaces appear in the left rail like
@@ -37,15 +42,16 @@ for an open protocol.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ Electron main process   src/main/   →  dist/main.cjs           │
-│   window lifecycle, session vault (safeStorage), IPC           │
+│ Electron main process   src/main/   →  dist/main.cjs         │
+│   window lifecycle, session + crypto vaults (safeStorage), IPC │
 └───────────────┬──────────────────────────────────────────────┘
                 │ contextBridge (contextIsolation, sandbox on)
 ┌───────────────┴──────────────────────────────────────────────┐
 │ Renderer                 src/renderer/ → dist/renderer.js     │
 │                                                               │
-│   app.ts ── orchestrates state and wiring                       │
+│   app.ts ── orchestrates state and wiring                     │
 │     ├── services/matrix-client.ts  typed Matrix CS API client │
+│     ├── services/e2ee.ts           Olm/Megolm via libolm WASM │
 │     └── components/*.ts             custom elements:           │
 │           login-view, app-shell, space-rail, room-list,        │
 │           chat-view, message-item, member-list, g-avatar       │
@@ -55,7 +61,9 @@ for an open protocol.
 - **esbuild** produces three outputs in `dist/`: the main process and
   preload (CJS, `.cjs` because package.json is `type: module`) and the
   renderer as ONE classic-script IIFE. A bundle is required: Chromium and
-  Electron block ES modules loaded from `file://` (CORS).
+  Electron block ES modules loaded from `file://` (CORS). libolm's
+  universal wrapper needs fs/path/crypto shims when bundling for the
+  browser (handled in scripts/build.mjs), and `olm.wasm` ships in `dist/`.
 - **Strict TypeScript end to end**: typed Matrix event/sync wire shapes,
   a typed client event bus, a timeline item union
   (`MessageItem | SystemItem`), and `HTMLElementTagNameMap` entries so
@@ -63,10 +71,11 @@ for an open protocol.
 - **Tests and examples run the .ts sources directly** on Node ≥ 24 via
   native type stripping — no separate build for the test suite.
 - No framework: native custom elements, one stylesheet.
-- The session (homeserver, user, access token) is stored encrypted via
+- The session and the E2EE identity pickles are stored encrypted via
   Electron's `safeStorage` when the platform keychain is available.
-- CSP: scripts and styles only from the app; `connect-src *` because the
-  homeserver URL is user-configured.
+- CSP: scripts and styles only from the app plus `'wasm-unsafe-eval'`
+  (WebAssembly for libolm, without allowing `eval()`); `connect-src *`
+  because the homeserver URL is user-configured.
 
 ## Matrix protocol coverage
 
@@ -80,17 +89,19 @@ Client-Server API (v3 paths, spec v1.x):
 | Login | `POST /_matrix/client/v3/login` (m.login.password) |
 | Token check | `GET /_matrix/client/v3/account/whoami` |
 | Profile | `GET /_matrix/client/v3/profile/{userId}` |
-| Realtime | `GET /_matrix/client/v3/sync` (long-poll) |
-| Send message | `PUT /_matrix/client/v3/rooms/{id}/send/m.room.message/{txnId}` |
-| Room creation | `POST /_matrix/client/v3/createRoom` (incl. spaces) |
+| Realtime | `GET /_matrix/client/v3/sync` (long-poll, incl. to-device) |
+| Send message | `PUT …/send/{m.room.message \| m.room.encrypted}/{txnId}` |
+| Room creation | `POST /_matrix/client/v3/createRoom` (incl. spaces, encryption) |
 | Join / invite | `POST /join/{idOrAlias}`, `POST /rooms/{id}/invite` |
 | Logout | `POST /_matrix/client/v3/logout` |
-| Avatars | `GET /_matrix/media/v3/thumbnail/…` (Bearer-authenticated media) |
-| Images / GIFs | `GET /_matrix/media/v3/download/…` (Bearer-authenticated media) |
+| Device keys | `POST /keys/upload`, `POST /keys/query`, `POST /keys/claim` |
+| Room key sharing | `PUT /sendToDevice/m.room.encrypted/{txnId}` (olm) |
+| Avatars / media | `GET /_matrix/media/v3/{thumbnail,download}/…` (Bearer) |
 
-Room state (names, topics, members, spaces) is derived from
+Room state (names, topics, members, spaces, encryption) is derived from
 `m.room.*` state events in the sync response, following the same model
-Element uses.
+Element uses. Device keys are signed with canonical JSON (Ed25519), the
+same way Element signs them.
 
 ## Getting started
 
@@ -107,7 +118,7 @@ Other scripts:
 ```bash
 npm run build      # esbuild -> dist/
 npm run typecheck  # tsc --noEmit (strict)
-npm test           # client suite vs the in-repo mock homeserver
+npm test           # client + E2EE suites vs the in-repo mock homeserver
 npm run smoke      # build + boot the app, then exit (--smoke)
 ```
 
@@ -122,18 +133,24 @@ cd dist && python3 -m http.server 8080
 # open http://localhost:8080
 ```
 
-In this mode the session is stored in `localStorage` (fine for testing,
-use the desktop app for day-to-day).
+In this mode the session and E2EE pickles are stored in `localStorage`
+(fine for testing, use the desktop app for day-to-day).
 
 ## Security notes
 
 - Renderer runs with `contextIsolation`, `sandbox`, no Node access;
-  the only bridge is a small `grungusPlatform` API (session load/save/clear).
-- Access tokens are stored via `safeStorage` (OS keychain) where available;
-  the fallback plaintext file is written `0600` in the Electron user data
-  directory and is documented here as a known trade-off.
-- E2EE (Olm/Megolm) is **not** implemented yet — treat messages as
-  server-readable until it lands (see roadmap).
+  the only bridge is a small `grungusPlatform` API (session + crypto vaults).
+- Access tokens and olm identity pickles are stored via `safeStorage`
+  (OS keychain) where available; the fallback plaintext file is written
+  `0600` in the Electron user data directory and is documented here as a
+  known trade-off. In browser dev mode pickles live in `localStorage`.
+- **E2EE is trust-on-first-use (v1)**: device keys are not verified (no
+  SAS/QR verification UI, no cross-signing), there is no key backup and
+  no key forwarding — a new device cannot decrypt history that predates
+  it, and outbound sessions are not rotated on membership change. Treat
+  it as protection against the server, not against device substitution.
+- Sends fail closed: an encrypted room without a working E2EE layer never
+  receives plaintext.
 - Messages render as text only; HTML from other clients is not executed.
 - Media is fetched with authenticated requests (Bearer header) and
   rendered from blob object URLs — compatible with homeservers that
@@ -141,36 +158,41 @@ use the desktop app for day-to-day).
 
 ## Testing
 
-Four layers, all driving the same typed client module that ships in the app:
+Four layers, all driving the same typed client modules that ship in the app:
 
 1. **Typecheck** — `npm run typecheck` (`tsc --noEmit`, strict, across
    src/tests/examples).
 2. **Integration tests vs an in-repo mock homeserver** — `npm test`
    (login, sync, bidirectional messages, local echo, unread, DM
-   resolution, spaces, media metadata, auth-error handling).
+   resolution, spaces, media metadata, auth-error handling, E2EE: key
+   upload, encrypted round-trips both ways with real libolm identities,
+   plaintext-rooms regression).
 3. **Real-homeserver e2e** — `tests/e2e-real-homeserver.ts` (run manually
    against conduwuit/Synapse/matrix.org-style servers; exercises UIA
-   registration, real sync, real state events, and authenticated media).
-   See the header of that file for the env vars.
+   registration, real sync, real state events, authenticated media, and
+   a full E2EE round-trip including a server-side check that stored
+   events are opaque megolm ciphertext). See the header of that file for
+   the env vars.
 4. **CI** — typecheck + tests + an Electron boot smoke test
    (`electron . --smoke` under xvfb on ubuntu-latest).
+
+The E2EE layer has also been verified in a real browser against a real
+homeserver: bidirectional encrypted chat with a headless second device,
+sender self-visibility, and correct "unable to decrypt" notices for
+history predating the device.
 
 Small CLI tools in `examples/` (list-rooms, tail-room, send-message) use
 the same client from Node — handy for debugging and demos.
 
 ## Roadmap
 
-- **E2EE (Olm/Megolm)** — the highest-value item; blocks most call work
-  (see below) and private-room usability against other clients.
-- **Voice/video calls** — not supported today, and the largest feature on
-  this list. Native Matrix group calls (MSC3401, what Element Call uses)
-  sit on top of E2EE (call member auth and media keys flow through
-  Olm/Megolm) plus WebRTC media transport. Realistic sequence: E2EE →
-  call signaling over to-device events → WebRTC (ideally via an SFU).
-  Interim option: embed Element Call in a `<webview>` window before
-  native calls land. Legacy 1:1 calls (`m.call` events) are possible
-  without the full group-call stack but are deprecated in the ecosystem
-  and still need WebRTC — not worth doing before the MSC3401 path.
+- **Voice/video calls (MSC3401)** — the E2EE prerequisite is in place;
+  next comes call signaling over to-device events, then WebRTC media
+  transport (ideally via an SFU). Interim option: embed Element Call in
+  a `<webview>` window before native calls land.
+- **E2EE hardening** — SAS/QR device verification, cross-signing, key
+  backup, key forwarding (session sharing to newly-seen devices), room
+  key rotation on membership change.
 - Invites UI (rooms.invite in sync), space management UI, media sending
   from the composer, message editing/reactions, reply chains.
 - Server-side read markers, presence, typing notifications.

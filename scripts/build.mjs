@@ -26,6 +26,26 @@ const common = {
   logLevel: "info",
 };
 
+/*
+ * libolm's wrapper is a universal (Node+browser) module: it requires
+ * fs/path/crypto in Node-only branches that feature-detect at runtime.
+ * For the browser bundle those branches are dead code — shim the builtins
+ * to empty modules so esbuild can resolve them.
+ */
+const emptyNodeBuiltinsPlugin = {
+  name: "empty-node-builtins",
+  setup(build) {
+    build.onResolve({ filter: /^(fs|path|crypto)$/ }, () => ({
+      path: "empty",
+      namespace: "empty-module",
+    }));
+    build.onLoad({ filter: /.*/, namespace: "empty-module" }, () => ({
+      contents: "module.exports = {};",
+      loader: "js",
+    }));
+  },
+};
+
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
 
@@ -56,6 +76,7 @@ await build({
   platform: "browser",
   format: "iife",
   target: "es2022",
+  plugins: [emptyNodeBuiltinsPlugin],
 });
 
 await cp(path.join(root, "src/renderer/index.html"), path.join(dist, "index.html"));
@@ -63,6 +84,11 @@ await cp(
   path.join(root, "src/renderer/styles"),
   path.join(dist, "styles"),
   { recursive: true }
+);
+/* libolm WASM — resolved by olm.js relative to the bundle (dist/). */
+await cp(
+  path.join(root, "node_modules/@matrix-org/olm/olm.wasm"),
+  path.join(dist, "olm.wasm")
 );
 
 console.log("grungus: build complete -> dist/");
