@@ -966,6 +966,56 @@ g-avatar.squared .av {
   display: none;
 }
 
+.invite-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(88, 101, 242, 0.12);
+  margin: 4px 8px;
+}
+
+.invite-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.invite-meta .room-name {
+  font-weight: 600;
+  color: var(--text-bright);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.invite-inviter {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.invite-accept,
+.invite-decline {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 8px;
+  flex: none;
+}
+
+.invite-accept:hover {
+  background: rgba(67, 181, 129, 0.2);
+  color: #43b581;
+}
+
+.invite-decline:hover {
+  background: rgba(240, 71, 71, 0.2);
+  color: #f04747;
+}
+
 .verify-card {
   background: var(--bg-sidebar);
   border-radius: 12px;

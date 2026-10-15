@@ -49,7 +49,10 @@ interface SyncJoinedRoom {
 
 export interface SyncResponse {
   next_batch?: string;
-  rooms?: { join?: Record<string, SyncJoinedRoom> };
+  rooms?: {
+    join?: Record<string, SyncJoinedRoom>;
+    invite?: Record<string, { invite_state?: { events?: MatrixEvent[] } }>;
+  };
   to_device?: { events?: ToDeviceEvent[] };
   device_one_time_keys_count?: Record<string, number>;
   device_lists?: { changed?: string[]; new?: string[] };
@@ -115,6 +118,21 @@ export type RoomEvent = TimelineItem | EchoMarker;
 export interface RoomUpdate {
   room: Room;
   newEvents: RoomEvent[];
+  /**
+   * Timeline items were changed in place (e.g. a forwarded room key turned
+   * "unable to decrypt" lines into messages) — the view should re-render
+   * the whole timeline instead of appending.
+   */
+  redraw?: boolean;
+}
+
+/** A room we are invited to but have not joined (rooms.invite in /sync). */
+export interface InvitedRoom {
+  id: string;
+  name: string | null;
+  inviterId: string | null;
+  isEncrypted: boolean;
+  isSpace: boolean;
 }
 
 export interface Room {
@@ -174,6 +192,7 @@ interface ClientEvents {
   ready: [];
   room: [RoomUpdate];
   rooms: [Room[]];
+  invites: [InvitedRoom[]];
   connection: [ConnectionState];
   error: [unknown];
   "auth-error": [HttpError];
@@ -241,6 +260,8 @@ export class MatrixClient {
   userId: string | null;
   deviceId: string | null;
   readonly rooms = new Map<string, Room>();
+  /** Rooms with a pending invite (rooms.invite in /sync). */
+  readonly invites = new Map<string, InvitedRoom>();
   connectionState: ConnectionState = "connecting";
   /** E2EE layer — attached by the app after login; null in plain mode. */
   crypto: E2eeCrypto | null = null;
@@ -262,11 +283,20 @@ export class MatrixClient {
   private _selectedRoomId: string | null = null;
   private _avatarCache = new Map<string, Promise<string | null>>();
   private _mediaCache = new Map<string, Promise<string | null>>();
+  /** Encrypted room events that failed to decrypt: roomId -> (eventId -> event). */
+  private _undecrypted = new Map<string, Map<string, MatrixEvent>>();
+  /**
+   * Encryption state for rooms not yet synced (set by createRoom/joinRoom):
+   * roomId -> is encrypted. Sends racing the first sync consult this so a
+   * room created/joined encrypted can never receive plaintext.
+   */
+  private _pendingEncryption = new Map<string, boolean>();
   private readonly _listeners: { [K in keyof ClientEvents]: Set<Listener<K>> } = {
     sync: new Set(),
     ready: new Set(),
     room: new Set(),
     rooms: new Set(),
+    invites: new Set(),
     connection: new Set(),
     error: new Set(),
     "auth-error": new Set(),
@@ -798,11 +828,12 @@ export class MatrixClient {
     if (!this.crypto) return null;
     const decrypted = this.crypto.decryptRoomEvent(ev);
     if (!decrypted) {
+      this._trackUndecrypted(room, ev);
       return {
         kind: "system",
         id: ev.event_id ?? null,
         ts: ev.origin_server_ts ?? Date.now(),
-        text: "🔒 Unable to decrypt this message (key not shared with this device)",
+        text: "🔒 Unable to decrypt this message (requesting the key from other devices…)",
       };
     }
     const inner: MatrixEvent = {
@@ -811,6 +842,66 @@ export class MatrixClient {
       content: decrypted.content,
     };
     return this._toTimelineItem(room, inner);
+  }
+
+  /**
+   * Remember an undecryptable event and fire a key request (deduped in the
+   * crypto layer). When a forwarded key arrives, retryUndecrypted() turns
+   * these into real timeline items.
+   */
+  private _trackUndecrypted(room: Room, ev: MatrixEvent): void {
+    const content = ev.content as { sender_key?: unknown; session_id?: unknown };
+    const senderKey = typeof content.sender_key === "string" ? content.sender_key : null;
+    const sessionId = typeof content.session_id === "string" ? content.session_id : null;
+    const eventId = ev.event_id ?? null;
+    if (!senderKey || !sessionId || !eventId) return;
+    if (this.crypto) {
+      void this.crypto
+        .requestRoomKey(room.id, ev.sender ?? null, senderKey, sessionId)
+        .catch((err) => console.error("[grungus] room key request failed:", err));
+    }
+    let perRoom = this._undecrypted.get(room.id);
+    if (!perRoom) {
+      perRoom = new Map();
+      this._undecrypted.set(room.id, perRoom);
+    }
+    perRoom.set(eventId, ev);
+  }
+
+  /**
+   * Retry tracked undecryptable events (called when a forwarded room key
+   * lands). Decrypted events replace their "unable to decrypt" system line
+   * in place; the room update carries redraw so the view re-renders.
+   */
+  retryUndecrypted(roomId: string): void {
+    const room = this.rooms.get(roomId);
+    const pending = this._undecrypted.get(roomId);
+    if (!room || !pending || pending.size === 0) return;
+    let changed = false;
+    for (const [eventId, ev] of [...pending.entries()]) {
+      const decrypted = this.crypto ? this.crypto.decryptRoomEvent(ev) : null;
+      if (!decrypted) continue;
+      pending.delete(eventId);
+      changed = true;
+      const inner: MatrixEvent = {
+        ...ev,
+        type: decrypted.type,
+        content: decrypted.content,
+      };
+      const item = this._toTimelineItem(room, inner);
+      if (!item) continue;
+      const idx = room.timeline.findIndex(
+        (entry) => entry.kind === "system" && entry.id === eventId
+      );
+      if (idx >= 0) room.timeline[idx] = item;
+      else room.timeline.push(item);
+      const ts = ev.origin_server_ts ?? Date.now();
+      if (ts > room.lastActivityTs) room.lastActivityTs = ts;
+    }
+    if (changed) {
+      this.emit("room", { room, newEvents: [], redraw: true });
+      this.emit("rooms", this.getRooms());
+    }
   }
 
   private _removeEcho(room: Room, txnId: string): boolean {
@@ -836,12 +927,8 @@ export class MatrixClient {
           this.onToDevice?.(event);
         }
         if (this.crypto) {
-          const encryptedToDevice = toDevice.filter(
-            (event) => event.type === "m.room.encrypted"
-          );
-          if (encryptedToDevice.length > 0) {
-            this.crypto.onToDeviceEvents(encryptedToDevice);
-          }
+          /* crypto filters internally: olm events, key requests */
+          this.crypto.onToDeviceEvents(toDevice);
           const keyCounts = data.device_one_time_keys_count;
           if (keyCounts) void this.crypto.onOneTimeKeyCounts(keyCounts);
           const changed = data.device_lists?.changed;
@@ -871,6 +958,29 @@ export class MatrixClient {
           this._seen.add(evId);
         }
         if (ev.state_key !== undefined) this._applyStateEvent(room, ev);
+        /* key rotation on membership transitions in encrypted rooms: a
+           fresh member (prev not "join" → join) must not read history, a
+           departing one (join → not join) must not read the future. Both
+           discard the outbound megolm session so the next send shares a
+           fresh one. Initial-sync state never passes through here, so
+           there are no spurious rotations at startup. */
+        if (
+          room.isEncrypted &&
+          this.crypto &&
+          ev.type === "m.room.member" &&
+          typeof ev.state_key === "string"
+        ) {
+          const prev = ev.unsigned?.prev_content?.membership;
+          const next =
+            typeof ev.content?.membership === "string" ? ev.content.membership : "";
+          const prevJoin = prev === "join";
+          const nextJoin = next === "join";
+          if (prevJoin !== nextJoin) {
+            void this.crypto
+              .discardOutboundSession(room.id)
+              .catch((err) => console.error("[grungus] rotation failed:", err));
+          }
+        }
         if (evId && this._acked.has(evId)) {
           const echoTxn = this._acked.get(evId)!;
           this._removeEcho(room, echoTxn);
@@ -943,6 +1053,69 @@ export class MatrixClient {
     if (changedRooms.length > 0) {
       this.emit("rooms", this.getRooms());
     }
+
+    /* rooms we are invited to (rooms.invite) */
+    const invited = data.rooms?.invite ?? {};
+    let invitesChanged = false;
+    for (const [roomId, rd] of Object.entries(invited)) {
+      if (this.rooms.has(roomId)) {
+        /* already joined via this or an earlier sync */
+        if (this.invites.delete(roomId)) invitesChanged = true;
+        continue;
+      }
+      let name: string | null = null;
+      let inviterId: string | null = null;
+      let isEncrypted = false;
+      let isSpace = false;
+      let stillInvited = false;
+      for (const ev of rd.invite_state?.events ?? []) {
+        if (ev.type === "m.room.name" && typeof ev.content?.name === "string") {
+          name = ev.content.name;
+        } else if (ev.type === "m.room.encryption") {
+          isEncrypted = true;
+        } else if (
+          ev.type === "m.room.create" &&
+          ev.content?.type === "m.space"
+        ) {
+          isSpace = true;
+        } else if (
+          ev.type === "m.room.member" &&
+          ev.state_key === this.userId
+        ) {
+          if (ev.content?.membership === "invite") {
+            stillInvited = true;
+            inviterId = ev.sender;
+          }
+        }
+      }
+      if (!stillInvited) {
+        /* revoked: our membership in the stripped state is no longer invite */
+        if (this.invites.delete(roomId)) invitesChanged = true;
+        continue;
+      }
+      const existingInvite = this.invites.get(roomId);
+      const nextInvite: InvitedRoom = { id: roomId, name, inviterId, isEncrypted, isSpace };
+      if (
+        !existingInvite ||
+        existingInvite.name !== name ||
+        existingInvite.inviterId !== inviterId
+      ) {
+        this.invites.set(roomId, nextInvite);
+        invitesChanged = true;
+      }
+    }
+    /* invites whose room became joined (rooms.join) are consumed above or by
+       accept; never drop an invite merely because a sync omitted the
+       section — incremental syncs omit unchanged data. */
+    for (const roomId of [...this.invites.keys()]) {
+      if (this.rooms.has(roomId)) {
+        this.invites.delete(roomId);
+        invitesChanged = true;
+      }
+    }
+    if (invitesChanged) {
+      this.emit("invites", this.getInvites());
+    }
   }
 
   /* --------------------------- room operations --------------------------- */
@@ -966,6 +1139,17 @@ export class MatrixClient {
     if (!text.trim()) throw new Error("Empty message");
     const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
     const room = this.rooms.get(roomId);
+    /* encryption decision must hold even when the first sync has not landed:
+       fall back to the flag createRoom/joinRoom recorded */
+    const encrypted = room
+      ? room.isEncrypted === true
+      : this._pendingEncryption.get(roomId) === true;
+    if (!room && encrypted === undefined) {
+      /* unknown room: we cannot know whether it is encrypted — sending
+         anyway could leak plaintext. Fail closed; the sync will land the
+         room state momentarily. */
+      throw new Error("Cannot send: room state not loaded yet (still syncing)");
+    }
     const echo: MessageItem = {
       kind: "message",
       id: `pending-${txnId}`,
@@ -984,7 +1168,6 @@ export class MatrixClient {
       this.emit("room", { room, newEvents: [echo] });
       this.emit("rooms", this.getRooms());
     }
-    const encrypted = room?.isEncrypted === true;
     if (encrypted && !this.crypto) {
       /* fail closed: never send plaintext into an encrypted room */
       throw new Error("Cannot send: E2EE is unavailable in this encrypted room");
@@ -1050,6 +1233,10 @@ export class MatrixClient {
       { body }
     );
     if (!res?.room_id) throw new Error("createRoom returned no room_id");
+
+    /* remember the encryption flag we asked for: a send racing ahead of the
+       first sync must never leak plaintext into a room created encrypted */
+    this._pendingEncryption.set(res.room_id, opts.encrypted === true);
     return res.room_id;
   }
 
@@ -1059,7 +1246,22 @@ export class MatrixClient {
       `${CLIENT_PREFIX}/join/${encodeURIComponent(roomIdOrAlias)}`,
       { body: {} }
     );
-    return res?.room_id ?? roomIdOrAlias;
+    const roomId = res?.room_id ?? roomIdOrAlias;
+
+    /* probe the encryption state as part of the join so sends racing the
+       first sync still encrypt correctly */
+    if (!this.rooms.has(roomId) && !this._pendingEncryption.has(roomId)) {
+      try {
+        const state = await this.api<{ algorithm?: string }>(
+          "GET",
+          `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/state/m.room.encryption`
+        );
+        this._pendingEncryption.set(roomId, typeof state.algorithm === "string");
+      } catch {
+        /* state unreadable — leave unknown; sends fail closed */
+      }
+    }
+    return roomId;
   }
 
   async invite(roomId: string, userId: string): Promise<void> {
@@ -1068,6 +1270,31 @@ export class MatrixClient {
       `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/invite`,
       { body: { user_id: userId } }
     );
+  }
+
+  /** Leave a room (also used to decline an invite). */
+  async leaveRoom(roomId: string): Promise<void> {
+    await this.api(
+      "POST",
+      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/leave`,
+      { body: {} }
+    );
+  }
+
+  /** Accept a pending invite by joining the room. */
+  async acceptInvite(roomId: string): Promise<void> {
+    await this.joinRoom(roomId);
+    if (this.invites.delete(roomId)) {
+      this.emit("invites", this.getInvites());
+    }
+  }
+
+  /** Decline a pending invite (leave without joining). */
+  async declineInvite(roomId: string): Promise<void> {
+    await this.leaveRoom(roomId);
+    if (this.invites.delete(roomId)) {
+      this.emit("invites", this.getInvites());
+    }
   }
 
   /** Send/overwrite a room state event (e.g. m.call.member). */
@@ -1149,6 +1376,13 @@ export class MatrixClient {
   ): Promise<string | null> {
     const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
     const room = this.rooms.get(roomId);
+    const encrypted = room
+      ? room.isEncrypted === true
+      : this._pendingEncryption.get(roomId) === true;
+    if (!room && encrypted === undefined) {
+      /* fail closed: an unknown room may be encrypted */
+      throw new Error("Cannot send: room state not loaded yet (still syncing)");
+    }
     const info: Record<string, unknown> = { mimetype: media.mimeType };
     if (media.width != null) info.w = media.width;
     if (media.height != null) info.h = media.height;
@@ -1160,7 +1394,7 @@ export class MatrixClient {
       info,
     };
 
-    if (room?.isEncrypted === true && !this.crypto) {
+    if (encrypted && !this.crypto) {
       throw new Error("Cannot send: E2EE is unavailable in this encrypted room");
     }
 
@@ -1190,9 +1424,9 @@ export class MatrixClient {
       this.emit("rooms", this.getRooms());
     }
     try {
-      const encrypted = room?.isEncrypted === true && this.crypto !== null;
-      const sendType = encrypted ? "m.room.encrypted" : "m.room.message";
-      const payload: Record<string, unknown> = encrypted
+      const sendEncrypted = encrypted && this.crypto !== null;
+      const sendType = sendEncrypted ? "m.room.encrypted" : "m.room.message";
+      const payload: Record<string, unknown> = sendEncrypted
         ? await this.crypto!.encryptRoomMessage(roomId, content)
         : content;
       const res = await this.api<{ event_id?: string }>(
@@ -1243,6 +1477,11 @@ export class MatrixClient {
   /** Joined spaces (m.space rooms). */
   getSpaces(): Room[] {
     return [...this.rooms.values()].filter((room) => room.isSpace);
+  }
+
+  /** Rooms with a pending invite. */
+  getInvites(): InvitedRoom[] {
+    return [...this.invites.values()];
   }
 
   getRoom(roomId: string): Room | null {

@@ -181,6 +181,8 @@ async function attachCrypto(c: MatrixClient): Promise<void> {
     const crypto = new E2eeCrypto({ host: c, store: makeCryptoStore() });
     await crypto.init();
     c.crypto = crypto;
+    /* a forwarded room key may decrypt tracked UTD events — retry them */
+    crypto.onInboundSessionAdded = (roomId) => c.retryUndecrypted(roomId);
   } catch (err) {
     console.error("[grungus] E2EE init failed (continuing without):", err);
   }
@@ -408,7 +410,13 @@ function startShell(): void {
     if (!client) return;
     callManager.onRoomUpdate(update.room);
     if (update.room.id === state.roomId) {
-      chat.appendEvents(update.room, update.newEvents);
+      if (update.redraw) {
+        /* timeline items changed in place (forwarded key decrypted UTD
+           lines) — full re-render */
+        chat.setRoom(update.room, client, client.userId);
+      } else {
+        chat.appendEvents(update.room, update.newEvents);
+      }
       members.update(update.room, client, client.userId);
       chat.setCallState(
         CallManager.callOngoing(update.room, active.userId),
@@ -417,6 +425,38 @@ function startShell(): void {
       chat.setTypingUsers(update.room.typingUsers);
     }
     refreshSidebar();
+  });
+
+  /* ---- invites ---- */
+  active.on("invites", (invites) => {
+    roomList.setInvites(invites);
+  });
+  roomList.addEventListener("grungus:accept-invite", (event) => {
+    const detail = (event as CustomEvent<{ roomId: string }>).detail;
+    void active
+      .acceptInvite(detail.roomId)
+      .then(() => {
+        roomList.setInvites(active.getInvites());
+        refreshSidebar();
+      })
+      .catch((err: unknown) => {
+        chat.setNotice(
+          `Could not accept invite: ${err instanceof Error ? err.message : "unknown error"}`
+        );
+      });
+  });
+  roomList.addEventListener("grungus:decline-invite", (event) => {
+    const detail = (event as CustomEvent<{ roomId: string }>).detail;
+    void active
+      .declineInvite(detail.roomId)
+      .then(() => {
+        roomList.setInvites(active.getInvites());
+      })
+      .catch((err: unknown) => {
+        chat.setNotice(
+          `Could not decline invite: ${err instanceof Error ? err.message : "unknown error"}`
+        );
+      });
   });
 
   active.on("connection", (connState) => {
@@ -473,6 +513,10 @@ function boot(): void {
           accessToken: saved.accessToken,
           userId: saved.userId,
         });
+        /* the olm account is bound to the server-side device — the crypto
+           layer needs the token's device id, not a stale client-generated
+           one from an old store */
+        client.deviceId = saved.deviceId ?? null;
         return client
           .whoami()
           .then(() => {

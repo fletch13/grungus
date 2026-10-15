@@ -383,7 +383,44 @@ async function main(): Promise<void> {
   /* the mxc URL itself must be hidden from the server: fetch the raw event */
   log("media message sent megolm-encrypted and media downloaded ✓");
 
-  /* 4e. SAS device verification, both sides */
+  /* 4e. rotation: b joining an encrypted room reads post-join but not pre-join.
+     Runs BEFORE SAS verification so the pair is unverified (a verified member
+     would legitimately receive history via key forwarding). */
+  const rotRoom = await a.createRoom({
+    name: `rot-e2e-${Date.now()}`,
+    isPublic: true,
+    encrypted: true,
+  });
+  await waitFor(() => a.getRoom(rotRoom) !== null, "rotation room syncs");
+  await a.sendMessage(rotRoom, "rot-before-join");
+  await waitFor(
+    () =>
+      (a.getRoom(rotRoom)?.timeline ?? []).some(
+        (item) => item.kind === "message" && (item as MessageItem).body === "rot-before-join"
+      ),
+    "sender sees the pre-join message"
+  );
+  await b.joinRoom(rotRoom);
+  await waitFor(
+    () => a.getRoom(rotRoom)?.members.get(b.userId!)?.membership === "join",
+    "sender sees the join"
+  );
+  await a.sendMessage(rotRoom, "rot-after-join");
+  await waitFor(
+    () =>
+      (b.getRoom(rotRoom)?.timeline ?? []).some(
+        (item) => item.kind === "message" && (item as MessageItem).body === "rot-after-join"
+      ),
+    "joiner reads the post-join message"
+  );
+  await new Promise((r) => setTimeout(r, 2_000));
+  const bSeesBefore = (b.getRoom(rotRoom)?.timeline ?? []).some(
+    (item) => item.kind === "message" && (item as MessageItem).body === "rot-before-join"
+  );
+  assert.equal(bSeesBefore, false, "pre-join history stays encrypted to the joiner");
+  log("rotation: joiner reads post-join messages, pre-join stays unreadable ✓");
+
+  /* 4f. SAS device verification, both sides */
   const managerA = new VerificationManager(cryptoA);
   cryptoA.addPayloadListener((sender, type, content) => {
     void managerA.handlePayload(sender, type, content);
@@ -421,6 +458,59 @@ async function main(): Promise<void> {
   const trustedByB = await cryptoB.getVerifiedKey(a.userId!, a.deviceId ?? "");
   assert.equal(trustedByB, cryptoA.ed25519Key);
   log("SAS verification: identical emoji, mutual device trust, MAC-checked ✓");
+
+  /* 4f. invites: b invites a to a private room; a accepts via the client */
+  const inviteRoom = await b.createRoom({ name: `invite-e2e-${Date.now()}`, isPublic: false });
+  await b.invite(inviteRoom, a.userId!);
+  await waitFor(
+    () => a.getInvites().some((entry) => entry.id === inviteRoom),
+    "a sees the invite"
+  );
+  const seenInvite = a.getInvites().find((entry) => entry.id === inviteRoom)!;
+  assert.ok(seenInvite.inviterId === b.userId, "invite carries the inviter");
+  await a.acceptInvite(inviteRoom);
+  await waitFor(() => a.getRoom(inviteRoom) !== null, "a joined the invited room");
+  await b.sendMessage(inviteRoom, "invitation accepted");
+  await waitFor(
+    () =>
+      (a.getRoom(inviteRoom)?.timeline ?? []).some(
+        (item) => item.kind === "message" && (item as MessageItem).body === "invitation accepted"
+      ),
+    "a receives a message in the accepted room"
+  );
+  log("invites: private invite visible in sync, accepted, messages flow ✓");
+
+  /* 4g. key forwarding: a second device of user A receives history */
+  const fwdRoom = await a.createRoom({
+    name: `fwd-e2e-${Date.now()}`,
+    isPublic: true,
+    encrypted: true,
+  });
+  await b.joinRoom(fwdRoom);
+  await waitFor(() => a.getRoom(fwdRoom) !== null, "forward room syncs");
+  await a.sendMessage(fwdRoom, "fwd-history-1");
+  await a.sendMessage(fwdRoom, "fwd-history-2");
+
+  /* second device of the SAME user: fresh login, fresh olm identity */
+  const a2 = new MatrixClient({ baseUrl: HOME });
+  await a2.loginWithPassword({ username: USER1, password: PASS1 });
+  const cryptoA2 = new E2eeCrypto({ host: a2, store: new MemoryCryptoStore() });
+  await cryptoA2.init();
+  a2.crypto = cryptoA2;
+  cryptoA2.onInboundSessionAdded = (roomId) => a2.retryUndecrypted(roomId);
+  a2.startSync();
+  await waitFor(
+    () =>
+      (a2.getRoom(fwdRoom)?.timeline ?? []).some(
+        (item) => item.kind === "message" && (item as MessageItem).body === "fwd-history-1"
+      ) &&
+      (a2.getRoom(fwdRoom)?.timeline ?? []).some(
+        (item) => item.kind === "message" && (item as MessageItem).body === "fwd-history-2"
+      ),
+    "second device decrypts history via forwarded key"
+  );
+  log("key forwarding: fresh device of the same user receives history ✓");
+  a2.stopSync();
 
   a.stopSync();
   b.stopSync();

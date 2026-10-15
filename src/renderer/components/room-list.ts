@@ -5,7 +5,13 @@
  * "grungus:logout".
  */
 import { el } from "./ui.ts";
-import type { ConnectionState, MatrixClient, Room } from "../services/matrix-client.ts";
+import {
+  mxidLocalpart,
+  type ConnectionState,
+  type InvitedRoom,
+  type MatrixClient,
+  type Room,
+} from "../services/matrix-client.ts";
 
 export interface UserInfo {
   userId: string;
@@ -16,6 +22,7 @@ export interface UserInfo {
 export class RoomList extends HTMLElement {
   private _rooms: Room[] = [];
   private _spaces: Room[] = [];
+  private _invites: InvitedRoom[] = [];
   private _selectedRoomId: string | null = null;
   private _spaceId: string | null = null;
   private _client: MatrixClient | null = null;
@@ -45,6 +52,11 @@ export class RoomList extends HTMLElement {
   setUser(user: UserInfo | null): void {
     this._user = user;
     this._renderFooter();
+  }
+
+  setInvites(invites: InvitedRoom[]): void {
+    this._invites = invites;
+    this._render();
   }
 
   setConnection(state: ConnectionState): void {
@@ -120,6 +132,9 @@ export class RoomList extends HTMLElement {
 
     /* scrollable room sections */
     const scroll = el("div", { class: "room-scroll" });
+
+    this._renderInvites(scroll);
+
     const roomsSection = this._rooms.filter((room) => !room.isDirect);
     const dmSection = this._rooms.filter((room) => room.isDirect);
 
@@ -147,6 +162,53 @@ export class RoomList extends HTMLElement {
     if (rooms.length === 0) return;
     container.appendChild(el("div", { class: "sidebar-section", text: label }));
     for (const room of rooms) container.appendChild(this._buildRoomRow(room));
+  }
+
+  /** Pending-invite rows with accept/decline buttons. */
+  private _renderInvites(container: HTMLElement): void {
+    if (this._invites.length === 0) return;
+    container.appendChild(el("div", { class: "sidebar-section", text: "Invites" }));
+    for (const invite of this._invites) {
+      const row = el("div", { class: "invite-row", dataset: { roomId: invite.id } });
+      const meta = el("div", { class: "invite-meta" });
+      meta.appendChild(
+        el("div", {
+          class: "room-name",
+          text: `${invite.isEncrypted ? "🔒 " : ""}${invite.name ?? "Unnamed room"}`,
+        })
+      );
+      const inviter = invite.inviterId ? mxidLocalpart(invite.inviterId) : null;
+      meta.appendChild(
+        el("div", {
+          class: "invite-inviter",
+          text: inviter ? `invited by ${inviter}` : "you are invited",
+        })
+      );
+      const accept = el("button", { class: "invite-accept", title: "Accept", text: "✓" });
+      accept.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.dispatchEvent(
+          new CustomEvent("grungus:accept-invite", {
+            detail: { roomId: invite.id },
+            bubbles: true,
+          })
+        );
+      });
+      const decline = el("button", { class: "invite-decline", title: "Decline", text: "✗" });
+      decline.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.dispatchEvent(
+          new CustomEvent("grungus:decline-invite", {
+            detail: { roomId: invite.id },
+            bubbles: true,
+          })
+        );
+      });
+      row.appendChild(meta);
+      row.appendChild(accept);
+      row.appendChild(decline);
+      container.appendChild(row);
+    }
   }
 
   private _buildRoomRow(room: Room): HTMLElement {

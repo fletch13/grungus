@@ -27,6 +27,7 @@ interface MockEvent {
   origin_server_ts: number;
   seq: number;
   state_key?: string;
+  unsigned?: { prev_content?: Record<string, unknown>; [key: string]: unknown };
 }
 
 interface MockRoom {
@@ -61,16 +62,19 @@ interface CreateRoomOptions {
 
 export class MockHomeserver {
   readonly users = new Map<string, MockUser>();
-  readonly tokens = new Map<string, string>(); /* token -> username */
+  /** token -> { username, deviceId } — tokens are device-bound like real servers. */
+  readonly tokens = new Map<string, { username: string; deviceId: string }>();
   readonly rooms = new Map<string, MockRoom>();
   /** media: id -> { bytes, mime } */
   readonly media = new Map<string, { bytes: Buffer; mime: string }>();
   /** username -> deviceId -> device (keys + one-time keys). */
   readonly devices = new Map<string, Map<string, MockDevice>>();
-  /** username -> queued to-device events (with global seq for sync wakeups). */
+  /** username -> deviceId -> queued to-device events (with global seq for sync wakeups).
+   *  To-device routing is PER DEVICE (real servers never leak one device's
+   *  olm messages to another device of the same user). */
   private readonly toDeviceQueue = new Map<
     string,
-    { seq: number; event: Record<string, unknown> }[]
+    Map<string, { seq: number; event: Record<string, unknown> }[]>
   >();
   baseUrl: string | null = null;
   port: number | null = null;
@@ -91,7 +95,10 @@ export class MockHomeserver {
     });
   }
 
+  private _closed = false;
+
   close(): Promise<void> {
+    this._closed = true; /* abort pending long-poll loops */
     return new Promise((resolve) => {
       const server = this._server;
       if (!server) {
@@ -153,6 +160,19 @@ export class MockHomeserver {
       seq: ++this._seq,
     };
     if (extra && extra.state_key !== undefined) ev.state_key = extra.state_key;
+    /* real servers attach unsigned.prev_content on membership transitions —
+       the client's key rotation depends on it */
+    if (
+      ev.type === "m.room.member" &&
+      ev.state_key !== undefined &&
+      room.members.has(ev.state_key)
+    ) {
+      const prev = room.members.get(ev.state_key);
+      ev.unsigned = {
+        ...ev.unsigned,
+        prev_content: { membership: prev },
+      };
+    }
     room.events.push(ev);
 
     /* mock-side bookkeeping for routing (join checks etc.) */
@@ -311,11 +331,19 @@ export class MockHomeserver {
     this._send(res, status, { errcode, error });
   }
 
-  private _authUser(req: http.IncomingMessage): MockUser | null {
+  private _authContext(
+    req: http.IncomingMessage
+  ): { user: MockUser; deviceId: string } | null {
     const header = req.headers["authorization"] ?? "";
     const token = String(header).replace(/^Bearer /, "");
-    const username = this.tokens.get(token);
-    return username ? (this.users.get(username) ?? null) : null;
+    const entry = this.tokens.get(token);
+    if (!entry) return null;
+    const user = this.users.get(entry.username);
+    return user ? { user, deviceId: entry.deviceId } : null;
+  }
+
+  private _authUser(req: http.IncomingMessage): MockUser | null {
+    return this._authContext(req)?.user ?? null;
   }
 
   private _route(
@@ -362,11 +390,12 @@ export class MockHomeserver {
         return;
       }
       const token = "tok_" + crypto.randomBytes(12).toString("hex");
-      this.tokens.set(token, user.username);
+      const deviceId = "MOCK_" + crypto.randomBytes(6).toString("hex");
+      this.tokens.set(token, { username: user.username, deviceId });
       this._send(res, 200, {
         access_token: token,
         user_id: user.userId,
-        device_id: "MOCKDEVICE",
+        device_id: deviceId,
         home_server: "mock.hs",
       });
       return;
@@ -506,14 +535,16 @@ export class MockHomeserver {
       for (const [userId, deviceMap] of Object.entries(messages)) {
         const username = this._usernameForUserId(userId);
         if (!username) continue;
-        const queue = this.toDeviceQueue.get(username) ?? [];
-        for (const [_deviceId, content] of Object.entries(deviceMap)) {
+        const byDevice = this.toDeviceQueue.get(username) ?? new Map();
+        this.toDeviceQueue.set(username, byDevice);
+        for (const [targetDeviceId, content] of Object.entries(deviceMap)) {
+          const queue = byDevice.get(targetDeviceId) ?? [];
           queue.push({
             seq: ++this._seq,
             event: { type, sender: user.userId, content },
           });
+          byDevice.set(targetDeviceId, queue);
         }
-        this.toDeviceQueue.set(username, queue);
       }
       this._send(res, 200, {});
       return;
@@ -588,6 +619,50 @@ export class MockHomeserver {
       return;
     }
 
+    const leaveMatch = route.match(/^rooms\/([^/]+)\/leave$/);
+    if (req.method === "POST" && leaveMatch) {
+      const room = this.rooms.get(leaveMatch[1] ?? "");
+      if (!room) {
+        this._err(res, 404, "M_NOT_FOUND", "Unknown room");
+        return;
+      }
+      const membership = room.members.get(user.userId);
+      if (membership !== "join" && membership !== "invite") {
+        this._err(res, 403, "M_FORBIDDEN", "Not in room");
+        return;
+      }
+      this._appendEvent(
+        room,
+        "m.room.member",
+        user.userId,
+        { membership: "leave" },
+        { state_key: user.userId }
+      );
+      this._send(res, 200, {});
+      return;
+    }
+
+    /* GET room state (e.g. the m.room.encryption probe in joinRoom) */
+    const getStateMatch = route.match(/^rooms\/([^/]+)\/state\/([^/]+)(?:\/(.*))?$/);
+    if (req.method === "GET" && getStateMatch) {
+      const room = this.rooms.get(getStateMatch[1] ?? "");
+      if (!room) {
+        this._err(res, 404, "M_NOT_FOUND", "Unknown room");
+        return;
+      }
+      const type = getStateMatch[2] ?? "";
+      const stateKey = getStateMatch[3] ?? "";
+      const found = [...room.events]
+        .reverse()
+        .find((event) => event.type === type && (event.state_key ?? "") === stateKey);
+      if (found) {
+        this._send(res, 200, found.content);
+      } else {
+        this._err(res, 404, "M_NOT_FOUND", "State event not found");
+      }
+      return;
+    }
+
     /* generic state event send (e.g. m.call.member) */
     const stateMatch = route.match(/^rooms\/([^/]+)\/state\/([^/]+)\/(.*)$/);
     if (req.method === "PUT" && stateMatch) {
@@ -644,7 +719,12 @@ export class MockHomeserver {
     }
 
     if (req.method === "GET" && route === "sync") {
-      this._handleSync(res, user, query);
+      const context = this._authContext(req);
+      if (context) {
+        this._handleSync(res, context.user, context.deviceId, query);
+      } else {
+        this._err(res, 401, "M_UNKNOWN_TOKEN", "Unrecognised access token");
+      }
       return;
     }
 
@@ -668,39 +748,64 @@ export class MockHomeserver {
     return out;
   }
 
-  private _hasNew(user: MockUser, sinceNum: number): boolean {
-    const toDevice = this.toDeviceQueue.get(user.username) ?? [];
-    if (toDevice.some((entry) => entry.seq > sinceNum)) return true;
-    return this._joinedRooms(user).some(
-      (room) =>
-        room.typingSeq > sinceNum ||
+  private _invitedRooms(user: MockUser): MockRoom[] {
+    const out: MockRoom[] = [];
+    for (const room of this.rooms.values()) {
+      if (room.members.get(user.userId) === "invite") out.push(room);
+    }
+    return out;
+  }
+
+  /** username -> room ids already delivered by a sync (first delivery includes full state). */
+  private readonly _syncedRooms = new Map<string, Set<string>>();
+
+  private _hasNew(
+    user: MockUser,
+    deviceId: string,
+    sinceNum: number
+  ): boolean {
+    const deviceQueue = this.toDeviceQueue.get(user.username)?.get(deviceId) ?? [];
+    if (deviceQueue.some((entry) => entry.seq > sinceNum)) return true;
+    return (
+      this._invitedRooms(user).some((room) =>
         room.events.some((event) => event.seq > sinceNum)
+      ) ||
+      this._joinedRooms(user).some(
+        (room) =>
+          room.typingSeq > sinceNum ||
+          room.events.some((event) => event.seq > sinceNum)
+      )
     );
   }
 
   private _handleSync(
     res: http.ServerResponse,
     user: MockUser,
+    deviceId: string,
     query: URLSearchParams
   ): void {
     const since = query.get("since");
     const timeout = Number(query.get("timeout") ?? "0");
     const sinceNum = since ? Number(since) : null;
 
-    if (!since || (sinceNum !== null && this._hasNew(user, sinceNum))) {
-      this._send(res, 200, this._buildSync(user, sinceNum));
+    if (!since || (sinceNum !== null && this._hasNew(user, deviceId, sinceNum))) {
+      this._send(res, 200, this._buildSync(user, deviceId, sinceNum));
       return;
     }
     if (!timeout) {
-      this._send(res, 200, this._buildSync(user, sinceNum));
+      this._send(res, 200, this._buildSync(user, deviceId, sinceNum));
       return;
     }
 
     /* long-poll: poll internally until new events or deadline */
     const deadline = Date.now() + Math.min(timeout, 30_000);
     const poll = (): void => {
-      if ((sinceNum !== null && this._hasNew(user, sinceNum)) || Date.now() >= deadline) {
-        this._send(res, 200, this._buildSync(user, sinceNum));
+      if (this._closed) return; /* server closed under us */
+      if (
+        (sinceNum !== null && this._hasNew(user, deviceId, sinceNum)) ||
+        Date.now() >= deadline
+      ) {
+        this._send(res, 200, this._buildSync(user, deviceId, sinceNum));
       } else {
         setTimeout(poll, 20);
       }
@@ -708,14 +813,26 @@ export class MockHomeserver {
     poll();
   }
 
-  private _buildSync(user: MockUser, sinceNum: number | null): Record<string, unknown> {
+  private _buildSync(
+    user: MockUser,
+    deviceId: string,
+    sinceNum: number | null
+  ): Record<string, unknown> {
     const join: Record<string, unknown> = {};
     for (const room of this._joinedRooms(user)) {
+      /* Real servers deliver a newly-joined room's full state in the first
+         sync it appears in — otherwise clients miss e.g. m.room.encryption
+         and silently drop encrypted events. Mirror that here. */
+      const seen = this._syncedRooms.get(user.username) ?? new Set<string>();
+      this._syncedRooms.set(user.username, seen);
+      const firstSync = !seen.has(room.id);
+      if (firstSync) seen.add(room.id);
+
       const isState = (event: MockEvent) => event.state_key !== undefined;
       const stateEvents =
-        sinceNum === null ? room.events.filter(isState) : [];
+        sinceNum === null || firstSync ? room.events.filter(isState) : [];
       const timelineEvents =
-        sinceNum === null
+        sinceNum === null || firstSync
           ? room.events.filter((event) => !isState(event))
           : room.events.filter((event) => event.seq > sinceNum);
       const joinedCount = [...room.members.values()].filter(
@@ -746,30 +863,40 @@ export class MockHomeserver {
       join[room.id] = joinEntry;
     }
 
-    /* to-device: deliver queued events once (initial sync delivers all). */
-    const queue = this.toDeviceQueue.get(user.username) ?? [];
+    /* to-device: deliver THIS device's queued events (initial sync delivers all). */
+    const deviceQueue =
+      this.toDeviceQueue.get(user.username)?.get(deviceId) ?? [];
     let delivered: { seq: number; event: Record<string, unknown> }[];
     if (sinceNum === null) {
-      delivered = queue.splice(0, queue.length);
+      delivered = deviceQueue.splice(0, deviceQueue.length);
     } else {
-      delivered = queue.filter((entry) => entry.seq > sinceNum);
-      this.toDeviceQueue.set(
-        user.username,
-        queue.filter((entry) => entry.seq <= sinceNum)
-      );
+      delivered = deviceQueue.filter((entry) => entry.seq > sinceNum);
+      const remaining = deviceQueue.filter((entry) => entry.seq <= sinceNum);
+      this.toDeviceQueue.get(user.username)?.set(deviceId, remaining);
+    }
+
+    /* rooms.invite: stripped state for rooms the user is invited to */
+    const invite: Record<string, unknown> = {};
+    for (const room of this._invitedRooms(user)) {
+      const stripped = room.events
+        .filter((event) => event.state_key !== undefined)
+        .map((event) => ({
+          type: event.type,
+          state_key: event.state_key,
+          sender: event.sender,
+          content: event.content,
+        }));
+      invite[room.id] = { invite_state: { events: stripped } };
     }
 
     const userDevices = this.devices.get(user.username);
-    const totalOtks = [...(userDevices?.values() ?? [])].reduce(
-      (n, d) => n + d.oneTimeKeys.size,
-      0
-    );
+    const myOtks = userDevices?.get(deviceId)?.oneTimeKeys.size ?? 0;
 
     return {
       next_batch: String(this._seq),
-      rooms: { join },
+      rooms: { join, invite },
       to_device: { events: delivered.map((entry) => entry.event) },
-      device_one_time_keys_count: { signed_curve25519: totalOtks },
+      device_one_time_keys_count: { signed_curve25519: myOtks },
     };
   }
 }

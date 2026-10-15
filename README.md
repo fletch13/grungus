@@ -19,7 +19,21 @@ for an open protocol.
   are megolm-encrypted via libolm (WASM); room keys are shared over olm
   to-device messages to every member device, including your own.
   Encrypted rooms show a 🔒 badge; sends fail closed rather than leaking
-  plaintext; undecryptable history shows an explicit notice.
+  plaintext (including sends that race the first room sync);
+  undecryptable events show an explicit notice while the key is
+  requested from other devices.
+- **Room key forwarding (m.room_key_request / m.forwarded_room_key)** —
+  a fresh device asks your other devices (and SAS-verified members)
+  for the megolm sessions behind "unable to decrypt" history; the
+  exported session is imported at its chain index and the affected
+  messages decrypt in place, live. Unverified strangers are declined.
+- **Key rotation on membership change** — when someone joins or leaves
+  an encrypted room, senders start a fresh megolm session: joiners can
+  read from their join onward (not before, unless verified — see
+  forwarding), and leavers cannot read the room's future.
+- **Invites** — rooms you are invited to (rooms.invite in /sync) appear
+  in an "Invites" section with accept/decline buttons; accepting joins
+  and immediately enables chat.
 - **Native group calls (MSC3401, full-mesh WebRTC)** — start or join a
   call from the chat header; m.call.member state announces membership,
   SDP offers/answers and ICE candidates flow over olm-encrypted
@@ -224,6 +238,21 @@ device). The SAS UI path — verify button, emoji comparison card,
 "They match" confirmation — was additionally driven live in the
 browser against a real second device.
 
+Key forwarding, rotation, and invites are verified the same way:
+mock suites (a second device of the same user decrypts history; an
+unverified stranger is declined; a SAS-verified member gets history
+after joining; joiners read post-join but not pre-join messages;
+leavers cannot read future messages; invite appear/accept/decline),
+the real-homeserver e2e (rotation and invites over conduwuit; a fresh
+login of the same user receiving history via a forwarded key), and
+live in the browser: a fresh device's "unable to decrypt" lines in a
+room with real history turned into the decrypted messages in place,
+and an invite card was accepted through the UI with messages flowing
+immediately after. One real bug class was found and fixed during this
+verification: a send racing the first sync of a room used to leak
+plaintext into encrypted rooms — createRoom/joinRoom now carry the
+encryption flag and unknown-room sends fail closed.
+
 Small CLI tools in `examples/` (list-rooms, tail-room, send-message) use
 the same client from Node — handy for debugging and demos.
 
@@ -234,10 +263,10 @@ the same client from Node — handy for debugging and demos.
   (the signaling is modeled on MSC3401 but interop is untested), and
   insertable-streams E2EE media on top of DTLS-SRTP.
 - **E2EE hardening** — QR device verification, cross-signing, key
-  backup, key forwarding (session sharing to newly-seen devices), room
-  key rotation on membership change. (SAS emoji verification shipped —
-  see above; verification persistence is per-device-store only.)
-- Invites UI (rooms.invite in sync), space management UI, message
+  backup. (SAS verification, key forwarding to own/verified devices,
+  and rotation on membership change shipped — see above; verification
+  persistence is per-device-store only.)
+- Space management UI, message
   editing/reactions, reply chains.
 - Server-side read markers, presence, notifications
   (Electron + Push Gateway).

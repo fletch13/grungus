@@ -65,8 +65,14 @@ export interface OlmOutboundGroupSessionApi {
 
 export interface OlmInboundGroupSessionApi {
   create(sessionKey: string): void;
+  /** Import a forwarded (exported) megolm session key. */
+  import_session(sessionKey: string): string;
   decrypt(ciphertext: string): { plaintext: string; message_index: number };
   session_id(): string;
+  /** Earliest chain index this session can decrypt from. */
+  first_known_index(): number;
+  /** Export the session at a chain index (for forwarding to other devices). */
+  export_session(messageIndex: number): string;
   pickle(key: string): string;
   unpickle(key: string, pickle: string): void;
   free(): void;
@@ -152,6 +158,8 @@ interface OutboundRoomRecord {
   sessionPickle: string;
   shared: boolean;
   messageCount: number;
+  /** set when the session was discarded (membership rotation) — next send creates a fresh one */
+  discarded?: boolean;
 }
 
 const ONE_TIME_KEY_TARGET = 50;
@@ -199,7 +207,16 @@ export class E2eeCrypto {
     string,
     { session: OlmInboundGroupSessionApi; roomId: string }
   >();
+  /** room-key requests already sent (dedup per session). */
+  private readonly _requestedKeys = new Set<string>();
   private _txnCounter = 0;
+
+  /**
+   * Client hook: a new inbound group session landed (forwarded room key).
+   * The client uses it to retry decrypting tracked "unable to decrypt"
+   * events.
+   */
+  onInboundSessionAdded: ((roomId: string) => void) | null = null;
 
   constructor(options: {
     host: CryptoHost;
@@ -225,6 +242,17 @@ export class E2eeCrypto {
 
     const storedDeviceId = await this._store.get(STORE_DEVICE_ID);
     this._deviceId = this.host.deviceId ?? storedDeviceId ?? this._deviceId;
+    if (this.host.deviceId && storedDeviceId && storedDeviceId !== this.host.deviceId) {
+      /* the pickled account belongs to a DIFFERENT device (e.g. a stale
+         client-generated id, or another session's device): the olm account
+         is useless with this token — start a fresh device identity */
+      console.warn(
+        `[e2ee] stored device ${storedDeviceId} does not match the login device ${this.host.deviceId} — resetting the crypto identity`
+      );
+      this._deviceId = this.host.deviceId;
+      await this._store.put(STORE_DEVICE_ID, this._deviceId);
+      await this._store.put(STORE_ACCOUNT, ""); /* force a fresh account below */
+    }
     if (!this._deviceId) {
       this._deviceId = "GRUNGUS_" + Math.random().toString(16).slice(2, 10);
       await this._store.put(STORE_DEVICE_ID, this._deviceId);
@@ -380,8 +408,8 @@ export class E2eeCrypto {
 
   /** The Ed25519 key the server has published for a device. */
   async getDeviceEd25519(userId: string, deviceId: string): Promise<string | null> {
-    const devices = await this.getUserDevices(userId);
-    return devices.find((device) => device.deviceId === deviceId)?.ed25519 ?? null;
+    const device = await this.findDevice(userId, deviceId);
+    return device?.ed25519 ?? null;
   }
 
   /** Record a SAS-verified device key (trust replaces TOFU for the pair). */
@@ -408,8 +436,7 @@ export class E2eeCrypto {
     type: string,
     content: Record<string, unknown>
   ): Promise<void> {
-    const devices = await this.getUserDevices(targetUserId);
-    const device = devices.find((d) => d.deviceId === targetDeviceId);
+    const device = await this.findDevice(targetUserId, targetDeviceId);
     if (!device) throw new Error(`unknown device ${targetUserId}/${targetDeviceId}`);
     const session = await this.getOrCreateOlmSession(device, targetUserId);
     if (!session) throw new Error(`no olm session to ${targetUserId}/${targetDeviceId}`);
@@ -444,6 +471,23 @@ export class E2eeCrypto {
   private async getUserDevices(userId: string): Promise<DeviceInfo[]> {
     const cached = this._deviceCache.get(userId);
     if (cached) return cached;
+    return this._queryDevices(userId);
+  }
+
+  /**
+   * Find one device of a user, re-querying the directory once when the id
+   * is not in our cache (the device may have come online after we cached).
+   */
+  private async findDevice(userId: string, deviceId: string): Promise<DeviceInfo | null> {
+    const list = await this.getUserDevices(userId);
+    const found = list.find((device) => device.deviceId === deviceId) ?? null;
+    if (found) return found;
+    this._deviceCache.delete(userId);
+    const refreshed = await this._queryDevices(userId);
+    return refreshed.find((device) => device.deviceId === deviceId) ?? null;
+  }
+
+  private async _queryDevices(userId: string): Promise<DeviceInfo[]> {
     const res = await this.host.api<{
       device_keys?: Record<string, Record<string, { keys?: Record<string, string> }>>;
     }>("POST", "/_matrix/client/v3/keys/query", {
@@ -563,12 +607,15 @@ export class E2eeCrypto {
 
   private async _ensureOutboundSession(roomId: string): Promise<OutboundRoomRecord> {
     const existing = this._outbound.get(roomId);
-    if (existing) return existing;
+    if (existing && !existing.discarded) return existing;
     const stored = await this._store.get(this._storeKeyOutbound(roomId));
-    if (stored) {
+    if (!existing && stored) {
       const record = JSON.parse(stored) as OutboundRoomRecord;
-      this._outbound.set(roomId, record);
-      return record;
+      if (!record.discarded) {
+        this._outbound.set(roomId, record);
+        return record;
+      }
+      /* tombstone from a rotation — fall through and create fresh */
     }
     const record: OutboundRoomRecord = {
       sessionPickle: "",
@@ -581,6 +628,28 @@ export class E2eeCrypto {
     this._outbound.set(roomId, record);
     await this._store.put(this._storeKeyOutbound(roomId), JSON.stringify(record));
     return record;
+  }
+
+  /**
+   * Discard the room's outbound megolm session (key rotation). Called by
+   * the client when membership changes in an encrypted room, so messages
+   * sent afterwards use a fresh session that joining members can read
+   * (and leaving members cannot). No-op when no session exists yet.
+   */
+  async discardOutboundSession(roomId: string): Promise<void> {
+    if (!this._outbound.has(roomId)) {
+      /* not loaded yet — tombstone the persisted record if any */
+      const stored = await this._store.get(this._storeKeyOutbound(roomId));
+      if (!stored) return;
+    }
+    this._outbound.delete(roomId);
+    const tombstone: OutboundRoomRecord = {
+      sessionPickle: "",
+      shared: false,
+      messageCount: 0,
+      discarded: true,
+    };
+    await this._store.put(this._storeKeyOutbound(roomId), JSON.stringify(tombstone));
   }
 
   /** Share the megolm session key with every joined member's devices. */
@@ -656,9 +725,151 @@ export class E2eeCrypto {
   /** sync hook: to_device events. */
   onToDeviceEvents(events: MatrixWireEvent[]): void {
     for (const event of events) {
-      if (event.type !== "m.room.encrypted" || !event.content) continue;
-      this._handleOlmEvent(event);
+      if (event.type === "m.room.encrypted" && event.content) {
+        this._handleOlmEvent(event);
+      } else if (event.type === "m.room_key_request" && event.content) {
+        this._handleKeyRequest(event);
+      }
     }
+  }
+
+  /* --------------------------- key forwarding ----------------------------- */
+
+  /**
+   * Ask devices that may hold a megolm session for its key (m.room_key_request,
+   * plaintext to-device — the request itself carries nothing secret). Targets:
+   * the original sender's devices and our other own devices. Deduped per
+   * (senderKey, sessionId).
+   */
+  async requestRoomKey(
+    roomId: string,
+    senderUserId: string | null,
+    senderKey: string,
+    sessionId: string
+  ): Promise<void> {
+    const dedupeKey = `${senderKey}|${sessionId}`;
+    if (this._requestedKeys.has(dedupeKey)) return;
+    this._requestedKeys.add(dedupeKey);
+
+    const requestId = `req-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const content = {
+      action: "request",
+      request_id: requestId,
+      requesting_device_id: this._deviceId,
+      body: {
+        algorithm: ALGORITHM_MEGOLM,
+        room_id: roomId,
+        sender_key: senderKey,
+        session_id: sessionId,
+      },
+    };
+
+    const messages: Record<string, Record<string, unknown>> = {};
+    const addTarget = async (userId: string): Promise<void> => {
+      const devices = await this.getUserDevices(userId);
+      for (const device of devices) {
+        if (userId === this.host.userId && device.deviceId === this._deviceId) continue;
+        messages[userId] = messages[userId] ?? {};
+        messages[userId]![device.deviceId] = content;
+      }
+    };
+    if (senderUserId) await addTarget(senderUserId);
+    if (this.host.userId) await addTarget(this.host.userId);
+
+    if (Object.keys(messages).length === 0) return;
+    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
+    await this.host.api(
+      "PUT",
+      `/_matrix/client/v3/sendToDevice/m.room_key_request/${encodeURIComponent(txnId)}`,
+      { body: { messages } }
+    );
+  }
+
+  /**
+   * We hold a session another device asks for. Policy (Element-like):
+   * forward to our own user's devices, and to devices whose Ed25519 key
+   * we have verified via SAS. Never forward to strangers.
+   */
+  private _handleKeyRequest(event: MatrixWireEvent): void {
+    const content = event.content as {
+      action?: string;
+      requesting_device_id?: string;
+      body?: {
+        algorithm?: string;
+        room_id?: string;
+        sender_key?: string;
+        session_id?: string;
+      };
+    };
+    if (content.action !== "request" || !content.requesting_device_id) return;
+    const body = content.body ?? {};
+    if (body.algorithm !== ALGORITHM_MEGOLM || !body.sender_key || !body.session_id) return;
+
+    const requester = event.sender;
+    const requestDevice = content.requesting_device_id;
+
+    void (async () => {
+      try {
+        const ownUser = requester === this.host.userId;
+        if (!ownUser) {
+          const [verified, published] = await Promise.all([
+            this.getVerifiedKey(requester, requestDevice),
+            this.getDeviceEd25519(requester, requestDevice),
+          ]);
+          if (!verified || !published || verified !== published) {
+            console.warn(
+              `[e2ee] declining room-key request from unverified device ${requester}/${requestDevice}`
+            );
+            return;
+          }
+        }
+
+        const entry = this._inbound.get(`${body.sender_key}|${body.session_id}`);
+        if (!entry) return; /* we do not hold the requested session */
+
+        /* export at the earliest index we can provide — the requester
+           gets as much history as this device has */
+        const exported = entry.session.export_session(
+          entry.session.first_known_index()
+        );
+        await this.sendToDeviceEncrypted(requester, requestDevice, "m.forwarded_room_key", {
+          algorithm: ALGORITHM_MEGOLM,
+          room_id: entry.roomId,
+          sender_key: body.sender_key,
+          session_id: body.session_id,
+          session_key: exported,
+        });
+      } catch (err) {
+        console.error("[e2ee] failed to forward room key:", err);
+      }
+    })();
+  }
+
+  /** Ingest a forwarded megolm session (m.forwarded_room_key via olm). */
+  private _ingestForwardedRoomKey(content: Record<string, unknown>): void {
+    const roomId = typeof content.room_id === "string" ? content.room_id : null;
+    const senderKey = typeof content.sender_key === "string" ? content.sender_key : null;
+    const sessionId = typeof content.session_id === "string" ? content.session_id : null;
+    const sessionKey = typeof content.session_key === "string" ? content.session_key : null;
+    if (!roomId || !senderKey || !sessionId || !sessionKey) return;
+
+    const key = `${senderKey}|${sessionId}`;
+    if (this._inbound.has(key)) return; /* never downgrade an existing session */
+
+    const olm = this._olm!;
+    const igs = new olm.InboundGroupSession();
+    try {
+      igs.import_session(sessionKey);
+    } catch (err) {
+      console.error("[e2ee] bad forwarded room key:", err);
+      return;
+    }
+    if (igs.session_id() !== sessionId) {
+      console.error("[e2ee] forwarded session id mismatch — discarding");
+      return;
+    }
+    this._inbound.set(key, { session: igs, roomId });
+    this.onInboundSessionAdded?.(roomId);
   }
 
   private _handleOlmEvent(event: MatrixWireEvent): void {
@@ -686,6 +897,8 @@ export class E2eeCrypto {
 
     if (payload.type === "m.room_key") {
       this._ingestRoomKey(senderKey, payload.content);
+    } else if (payload.type === "m.forwarded_room_key") {
+      this._ingestForwardedRoomKey(payload.content);
     } else {
       /* other olm-protected payloads (call signaling, SAS verification) */
       for (const listener of [...this._payloadListeners]) {

@@ -87,8 +87,14 @@ test("device keys are uploaded on init", async (t) => {
     signatures?: Record<string, Record<string, string>>;
   };
   assert.equal(deviceKeys.user_id, "@kim:mock.hs");
-  assert.ok(deviceKeys.keys?.["curve25519:MOCKDEVICE"], "curve25519 key uploaded");
-  assert.ok(deviceKeys.keys?.["ed25519:MOCKDEVICE"], "ed25519 key uploaded");
+  assert.ok(
+    deviceKeys.keys?.[`curve25519:${client.deviceId}`],
+    "curve25519 key uploaded"
+  );
+  assert.ok(
+    deviceKeys.keys?.[`ed25519:${client.deviceId}`],
+    "ed25519 key uploaded"
+  );
   assert.ok(deviceKeys.signatures?.["@kim:mock.hs"], "device keys are signed");
   assert.ok(device.oneTimeKeys.size > 0, "one-time keys uploaded");
   client.stopSync();
