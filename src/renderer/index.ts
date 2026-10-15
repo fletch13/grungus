@@ -15,4 +15,5 @@ import "./components/member-list.ts";
 import "./components/app-shell.ts";
 import "./components/call-view.ts";
 import "./components/verify-view.ts";
+import "./components/backup-view.ts";
 import "./app.ts";

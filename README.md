@@ -13,8 +13,16 @@ for an open protocol.
 
 ## Features
 
-- **Matrix login** — password or access-token, with
-  `.well-known/matrix/client` homeserver discovery, exactly like Element.
+- **Matrix login** — two-step: enter the homeserver domain first, then the
+  app queries the server's real login flows (GET /login) and offers
+  exactly what that server supports: password, access token, and SSO.
+- **SSO / redirect login (m.login.sso)** — for homeservers that federate
+  an IdP (e.g. a university Keycloak), each advertised identity provider
+  becomes a "Continue with …" button. In Electron an auth window opens
+  and the loginToken callback is intercepted before any network
+  connection; in the browser the redirect returns to the app, which
+  completes the login via m.login.token and strips the single-use token
+  from the URL.
 - **End-to-end encryption (Olm/Megolm)** — messages in encrypted rooms
   are megolm-encrypted via libolm (WASM); room keys are shared over olm
   to-device messages to every member device, including your own.
@@ -34,6 +42,15 @@ for an open protocol.
 - **Invites** — rooms you are invited to (rooms.invite in /sync) appear
   in an "Invites" section with accept/decline buttons; accepting joins
   and immediately enables chat.
+- **Server-side key backup (m.megolm_backup.v1.curve25519-aes-sha2)** —
+  back up your megolm sessions to the homeserver, secured by a
+  passphrase-derived curve25519 key (PBKDF2-HMAC-SHA-512, 500k
+  iterations; the server only ever sees the public key — wire formats
+  cross-checked against matrix-js-sdk). New sessions are backed up as
+  they arrive. A fresh device (e.g. after an SSO login on a new machine)
+  restores with the passphrase and decrypts history in place — even with
+  no other device of yours online. The 🔑 button in the sidebar opens
+  the create/restore overlay.
 - **Native group calls (MSC3401, full-mesh WebRTC)** — start or join a
   call from the chat header; m.call.member state announces membership,
   SDP offers/answers and ICE candidates flow over olm-encrypted
@@ -253,6 +270,27 @@ verification: a send racing the first sync of a room used to leak
 plaintext into encrypted rooms — createRoom/joinRoom now carry the
 encryption flag and unknown-room sends fail closed.
 
+SSO login is verified against the mock homeserver's Keycloak-style
+redirect dance (flows discovery → redirect to the IdP → callback with
+loginToken → m.login.token exchange → a fully working session, plus
+forged-token rejection) and live in the browser: the two-step login
+shows "Continue with University Keycloak" after entering the server
+domain, and clicking it completes the entire redirect round-trip and
+lands in the app as the SSO user. The Electron auth-window path shares
+the same client code and is exercised by the same suites; conduwuit
+does not implement SSO, so the mock is the SSO test bed.
+
+Key backup is verified in three layers: the mock suite (create with a
+passphrase, automatic backup of received sessions, fresh device
+restores and decrypts history with the first device offline, wrong
+passphrase rejected), the real-homeserver e2e on a dedicated fresh
+account (create over conduwuit, sweep PUTs with ?version=, a second
+device restoring and decrypting history purely from the backup —
+conduwuit only ever allows manipulating the FIRST backup version, so
+the e2e registers a throwaway account per run), and live in the
+browser (the 🔑 overlay created a real 500k-iteration backup and
+reported the version).
+
 Small CLI tools in `examples/` (list-rooms, tail-room, send-message) use
 the same client from Node — handy for debugging and demos.
 
@@ -262,10 +300,10 @@ the same client from Node — handy for debugging and demos.
   handful of participants), screenshare, Element Call interoperability
   (the signaling is modeled on MSC3401 but interop is untested), and
   insertable-streams E2EE media on top of DTLS-SRTP.
-- **E2EE hardening** — QR device verification, cross-signing, key
-  backup. (SAS verification, key forwarding to own/verified devices,
-  and rotation on membership change shipped — see above; verification
-  persistence is per-device-store only.)
+- **E2EE hardening** — QR device verification, cross-signing.
+  (SAS verification, key forwarding to own/verified devices, rotation
+  on membership change, and server-side key backup shipped — see above;
+  verification persistence is per-device-store only.)
 - Space management UI, message
   editing/reactions, reply chains.
 - Server-side read markers, presence, notifications

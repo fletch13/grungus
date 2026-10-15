@@ -69,6 +69,15 @@ export class MockHomeserver {
   readonly media = new Map<string, { bytes: Buffer; mime: string }>();
   /** username -> deviceId -> device (keys + one-time keys). */
   readonly devices = new Map<string, Map<string, MockDevice>>();
+  /** SSO simulation: advertised identity providers (enableSso() to use). */
+  ssoEnabled = false;
+  readonly ssoProviders = [{ id: "keycloak", name: "University Keycloak" }];
+  /** loginToken -> username, issued by the fake IdP redirect. */
+  private readonly ssoLoginTokens = new Map<string, string>();
+  /** Server-side key backup (single version, per-user). */
+  readonly keyBackups = new Map<string, { version: string; body: Record<string, unknown> }>();
+  /** username -> roomId -> sessionId -> backed-up entry. */
+  readonly backedUpKeys = new Map<string, Record<string, Record<string, unknown>>>();
   /** username -> deviceId -> queued to-device events (with global seq for sync wakeups).
    *  To-device routing is PER DEVICE (real servers never leak one device's
    *  olm messages to another device of the same user). */
@@ -249,6 +258,46 @@ export class MockHomeserver {
       return;
     }
 
+    /* fake IdP (Keycloak stand-in) — lives outside /_matrix, handled early */
+    if (req.method === "GET" && uploadUrl.pathname === "/_fake_idp/auth") {
+      const redirectUrl = uploadUrl.searchParams.get("redirectUrl");
+      if (!redirectUrl) {
+        this._err(res, 400, "M_BAD_JSON", "redirectUrl required");
+        return;
+      }
+      const lastUser = [...this.users.values()].pop();
+      if (!lastUser) {
+        this._err(res, 500, "M_UNKNOWN", "No users registered");
+        return;
+      }
+      const token = "sso_tok_" + crypto.randomBytes(12).toString("hex");
+      this.ssoLoginTokens.set(token, lastUser.username);
+      const sep = redirectUrl.includes("?") ? "&" : "?";
+      res.writeHead(302, { Location: `${redirectUrl}${sep}loginToken=${token}` });
+      res.end();
+      return;
+    }
+
+    /* SSO redirect lives under /_matrix/client/v3 but needs no auth */
+    if (req.method === "GET" && /^\/_matrix\/client\/v\d+\/login\/sso\/redirect/.test(uploadUrl.pathname)) {
+      const match = uploadUrl.pathname.match(/\/login\/sso\/redirect(?:\/([^/]+))?$/);
+      const idpId = match?.[1] ?? null;
+      if (idpId && !this.ssoProviders.some((p) => p.id === idpId)) {
+        this._err(res, 404, "M_NOT_FOUND", "Unknown SSO provider");
+        return;
+      }
+      const redirectUrl = uploadUrl.searchParams.get("redirectUrl");
+      if (!redirectUrl) {
+        this._err(res, 400, "M_BAD_JSON", "redirectUrl required");
+        return;
+      }
+      const authUrl =
+        `${this.baseUrl!}/_fake_idp/auth?redirectUrl=${encodeURIComponent(redirectUrl)}`;
+      res.writeHead(302, { Location: authUrl });
+      res.end();
+      return;
+    }
+
     this._readBody(req)
       .then((body) => this._route(req, res, body))
       .catch((err: unknown) => {
@@ -382,7 +431,38 @@ export class MockHomeserver {
     const route = parts.slice(3).join("/");
 
     /* POST /login (no auth) */
+    /* GET /login: the login modes this server offers (SSO providers included) */
+    if (req.method === "GET" && route === "login") {
+      const flows: Record<string, unknown>[] = [{ type: "m.login.password" }];
+      if (this.ssoEnabled) {
+        flows.push({ type: "m.login.sso", identity_providers: this.ssoProviders });
+      }
+      this._send(res, 200, { flows });
+      return;
+    }
+
+    /* SSO redirect + fake IdP handled pre-route in _handleRequest */
     if (req.method === "POST" && route === "login") {
+      /* m.login.token: exchange the loginToken from the SSO redirect */
+      if (body.type === "m.login.token") {
+        const username = this.ssoLoginTokens.get(String(body.token ?? ""));
+        if (!username) {
+          this._err(res, 403, "M_FORBIDDEN", "Invalid login token");
+          return;
+        }
+        this.ssoLoginTokens.delete(String(body.token ?? ""));
+        const ssoUser = this.users.get(username)!;
+        const token = "tok_" + crypto.randomBytes(12).toString("hex");
+        const deviceId = "MOCK_" + crypto.randomBytes(6).toString("hex");
+        this.tokens.set(token, { username, deviceId });
+        this._send(res, 200, {
+          access_token: token,
+          user_id: ssoUser.userId,
+          device_id: deviceId,
+          home_server: "mock.hs",
+        });
+        return;
+      }
       const identifier = (body.identifier ?? {}) as { user?: string };
       const user = this.users.get(String(identifier.user ?? ""));
       if (!user || user.password !== body.password) {
@@ -416,6 +496,62 @@ export class MockHomeserver {
 
     if (req.method === "GET" && route === "account/whoami") {
       this._send(res, 200, { user_id: user.userId });
+      return;
+    }
+
+    /* ---- server-side key backup (m.megolm_backup.v1) ---- */
+
+    if (req.method === "GET" && route === "room_keys/version") {
+      const backup = this.keyBackups.get(user.username);
+      if (!backup) {
+        this._err(res, 404, "M_NOT_FOUND", "Key backup does not exist.");
+        return;
+      }
+      const rooms = this.backedUpKeys.get(user.username) ?? {};
+      let count = 0;
+      for (const perRoom of Object.values(rooms)) count += Object.keys(perRoom).length;
+      this._send(res, 200, { ...backup.body, version: backup.version, count, etag: "1" });
+      return;
+    }
+
+    if (req.method === "POST" && route === "room_keys/version") {
+      if (this.keyBackups.has(user.username)) {
+        this._err(res, 400, "M_UNKNOWN", "A backup already exists");
+        return;
+      }
+      if (
+        body.algorithm !== "m.megolm_backup.v1.curve25519-aes-sha2" ||
+        !body.auth_data
+      ) {
+        this._err(res, 400, "M_BAD_JSON", "Unsupported backup algorithm");
+        return;
+      }
+      this.keyBackups.set(user.username, { version: "1", body });
+      this._send(res, 200, { version: "1" });
+      return;
+    }
+
+    if (req.method === "GET" && route === "room_keys/keys") {
+      const stored = this.backedUpKeys.get(user.username) ?? {};
+      /* spec shape: {rooms: {roomId: {sessions: {sessionId: entry}}}} */
+      const rooms: Record<string, { sessions: Record<string, unknown> }> = {};
+      for (const [roomId, sessions] of Object.entries(stored)) {
+        rooms[roomId] = { sessions };
+      }
+      this._send(res, 200, { rooms });
+      return;
+    }
+
+    const backupKeyMatch = route.match(/^room_keys\/keys\/([^/]+)\/(.+)$/);
+    if (req.method === "PUT" && backupKeyMatch) {
+      const rooms = this.backedUpKeys.get(user.username) ?? {};
+      this.backedUpKeys.set(user.username, rooms);
+      const roomId = backupKeyMatch[1] ?? "";
+      /* base64 session ids may contain "/" — everything after the room id */
+      const sessionId = backupKeyMatch[2] ?? "";
+      rooms[roomId] = rooms[roomId] ?? {};
+      rooms[roomId]![sessionId] = body;
+      this._send(res, 200, {});
       return;
     }
 

@@ -32,6 +32,11 @@ export interface GrungusPlatform {
   /** Present in Electron — olm pickle storage in the main-process vault. */
   cryptoGet?(key: string): Promise<string | null>;
   cryptoPut?(key: string, value: string): Promise<void>;
+  /** Present in Electron — SSO auth window with redirect interception. */
+  ssoLogin?(
+    url: string,
+    callbackPrefix: string
+  ): Promise<{ loginToken: string | null }>;
 }
 
 /* Exposed by the preload bridge when running inside Electron. */
@@ -88,58 +93,127 @@ function showLogin(): void {
   if (!root) return;
   root.textContent = "";
   const view = el("login-view") as LoginView;
+  view.addEventListener("grungus:server-chosen", (event) => {
+    handleServerChosen((event as CustomEvent<{ homeserver: string }>).detail, view);
+  });
+  view.addEventListener("grungus:sso", (event) => {
+    handleSsoLogin((event as CustomEvent<{ idpId: string }>).detail.idpId, view);
+  });
   view.addEventListener("grungus:login", (event) => {
     handleLogin((event as CustomEvent<LoginDetail>).detail, view);
   });
   root.appendChild(view);
 }
 
-function handleLogin(detail: LoginDetail, view: LoginView): Promise<void> {
+/* The resolved homeserver + flows of the in-progress login. */
+let loginBaseUrl: string | null = null;
+
+async function handleServerChosen(
+  detail: { homeserver: string },
+  view: LoginView
+): Promise<void> {
   view.setBusy(true);
   view.setStatus("Connecting to homeserver…", false);
-  let baseUrl = "";
-  return MatrixClient.resolveBaseUrl(detail.homeserver)
-    .then((resolved) => {
-      baseUrl = resolved;
-      client = new MatrixClient({ baseUrl });
-      if (detail.accessToken) {
-        client.accessToken = detail.accessToken;
-        return client.whoami();
-      }
-      return client.loginWithPassword({
+  try {
+    loginBaseUrl = await MatrixClient.resolveBaseUrl(detail.homeserver);
+    const probe = new MatrixClient({ baseUrl: loginBaseUrl });
+    const flows = await probe.loginFlows();
+    view.setBusy(false);
+    view.showFlows(loginBaseUrl, flows);
+  } catch (err) {
+    view.setBusy(false);
+    view.setStatus(
+      `Could not reach the homeserver: ${err instanceof Error ? err.message : "unknown error"}`,
+      true
+    );
+  }
+}
+
+/**
+ * SSO (e.g. Keycloak): open the redirect URL and capture the loginToken
+ * callback. In Electron the main process opens an auth window and
+ * intercepts the callback; in browser dev mode the whole tab goes to the
+ * IdP and returns with ?loginToken=… which boot() completes.
+ */
+async function handleSsoLogin(idpId: string, view: LoginView): Promise<void> {
+  const baseUrl = loginBaseUrl;
+  if (!baseUrl) return;
+  const platform = window.grungusPlatform;
+
+  if (platform?.ssoLogin) {
+    /* Electron: auth window with redirect interception */
+    view.setBusy(true);
+    view.setStatus("Complete the sign-in in the opened window…", false);
+    try {
+      const callbackPrefix = "http://127.0.0.1/grungus-sso";
+      const ssoUrl = new MatrixClient({ baseUrl }).ssoLoginUrl(idpId, callbackPrefix);
+      const result = await platform.ssoLogin(ssoUrl, callbackPrefix);
+      if (!result.loginToken) throw new Error("SSO window closed before sign-in finished");
+      const client = new MatrixClient({ baseUrl });
+      await client.loginWithToken(result.loginToken);
+      await finishLogin(baseUrl, client);
+    } catch (err) {
+      view.setBusy(false);
+      view.setStatus(
+        `SSO login failed: ${err instanceof Error ? err.message : "unknown error"}`,
+        true
+      );
+    }
+    return;
+  }
+
+  /* Browser: full-page redirect; boot() completes it on return. */
+  const returnTo =
+    `${location.origin}${location.pathname}` +
+    `?sso=1&hs=${encodeURIComponent(baseUrl)}`;
+  const ssoUrl = new MatrixClient({ baseUrl }).ssoLoginUrl(idpId, returnTo);
+  location.href = ssoUrl;
+}
+
+/** Shared post-auth path: persist the session, attach E2EE, start the shell. */
+async function finishLogin(baseUrl: string, activeClient: MatrixClient): Promise<void> {
+  const active = activeClient;
+  const session: SavedSession = {
+    baseUrl,
+    userId: active.userId,
+    accessToken: active.accessToken ?? "",
+    deviceId: active.deviceId,
+  };
+  await storage.saveSession(session);
+  client = active;
+  await attachCrypto(active);
+  startShell();
+}
+
+async function handleLogin(detail: LoginDetail, view: LoginView): Promise<void> {
+  view.setBusy(true);
+  view.setStatus("Signing in…", false);
+  let baseUrl = loginBaseUrl;
+  try {
+    if (!baseUrl) {
+      baseUrl = await MatrixClient.resolveBaseUrl(detail.homeserver);
+    }
+    const active = new MatrixClient({ baseUrl });
+    if (detail.accessToken) {
+      active.accessToken = detail.accessToken;
+      await active.whoami();
+    } else {
+      await active.loginWithPassword({
         username: detail.username,
         password: detail.password,
       });
-    })
-    .then(() => {
-      const active = client;
-      if (!active) throw new Error("Login failed");
-      const session: SavedSession = {
-        baseUrl,
-        userId: active.userId,
-        accessToken: active.accessToken ?? "",
-        deviceId: active.deviceId,
-      };
-      return storage.saveSession(session).then(() => session);
-    })
-    .then(() => {
-      const active = client;
-      if (!active) throw new Error("Login failed");
-      return attachCrypto(active);
-    })
-    .then(() => {
-      startShell();
-    })
-    .catch((err: unknown) => {
-      view.setBusy(false);
-      const message =
-        err instanceof Error
-          ? err instanceof Error && "errcode" in err
-            ? `${(err as { errcode?: string }).errcode}: ${err.message}`
-            : err.message
-          : "Login failed";
-      view.setStatus(message, true);
-    });
+    }
+    await finishLogin(baseUrl, active);
+  } catch (err) {
+    view.setBusy(false);
+    const message =
+      err instanceof Error
+        ? err instanceof Error && "errcode" in err
+          ? `${(err as { errcode?: string }).errcode}: ${err.message}`
+          : err.message
+        : "Login failed";
+    view.setStatus(message, true);
+  }
 }
 
 function makeCryptoStore(): CryptoStore {
@@ -263,6 +337,74 @@ function startShell(): void {
   const verifyView = document.createElement("verify-view");
   root.appendChild(verifyView);
   let verification: VerificationManager | null = null;
+
+  /* ---- key backup / restore ---- */
+  const backupView = document.createElement("backup-view");
+  backupView.hidden = true;
+  root.appendChild(backupView);
+  let serverHasBackup: boolean | null = null;
+  if (active.crypto) {
+    void active.crypto
+      .getKeyBackupVersion()
+      .then((version) => {
+        serverHasBackup = version !== null;
+        backupView.update(active.crypto, serverHasBackup);
+      })
+      .catch(() => {
+        serverHasBackup = false;
+        backupView.update(active.crypto, false);
+      });
+  } else {
+    backupView.update(null, false);
+  }
+  roomList.addEventListener("grungus:open-backup", () => {
+    backupView.update(active.crypto, serverHasBackup);
+    backupView.show();
+  });
+  backupView.addEventListener(
+    "grungus:backup-create",
+    (event) => {
+      const detail = (event as CustomEvent<{ passphrase: string; confirm: string }>).detail;
+      const cryptoLayerNow = active.crypto;
+      if (!cryptoLayerNow) return;
+      if (detail.passphrase !== detail.confirm) {
+        backupView.setStatus("Passphrases do not match.", true);
+        return;
+      }
+      backupView.setStatus("Deriving key and creating backup…", false);
+      void cryptoLayerNow
+        .createKeyBackup(detail.passphrase)
+        .then((version) => {
+          serverHasBackup = true;
+          backupView.update(cryptoLayerNow, true);
+          backupView.setStatus(`Backup created (version ${version}). New room keys are backed up automatically.`, false);
+        })
+        .catch((err: unknown) => {
+          backupView.setStatus(
+            `Could not create backup: ${err instanceof Error ? err.message : "unknown error"}`,
+            true
+          );
+        });
+    }
+  );
+  backupView.addEventListener("grungus:backup-restore", (event) => {
+    const detail = (event as CustomEvent<{ passphrase: string }>).detail;
+    const cryptoLayerNow = active.crypto;
+    if (!cryptoLayerNow) return;
+    backupView.setStatus("Deriving key and fetching the backup…", false);
+    void cryptoLayerNow
+      .restoreKeyBackup(detail.passphrase)
+      .then((count) => {
+        backupView.setStatus(`Restored ${count} session${count === 1 ? "" : "s"} — undecryptable messages update in place.`, false);
+      })
+      .catch((err: unknown) => {
+        backupView.setStatus(
+          `${err instanceof Error ? err.message : "unknown error"}`,
+          true
+        );
+      });
+  });
+
   const cryptoLayer = active.crypto;
   if (cryptoLayer) {
     verification = new VerificationManager(cryptoLayer);
@@ -501,9 +643,30 @@ function startShell(): void {
   active.startSync();
 }
 
-/* ---- boot: restore a saved session, otherwise show login ---- */
+/* ---- boot: complete an SSO return, restore a saved session, or show login ---- */
+
+async function completeSsoReturn(params: URLSearchParams): Promise<void> {
+  const loginToken = params.get("loginToken");
+  const hs = params.get("hs");
+  if (!loginToken || !hs) return;
+  /* strip the token from the URL — it is single-use and must not linger */
+  history.replaceState(null, "", location.pathname);
+  try {
+    const active = new MatrixClient({ baseUrl: hs });
+    await active.loginWithToken(loginToken);
+    await finishLogin(hs, active);
+  } catch (err) {
+    console.error("[grungus] SSO token exchange failed:", err);
+    showLogin();
+  }
+}
 
 function boot(): void {
+  const bootParams = new URLSearchParams(location.search);
+  if (bootParams.get("sso") === "1" && bootParams.get("loginToken")) {
+    void completeSsoReturn(bootParams);
+    return;
+  }
   void storage
     .loadSession()
     .then((saved) => {

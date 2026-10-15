@@ -512,8 +512,69 @@ async function main(): Promise<void> {
   log("key forwarding: fresh device of the same user receives history ✓");
   a2.stopSync();
 
-  a.stopSync();
-  b.stopSync();
+  /* 4h. server-side key backup, on a DEDICATED account: some servers
+     (conduwuit included) only ever allow manipulating the FIRST backup
+     version, so a fresh account gives this section exactly one create
+     and stays deterministic across runs. */
+  const BK_USER = `grungus_bk_${Date.now().toString(36)}`;
+  const BK_PASS = "bk-pass-12345678";
+  const PASSPHRASE = "grungus backup passphrase 1234";
+  await register(BK_USER, BK_PASS);
+  const bk = new MatrixClient({ baseUrl: HOME });
+  await bk.loginWithPassword({ username: BK_USER, password: BK_PASS });
+  const cryptoBK = new E2eeCrypto({ host: bk, store: new MemoryCryptoStore() });
+  await cryptoBK.init();
+  bk.crypto = cryptoBK;
+  cryptoBK.onInboundSessionAdded = (roomId) => bk.retryUndecrypted(roomId);
+  bk.startSync();
+  const bkRoom = await bk.createRoom({
+    name: `bk-e2e-${Date.now()}`,
+    isPublic: true,
+    encrypted: true,
+  });
+  await waitFor(() => bk.getRoom(bkRoom) !== null, "backup room syncs");
+  await bk.sendMessage(bkRoom, "bk-history-1");
+  await bk.sendMessage(bkRoom, "bk-history-2");
+  await waitFor(
+    () =>
+      (bk.getRoom(bkRoom)?.timeline ?? []).some(
+        (item) => item.kind === "message" && (item as MessageItem).body === "bk-history-2"
+      ),
+    "backup-room sender sees own messages"
+  );
+
+  const backupVersion = await cryptoBK.createKeyBackup(PASSPHRASE);
+  log("key backup: version created on the homeserver ✓");
+  await new Promise((r) => setTimeout(r, 2_500)); /* sweep PUTs are fire-and-forget */
+
+  /* a second device of the SAME fresh account, first device offline —
+     the backup is the only recovery path (no forwarding available) */
+  bk.stopSync();
+  const bk2 = new MatrixClient({ baseUrl: HOME });
+  await bk2.loginWithPassword({ username: BK_USER, password: BK_PASS });
+  const cryptoBK2 = new E2eeCrypto({ host: bk2, store: new MemoryCryptoStore() });
+  await cryptoBK2.init();
+  bk2.crypto = cryptoBK2;
+  cryptoBK2.onInboundSessionAdded = (roomId) => bk2.retryUndecrypted(roomId);
+  bk2.startSync();
+  await waitFor(() => bk2.getRoom(bkRoom) !== null, "second backup-device syncs the room");
+  const restored = await cryptoBK2.restoreKeyBackup(PASSPHRASE);
+  assert.ok(restored >= 1, `restored sessions (got ${restored})`);
+  await waitFor(
+    () =>
+      (bk2.getRoom(bkRoom)?.timeline ?? []).some(
+        (item) => item.kind === "message" && (item as MessageItem).body === "bk-history-1"
+      ) &&
+      (bk2.getRoom(bkRoom)?.timeline ?? []).some(
+        (item) => item.kind === "message" && (item as MessageItem).body === "bk-history-2"
+      ),
+    "second backup-device decrypts history purely from the backup"
+  );
+  log(
+    `key backup: second device restored ${restored} session(s) from version ${backupVersion} and decrypted history (no other device online) ✓`
+  );
+  bk2.stopSync();
+
   log("ALL E2E CHECKS PASSED against", HOME);
   process.exit(0);
 }

@@ -120,6 +120,60 @@ ipcMain.handle("crypto:put", (_event, key: string, value: string): boolean => {
   return true;
 });
 
+/* ---- SSO (Electron): auth window with callback interception ---- */
+
+ipcMain.handle(
+  "sso:login",
+  (
+    _event,
+    url: string,
+    callbackPrefix: string
+  ): Promise<{ loginToken: string | null }> => {
+    return new Promise((resolve) => {
+      const authWin = new BrowserWindow({
+        width: 640,
+        height: 760,
+        show: true,
+        title: "Sign in",
+        webPreferences: {
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+        },
+      });
+      let settled = false;
+      const finish = (result: { loginToken: string | null }): void => {
+        if (settled) return;
+        settled = true;
+        try {
+          authWin.destroy();
+        } catch {
+          /* already gone */
+        }
+        resolve(result);
+      };
+      const intercept = (targetUrl: string): boolean => {
+        if (targetUrl.startsWith(callbackPrefix)) {
+          const token = new URL(targetUrl).searchParams.get("loginToken");
+          finish({ loginToken: token });
+          return true;
+        }
+        return false;
+      };
+      /* the callback redirect is intercepted BEFORE any connection is
+         attempted — the callback host never needs to exist */
+      authWin.webContents.on("will-redirect", (event, targetUrl) => {
+        if (intercept(targetUrl)) event.preventDefault();
+      });
+      authWin.webContents.on("will-navigate", (event, targetUrl) => {
+        if (intercept(targetUrl)) event.preventDefault();
+      });
+      authWin.on("closed", () => finish({ loginToken: null }));
+      void authWin.loadURL(url);
+    });
+  }
+);
+
 /* ---- window lifecycle ---- */
 
 function createWindow(): BrowserWindow {

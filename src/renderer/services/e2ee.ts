@@ -93,6 +93,25 @@ export interface OlmApi {
   OutboundGroupSession: new () => OlmOutboundGroupSessionApi;
   InboundGroupSession: new () => OlmInboundGroupSessionApi;
   SAS: new () => OlmSasApi;
+  PkEncryption: new () => OlmPkEncryptionApi;
+  PkDecryption: new () => OlmPkDecryptionApi;
+}
+
+export interface OlmPkEncryptionApi {
+  set_recipient_key(key: string): void;
+  encrypt(plaintext: string): { ciphertext: string; mac: string; ephemeral: string };
+  free(): void;
+}
+
+export interface OlmPkDecryptionApi {
+  /** Derive a keypair from raw private-key bytes; returns the public key. */
+  init_with_private_key(key: Uint8Array): string;
+  generate_key(): string;
+  get_private_key(): Uint8Array;
+  decrypt(ephemeralKey: string, mac: string, ciphertext: string): string;
+  pickle(key: string): string;
+  unpickle(key: string, pickle: string): void;
+  free(): void;
 }
 
 /**
@@ -169,6 +188,56 @@ const ALGORITHM_OLM = "m.olm.v1.curve25519-aes-sha2";
 const ALGORITHM_MEGOLM = "m.megolm.v1.aes-sha2";
 const STORE_ACCOUNT = "device:account";
 const STORE_DEVICE_ID = "device:id";
+const BACKUP_ALGORITHM = "m.megolm_backup.v1.curve25519-aes-sha2";
+const BACKUP_DEFAULT_ITERATIONS = 500_000;
+
+/** Backup version info as stored by the homeserver. */
+export interface KeyBackupVersion {
+  version: string;
+  algorithm: string;
+  auth_data: {
+    public_key?: string;
+    private_key_salt?: string;
+    private_key_iterations?: number;
+    private_key_bits?: number;
+    passphrase?: { algorithm?: string; iterations?: number; salt?: string; bits?: number };
+  };
+  count?: number;
+  etag?: string;
+}
+
+/** PBKDF2-HMAC-SHA-512 → 256-bit curve25519 private key (js-sdk compatible). */
+async function deriveBackupKey(
+  passphrase: string,
+  salt: string,
+  iterations: number,
+  bits = 256
+): Promise<Uint8Array> {
+  const subtle = globalThis.crypto.subtle;
+  const enc = new TextEncoder();
+  const key = await subtle.importKey("raw", enc.encode(passphrase), { name: "PBKDF2" }, false, [
+    "deriveBits",
+  ]);
+  const derived = await subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: enc.encode(salt),
+      iterations,
+      hash: "SHA-512",
+    },
+    key,
+    bits
+  );
+  return new Uint8Array(derived);
+}
+
+function randomSalt(): string {
+  const bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(bytes);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
 
 /** Canonical JSON (sorted keys, no whitespace) — required for signatures. */
 function canonicalJson(value: unknown): string {
@@ -733,6 +802,11 @@ export class E2eeCrypto {
     }
   }
 
+  /** A backup created on this device (private key in memory). */
+  get hasActiveBackup(): boolean {
+    return this._backup !== null;
+  }
+
   /* --------------------------- key forwarding ----------------------------- */
 
   /**
@@ -869,7 +943,224 @@ export class E2eeCrypto {
       return;
     }
     this._inbound.set(key, { session: igs, roomId });
+    void this._backupInboundSession(senderKey, sessionId, roomId);
     this.onInboundSessionAdded?.(roomId);
+  }
+
+  /* --------------------------- key backup (MSC) --------------------------- */
+
+  /** The server's current backup version, or null when none exists. */
+  async getKeyBackupVersion(): Promise<KeyBackupVersion | null> {
+    try {
+      const res = await this.host.api<KeyBackupVersion>(
+        "GET",
+        "/_matrix/client/v3/room_keys/version"
+      );
+      return res && res.version ? res : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Create a server-side key backup secured by a passphrase. The private
+   * key never leaves this device: the passphrase derives a curve25519 key
+   * (PBKDF2-HMAC-SHA-512), the server only ever sees the public key.
+   */
+  async createKeyBackup(passphrase: string): Promise<string> {
+    if (passphrase.length < 8) {
+      throw new Error("Passphrase must be at least 8 characters");
+    }
+    const salt = randomSalt();
+    const iterations = BACKUP_DEFAULT_ITERATIONS;
+    const privateKey = await deriveBackupKey(passphrase, salt, iterations);
+    const olm = this._olm!;
+    const pk = new olm.PkDecryption();
+    const publicKey = pk.init_with_private_key(privateKey);
+
+    /* write both KDF shapes (js-sdk legacy + spec passphrase object) so
+       Element can restore a Grungus backup and vice versa */
+    const authData = {
+      public_key: publicKey,
+      private_key_salt: salt,
+      private_key_iterations: iterations,
+      private_key_bits: 256,
+      passphrase: { algorithm: "m.pbkdf2", iterations, salt, bits: 256 },
+    };
+    const res = await this.host.api<{ version?: string }>(
+      "POST",
+      "/_matrix/client/v3/room_keys/version",
+      { body: { algorithm: BACKUP_ALGORITHM, auth_data: authData, count: 0 } }
+    );
+    if (!res.version) throw new Error("Homeserver returned no backup version");
+    this._backup = { version: res.version, publicKey, privateKey, pk };
+    /* back up everything we already hold */
+    for (const [key, entry] of [...this._inbound.entries()]) {
+      const [senderKey, sessionId] = key.split("|");
+      void this._backupInboundSession(
+        senderKey ?? "",
+        sessionId ?? "",
+        entry.roomId
+      );
+    }
+    return res.version;
+  }
+
+  /**
+   * Restore the server-side backup with a passphrase. Every stored megolm
+   * session is decrypted, imported at its chain index, and reported through
+   * onInboundSessionAdded so the client can retry undecrypted events.
+   * An explicit `version` overrides "latest" (some servers keep a stale
+   * latest after creating additional versions).
+   */
+  async restoreKeyBackup(passphrase: string, version?: string): Promise<number> {
+    let info: KeyBackupVersion | null;
+    if (version) {
+      info = await this.host.api<KeyBackupVersion>(
+        "GET",
+        `/_matrix/client/v3/room_keys/version/${encodeURIComponent(version)}`
+      );
+      if (!info || !info.version) info = null;
+    } else {
+      info = await this.getKeyBackupVersion();
+    }
+    if (!info || info.algorithm !== BACKUP_ALGORITHM) {
+      throw new Error("No compatible key backup on the server");
+    }
+    const auth = info.auth_data ?? {};
+    const kdf = auth.passphrase;
+    const salt = kdf?.salt ?? auth.private_key_salt;
+    const iterations =
+      kdf?.iterations ?? auth.private_key_iterations ?? BACKUP_DEFAULT_ITERATIONS;
+    const bits = kdf?.bits ?? auth.private_key_bits ?? 256;
+    if (!salt || !auth.public_key) {
+      throw new Error("This backup was not created with a passphrase");
+    }
+    const privateKey = await deriveBackupKey(passphrase, salt, iterations, bits);
+    const olm = this._olm!;
+    const pk = new olm.PkDecryption();
+    const publicKey = pk.init_with_private_key(privateKey);
+    if (publicKey !== auth.public_key) {
+      pk.free();
+      throw new Error("Wrong passphrase — derived key does not match the backup");
+    }
+
+    const roomsResponse = await this.host.api<{
+      rooms?: Record<
+        string,
+        {
+          sessions?: Record<
+            string,
+            {
+              first_message_index?: number;
+              forwarded_count?: number;
+              session_data?: { ciphertext?: string; mac?: string; ephemeral?: string };
+            }
+          >;
+        }
+      >;
+    }>("GET", "/_matrix/client/v3/room_keys/keys", {
+      query: { version: info.version },
+    });
+
+    let imported = 0;
+    const touchedRooms = new Set<string>();
+    for (const [roomId, roomEntry] of Object.entries(roomsResponse.rooms ?? {})) {
+      for (const [sessionId, session] of Object.entries(roomEntry.sessions ?? {})) {
+        const envelope = session.session_data;
+        if (!envelope?.ciphertext || !envelope.mac || !envelope.ephemeral) continue;
+        let plaintext: string;
+        try {
+          plaintext = pk.decrypt(envelope.ephemeral, envelope.mac, envelope.ciphertext);
+        } catch {
+          continue; /* corrupt entry — skip */
+        }
+        const data = JSON.parse(plaintext) as {
+          room_id?: string;
+          session_id?: string;
+          session_key?: string;
+          sender_key?: string;
+        };
+        if (
+          data.room_id !== roomId ||
+          data.session_id !== sessionId ||
+          !data.session_key ||
+          !data.sender_key
+        ) {
+          continue;
+        }
+        const key = `${data.sender_key}|${sessionId}`;
+        if (this._inbound.has(key)) continue;
+        const igs = new olm.InboundGroupSession();
+        try {
+          igs.import_session(data.session_key);
+        } catch {
+          continue;
+        }
+        if (igs.session_id() !== sessionId) continue;
+        this._inbound.set(key, { session: igs, roomId });
+        imported += 1;
+        touchedRooms.add(roomId);
+      }
+    }
+    for (const roomId of touchedRooms) {
+      this.onInboundSessionAdded?.(roomId);
+    }
+    return imported;
+  }
+
+  /** Backup state once created (private key held in memory only). */
+  private _backup: {
+    version: string;
+    publicKey: string;
+    privateKey: Uint8Array;
+    pk: OlmPkDecryptionApi;
+  } | null = null;
+  /** session keys already backed up (dedup) */
+  private readonly _backedUpSessions = new Set<string>();
+
+  /** Encrypt one inbound session and PUT it into the server backup. */
+  private async _backupInboundSession(
+    senderKey: string,
+    sessionId: string,
+    roomId: string
+  ): Promise<void> {
+    if (!this._backup) return;
+    const key = `${senderKey}|${sessionId}`;
+    if (this._backedUpSessions.has(key)) return;
+    const entry = this._inbound.get(key);
+    if (!entry) return;
+
+    try {
+      const olm = this._olm!;
+      const exported = entry.session.export_session(entry.session.first_known_index());
+      const payload = JSON.stringify({
+        algorithm: ALGORITHM_MEGOLM,
+        room_id: roomId,
+        session_id: sessionId,
+        session_key: exported,
+        sender_key: senderKey,
+        forwarding_curve25519_key_chain: [],
+      });
+      const enc = new olm.PkEncryption();
+      enc.set_recipient_key(this._backup.publicKey);
+      const envelope = enc.encrypt(payload);
+      await this.host.api(
+        "PUT",
+        `/_matrix/client/v3/room_keys/keys/${encodeURIComponent(roomId)}/${encodeURIComponent(sessionId)}`,
+        {
+          query: { version: this._backup.version },
+          body: {
+            first_message_index: entry.session.first_known_index(),
+            forwarded_count: 0,
+            session_data: envelope,
+          },
+        }
+      );
+      this._backedUpSessions.add(key);
+    } catch (err) {
+      console.error("[e2ee] key backup PUT failed:", err);
+    }
   }
 
   private _handleOlmEvent(event: MatrixWireEvent): void {
@@ -931,6 +1222,7 @@ export class E2eeCrypto {
       session: igs,
       roomId,
     });
+    void this._backupInboundSession(senderCurve25519, sessionId, roomId);
   }
 
   private _decryptWithOlm(senderKey: string, type: number, body: string): string | null {

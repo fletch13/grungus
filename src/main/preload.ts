@@ -22,4 +22,7 @@ contextBridge.exposeInMainWorld("grungusPlatform", {
     ipcRenderer.invoke("crypto:get", key),
   cryptoPut: (key: string, value: string): Promise<void> =>
     ipcRenderer.invoke("crypto:put", key, value),
+  /** SSO auth window: resolves with the loginToken from the redirect. */
+  ssoLogin: (url: string, callbackPrefix: string): Promise<{ loginToken: string | null }> =>
+    ipcRenderer.invoke("sso:login", url, callbackPrefix),
 });

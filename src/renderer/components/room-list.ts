@@ -292,6 +292,17 @@ export class RoomList extends HTMLElement {
     });
     footer.appendChild(logout);
 
+    const backup = el("button", {
+      class: "backup-btn",
+      title: "Key backup / restore",
+      "aria-label": "Key backup",
+      text: "🔑",
+    });
+    backup.addEventListener("click", () => {
+      this.dispatchEvent(new CustomEvent("grungus:open-backup", { bubbles: true }));
+    });
+    footer.appendChild(backup);
+
     return footer;
   }
 

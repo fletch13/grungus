@@ -212,6 +212,20 @@ export interface LoginResult {
   home_server?: string;
 }
 
+/** SSO identity provider advertised in GET /login (e.g. a Keycloak IdP). */
+export interface SsoIdentityProvider {
+  id: string;
+  name?: string;
+  icon?: string;
+  brand?: string;
+}
+
+/** One entry of the homeserver's advertised login flows. */
+export interface LoginFlow {
+  type: string;
+  identity_providers?: SsoIdentityProvider[];
+}
+
 export interface CreateRoomOptions {
   name?: string;
   topic?: string;
@@ -452,6 +466,47 @@ export class MatrixClient {
   }
 
   /* ----------------------------- auth flows ------------------------------ */
+
+  /** The login modes this homeserver offers (GET /login). */
+  async loginFlows(): Promise<LoginFlow[]> {
+    const res = await this.api<{ flows?: LoginFlow[] }>(
+      "GET",
+      `${CLIENT_PREFIX}/login`,
+      { auth: false }
+    );
+    return res.flows ?? [];
+  }
+
+  /** Complete an SSO login by exchanging the loginToken from the redirect. */
+  async loginWithToken(loginToken: string): Promise<LoginResult> {
+    const res = await this.api<LoginResult>("POST", `${CLIENT_PREFIX}/login`, {
+      auth: false,
+      body: {
+        type: "m.login.token",
+        token: loginToken,
+        initial_device_display_name: "Grungus",
+      },
+    });
+    if (!res || !res.access_token) {
+      throw new Error("Homeserver returned no access token");
+    }
+    this.accessToken = res.access_token;
+    this.userId = res.user_id;
+    this.deviceId = res.device_id ?? null;
+    return res;
+  }
+
+  /**
+   * The URL that starts the SSO redirect dance for one identity provider
+   * (m.login.sso). null idpId uses the legacy no-idp endpoint.
+   */
+  ssoLoginUrl(idpId: string | null, redirectUrl: string): string {
+    const suffix = idpId ? `/${encodeURIComponent(idpId)}` : "";
+    return (
+      `${this.baseUrl}${CLIENT_PREFIX}/login/sso/redirect${suffix}` +
+      `?redirectUrl=${encodeURIComponent(redirectUrl)}`
+    );
+  }
 
   async loginWithPassword(credentials: LoginCredentials): Promise<LoginResult> {
     const username = String(credentials.username ?? "").trim();
