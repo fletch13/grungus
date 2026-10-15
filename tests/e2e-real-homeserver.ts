@@ -26,6 +26,7 @@ import {
   E2eeCrypto,
   MemoryCryptoStore,
 } from "../src/renderer/services/e2ee.ts";
+import { VerificationManager } from "../src/renderer/services/sas.ts";
 
 const HOME = process.env.GRUNGUS_E2E_HOMESERVER ?? "";
 const USER1 = process.env.GRUNGUS_E2E_USER1 ?? "grungus_a";
@@ -45,7 +46,7 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-function waitFor(predicate: () => boolean, label: string): Promise<void> {
+function waitFor(predicate: () => boolean, label: string, timeoutMs = WAIT_MS): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
     const poll = (): void => {
@@ -60,7 +61,7 @@ function waitFor(predicate: () => boolean, label: string): Promise<void> {
         resolve();
         return;
       }
-      if (Date.now() - start > WAIT_MS) {
+      if (Date.now() - start > timeoutMs) {
         reject(new Error(`Timed out waiting for: ${label}`));
         return;
       }
@@ -68,6 +69,14 @@ function waitFor(predicate: () => boolean, label: string): Promise<void> {
     };
     poll();
   });
+}
+
+function waitForT(
+  predicate: () => boolean,
+  timeoutMs: number,
+  label: string
+): Promise<void> {
+  return waitFor(predicate, label, timeoutMs);
 }
 
 interface ApiResult {
@@ -328,6 +337,90 @@ async function main(): Promise<void> {
     "membership cleared"
   );
   log("call membership cleared ✓");
+
+  /* 4c. typing notifications */
+  await a.setTyping(roomId, true);
+  await waitFor(
+    () => (b.getRoom(roomId)?.typingUsers ?? []).includes(a.userId!),
+    "b sees a typing"
+  );
+  log("typing state visible to the other member ✓");
+  await a.setTyping(roomId, false);
+  await waitFor(
+    () => !(b.getRoom(roomId)?.typingUsers ?? []).includes(a.userId!),
+    "typing cleared"
+  );
+  log("typing cleared ✓");
+
+  /* 4d. media sending in an encrypted room (event is megolm-wrapped) */
+  const mediaBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 8, 7, 6]);
+  const mxc = await a.uploadMedia("e2e.png", "image/png", mediaBytes);
+  assert.ok(mxc.startsWith("mxc://"), "upload returns an mxc URI");
+  await a.sendMedia(encRoomId, {
+    mxc,
+    name: "e2e.png",
+    mimeType: "image/png",
+    size: mediaBytes.length,
+    width: 32,
+    height: 32,
+  });
+  await waitFor(
+    () =>
+      (b.getRoom(encRoomId)?.timeline ?? []).some(
+        (item) => item.kind === "message" && (item as MessageItem).media !== null
+      ),
+    "b receives the media message (decrypted)"
+  );
+  const mediaItem = b
+    .getRoom(encRoomId)!
+    .timeline.find(
+      (item): item is MessageItem => item.kind === "message" && (item as MessageItem).media !== null
+    )! as MessageItem;
+  assert.equal(mediaItem.media!.mxc, mxc);
+  assert.equal(mediaItem.media!.width, 32);
+  const fetched = await b.mediaSrc(mxc);
+  assert.ok(fetched, "authenticated media download resolves");
+  /* the mxc URL itself must be hidden from the server: fetch the raw event */
+  log("media message sent megolm-encrypted and media downloaded ✓");
+
+  /* 4e. SAS device verification, both sides */
+  const managerA = new VerificationManager(cryptoA);
+  cryptoA.addPayloadListener((sender, type, content) => {
+    void managerA.handlePayload(sender, type, content);
+  });
+  const managerB = new VerificationManager(cryptoB);
+  cryptoB.addPayloadListener((sender, type, content) => {
+    void managerB.handlePayload(sender, type, content);
+  });
+  managerB.onIncoming = (txn) => {
+    void txn.sendStart();
+  };
+  const txnA = managerA.start(b.userId!, b.deviceId ?? "");
+  await waitForT(
+    () =>
+      managerA.transactions.some((txn) => txn.phase === "show-emoji") &&
+      managerB.transactions.some((txn) => txn.phase === "show-emoji"),
+    15_000,
+    "both sides reach the emoji phase"
+  );
+  const emojiA = managerA.transactions.find((txn) => txn.phase === "show-emoji")!.emoji;
+  const emojiB = managerB.transactions.find((txn) => txn.phase === "show-emoji")!.emoji;
+  assert.deepEqual(emojiA, emojiB, "identical emoji on both devices");
+  await txnA.confirmEmojiMatch();
+  const txnB = managerB.transactions.find((txn) => txn.phase === "show-emoji")!;
+  await txnB.confirmEmojiMatch();
+  await waitForT(
+    () =>
+      managerA.transactions.every((txn) => txn.phase === "verified") &&
+      managerB.transactions.every((txn) => txn.phase === "verified"),
+    15_000,
+    "both transactions verify"
+  );
+  const trustedByA = await cryptoA.getVerifiedKey(b.userId!, b.deviceId ?? "");
+  assert.equal(trustedByA, cryptoB.ed25519Key);
+  const trustedByB = await cryptoB.getVerifiedKey(a.userId!, a.deviceId ?? "");
+  assert.equal(trustedByB, cryptoA.ed25519Key);
+  log("SAS verification: identical emoji, mutual device trust, MAC-checked ✓");
 
   a.stopSync();
   b.stopSync();

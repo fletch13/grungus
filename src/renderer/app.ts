@@ -15,6 +15,7 @@ import type { AppShell } from "./components/app-shell.ts";
 import { MatrixClient, type Room } from "./services/matrix-client.ts";
 import { E2eeCrypto, type CryptoStore } from "./services/e2ee.ts";
 import { CallManager, type CallUiState } from "./services/calls.ts";
+import { VerificationManager, type SasUiState } from "./services/sas.ts";
 
 export interface SavedSession {
   baseUrl: string;
@@ -256,6 +257,97 @@ function startShell(): void {
     startCall((event as CustomEvent<{ roomId: string }>).detail.roomId);
   });
 
+  /* ---- SAS device verification ---- */
+  const verifyView = document.createElement("verify-view");
+  root.appendChild(verifyView);
+  let verification: VerificationManager | null = null;
+  const cryptoLayer = active.crypto;
+  if (cryptoLayer) {
+    verification = new VerificationManager(cryptoLayer);
+    cryptoLayer.addPayloadListener((sender, type, content) => {
+      verification?.handlePayload(sender, type, content);
+    });
+    /* v1: incoming requests are accepted automatically — the emoji
+       comparison remains the human checkpoint */
+    verification.onIncoming = (txn) => {
+      void txn.sendStart();
+    };
+    const refreshVerify = (): void => {
+      if (!verification) return;
+      verifyView.update(
+        verification.transactions.map((txn) => txn.uiState()),
+        verification
+      );
+    };
+    verification.onUi = refreshVerify;
+    verification.onVerified = () => {
+      refreshVerify();
+      setTimeout(refreshVerify, 1500); /* let the verified card show */
+    };
+  }
+
+  /* ---- typing + media ---- */
+  let typingSentAt = 0;
+  chat.addEventListener("grungus:typing", () => {
+    const roomId = state.roomId;
+    if (!roomId) return;
+    const now = Date.now();
+    if (now - typingSentAt < 8_000) return; /* server-side rate */
+    typingSentAt = now;
+    void active.setTyping(roomId, true).catch(() => {});
+  });
+  chat.addEventListener("grungus:typing-stop", () => {
+    const roomId = state.roomId;
+    if (!roomId) return;
+    typingSentAt = 0;
+    void active.setTyping(roomId, false).catch(() => {});
+  });
+
+  chat.addEventListener("grungus:send-media", (event) => {
+    const detail = (event as CustomEvent<{ roomId: string; file: File }>).detail;
+    void (async () => {
+      try {
+        const bytes = new Uint8Array(await detail.file.arrayBuffer());
+        const mxc = await active.uploadMedia(detail.file.name, detail.file.type || "image/png", bytes);
+        await active.sendMedia(detail.roomId, {
+          mxc,
+          name: detail.file.name,
+          mimeType: detail.file.type || "image/png",
+          size: bytes.length,
+        });
+      } catch (err) {
+        chat.setNotice(
+          `Could not send image: ${err instanceof Error ? err.message : "unknown error"}`
+        );
+      }
+    })();
+  });
+
+  chat.addEventListener("grungus:verify-devices", () => {
+    const roomId = state.roomId;
+    if (!roomId || !verification || !cryptoLayer) return;
+    const room = active.getRoom(roomId);
+    if (!room) return;
+    void (async () => {
+      try {
+        for (const member of room.members.values()) {
+          if (member.userId === active.userId || member.membership !== "join") continue;
+          const devices = await cryptoLayer.getDevicesOf(member.userId);
+          for (const device of devices) {
+            if (device.deviceId === cryptoLayer.deviceId) continue;
+            const verified = await cryptoLayer.getVerifiedKey(member.userId, device.deviceId);
+            if (verified === device.ed25519) continue; /* already verified */
+            verification.start(member.userId, device.deviceId);
+          }
+        }
+      } catch (err) {
+        chat.setNotice(
+          `Could not start verification: ${err instanceof Error ? err.message : "unknown error"}`
+        );
+      }
+    })();
+  });
+
   const selectRoom = (roomId: string): void => {
     const room = active.getRoom(roomId);
     if (!room) return;
@@ -322,6 +414,7 @@ function startShell(): void {
         CallManager.callOngoing(update.room, active.userId),
         callManager.active
       );
+      chat.setTypingUsers(update.room.typingUsers);
     }
     refreshSidebar();
   });

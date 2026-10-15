@@ -21,8 +21,11 @@ export class ChatView extends HTMLElement {
   private _scroll!: HTMLElement;
   private _input!: HTMLTextAreaElement;
   private _hint!: HTMLElement;
+  private _typingBar!: HTMLElement;
   private _callOngoing = false;
   private _callJoined = false;
+  private _typingSentAt = 0;
+  private _typingStopTimer: ReturnType<typeof setTimeout> | null = null;
 
   connectedCallback(): void {
     this._renderSkeleton();
@@ -41,13 +44,23 @@ export class ChatView extends HTMLElement {
 
     const wrap = el("div", { class: "composer-wrap" });
     const composer = el("div", { class: "composer" });
+    const attach = el("button", { class: "attach-btn", title: "Send an image", text: "📎" });
+    const fileInput = el("input", {
+      type: "file",
+      accept: "image/*,image/gif",
+      class: "hidden-file-input",
+    }) as HTMLInputElement;
+    this._typingBar = el("div", { class: "typing-bar" });
     this._input = el("textarea", {
       rows: "1",
       placeholder: "Message…",
       disabled: true,
     }) as HTMLTextAreaElement;
     this._hint = el("div", { class: "composer-hint" });
+    composer.appendChild(attach);
+    composer.appendChild(fileInput);
     composer.appendChild(this._input);
+    wrap.appendChild(this._typingBar);
     wrap.appendChild(composer);
     wrap.appendChild(this._hint);
 
@@ -55,9 +68,26 @@ export class ChatView extends HTMLElement {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
         this._submit();
+        this._typingStop();
       }
     });
-    this._input.addEventListener("input", () => this._autosize());
+    this._input.addEventListener("input", () => {
+      this._autosize();
+      this._typingPulse();
+    });
+
+    attach.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+      fileInput.value = "";
+      if (!file || !this._room) return;
+      this.dispatchEvent(
+        new CustomEvent("grungus:send-media", {
+          detail: { roomId: this._room.id, file },
+          bubbles: true,
+        })
+      );
+    });
 
     this.appendChild(this._header);
     this.appendChild(this._scroll);
@@ -124,6 +154,19 @@ export class ChatView extends HTMLElement {
         );
       });
       controls.appendChild(callBtn);
+    }
+    if (room.isEncrypted) {
+      const verifyBtn = el("button", {
+        class: "call-btn-header",
+        text: "🛡",
+        title: "Verify other members' devices (SAS)",
+      });
+      verifyBtn.addEventListener("click", () => {
+        this.dispatchEvent(
+          new CustomEvent("grungus:verify-devices", { bubbles: true })
+        );
+      });
+      controls.appendChild(verifyBtn);
     }
     this._header.appendChild(controls);
   }
@@ -214,6 +257,33 @@ export class ChatView extends HTMLElement {
     });
     this._scroll.appendChild(node);
     this._lastItem = item;
+  }
+
+  /** Update the "X is typing…" bar from the room's ephemeral state. */
+  setTypingUsers(users: string[]): void {
+    if (!this._typingBar) return;
+    this._typingBar.textContent =
+      users.length === 0
+        ? ""
+        : users.length === 1
+          ? `${users[0]} is typing…`
+          : `${users.slice(0, 2).join(", ")}${users.length > 2 ? " and others" : ""} are typing…`;
+  }
+
+  private _typingPulse(): void {
+    this.dispatchEvent(new CustomEvent("grungus:typing", { bubbles: true }));
+    if (this._typingStopTimer) clearTimeout(this._typingStopTimer);
+    this._typingStopTimer = setTimeout(() => this._typingStop(), 12_000);
+  }
+
+  private _typingStop(): void {
+    if (this._typingStopTimer) {
+      clearTimeout(this._typingStopTimer);
+      this._typingStopTimer = null;
+    }
+    this.dispatchEvent(
+      new CustomEvent("grungus:typing-stop", { bubbles: true })
+    );
   }
 
   private _autosize(): void {

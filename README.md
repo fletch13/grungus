@@ -39,7 +39,16 @@ for an open protocol.
 - **Local echo** — sent messages render instantly, then reconcile with
   the server event (no duplicates, "failed to send" marking on errors).
 - **Images and GIFs** — `m.image` / `m.sticker` messages render inline
-  via authenticated media downloads; GIFs animate natively.
+  via authenticated media downloads; GIFs animate natively. The composer
+  📎 button uploads and sends images (`m.image`).
+- **Typing notifications** — the composer emits `m.typing` while you
+  type (server-rate-limited); other members' typing state shows above
+  the composer.
+- **Device verification (SAS)** — the 🛡 button in encrypted rooms
+  starts emoji-based SAS verification (m.key.verification, real libolm
+  SAS + HKDF MACs) with every other member's unverified device; both
+  sides see the same emoji, confirming marks the device's Ed25519 key
+  trusted.
 - **Unread badges** — per-room counters, cleared when you open the room.
 - **Room creation** — inline "new room" form in the sidebar.
 - **Strict TypeScript throughout** — typed Matrix event/sync shapes and
@@ -204,6 +213,17 @@ established, `connectionState: connected` on both peers, two media
 tracks delivered and the video decoding over DTLS-SRTP, hangup via the
 product UI.
 
+Typing notifications, composer media sending, and SAS device
+verification are each verified twice: a mock-homeserver suite in
+`npm test` (typing round-trip; upload/send/receive/download byte
+equality; full SAS handshake with identical emoji, mutual device-trust
+marking, and a forged-MAC rejection) and the real-homeserver e2e
+(typing over conduwuit; a megolm-wrapped `m.image` event decrypted by
+the peer with an authenticated media fetch; SAS against a second real
+device). The SAS UI path — verify button, emoji comparison card,
+"They match" confirmation — was additionally driven live in the
+browser against a real second device.
+
 Small CLI tools in `examples/` (list-rooms, tail-room, send-message) use
 the same client from Node — handy for debugging and demos.
 
@@ -213,13 +233,14 @@ the same client from Node — handy for debugging and demos.
   handful of participants), screenshare, Element Call interoperability
   (the signaling is modeled on MSC3401 but interop is untested), and
   insertable-streams E2EE media on top of DTLS-SRTP.
-- **E2EE hardening** — SAS/QR device verification, cross-signing, key
+- **E2EE hardening** — QR device verification, cross-signing, key
   backup, key forwarding (session sharing to newly-seen devices), room
-  key rotation on membership change.
-- Invites UI (rooms.invite in sync), space management UI, media sending
-  from the composer, message editing/reactions, reply chains.
-- Server-side read markers, presence, typing notifications.
-- Notifications (Electron + Push Gateway).
+  key rotation on membership change. (SAS emoji verification shipped —
+  see above; verification persistence is per-device-store only.)
+- Invites UI (rooms.invite in sync), space management UI, message
+  editing/reactions, reply chains.
+- Server-side read markers, presence, notifications
+  (Electron + Push Gateway).
 
 ## License
 

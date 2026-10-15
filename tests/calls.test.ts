@@ -172,11 +172,11 @@ test("olm-encrypted call signals decrypt on the other side (encrypted room)", as
   b.crypto = cryptoB;
 
   const received: { sender: string; type: string; content: Record<string, unknown> }[] = [];
-  cryptoB.toDevicePayloadHandler = (sender, payload) => {
-    if (payload.type.startsWith("m.call.")) {
-      received.push({ sender, type: payload.type, content: payload.content });
+  cryptoB.addPayloadListener((sender, type, content) => {
+    if (type.startsWith("m.call.")) {
+      received.push({ sender, type, content });
     }
-  };
+  });
 
   const roomId = await a.createRoom({ name: "enc-call", isPublic: true, encrypted: true });
   await b.joinRoom(roomId);

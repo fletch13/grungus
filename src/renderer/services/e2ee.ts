@@ -72,12 +72,21 @@ export interface OlmInboundGroupSessionApi {
   free(): void;
 }
 
+export interface OlmSasApi {
+  get_pubkey(): string;
+  set_their_key(key: string): void;
+  generate_bytes(info: string, length: number): Uint8Array;
+  calculate_mac(input: string, info: string): string;
+  free(): void;
+}
+
 export interface OlmApi {
   init(): Promise<void>;
   Account: new () => OlmAccountApi;
   Session: new () => OlmSessionApi;
   OutboundGroupSession: new () => OlmOutboundGroupSessionApi;
   InboundGroupSession: new () => OlmInboundGroupSessionApi;
+  SAS: new () => OlmSasApi;
 }
 
 /**
@@ -335,12 +344,59 @@ export class E2eeCrypto {
   }
 
   /**
-   * Handler for olm-decrypted to-device payloads that are NOT room keys
-   * (e.g. MSC3401 call signaling). Set by the call layer.
+   * Handlers for olm-decrypted to-device payloads that are NOT room keys
+   * (MSC3401 call signaling, SAS verification). Register via
+   * addPayloadListener; returns an unsubscribe function.
    */
-  toDevicePayloadHandler:
-    | ((sender: string, payload: { type: string; content: Record<string, unknown> }) => void)
-    | null = null;
+  private readonly _payloadListeners = new Set<
+    (sender: string, type: string, content: Record<string, unknown>) => void
+  >();
+
+  addPayloadListener(
+    cb: (sender: string, type: string, content: Record<string, unknown>) => void
+  ): () => void {
+    this._payloadListeners.add(cb);
+    return () => this._payloadListeners.delete(cb);
+  }
+
+  /* SAS verification surface (see services/sas.ts) */
+
+  get deviceId(): string {
+    return this._deviceId;
+  }
+
+  get ed25519Key(): string {
+    return this._ed25519;
+  }
+
+  createSas(): OlmSasApi {
+    return new this._olm!.SAS();
+  }
+
+  /** Public device directory (for starting verifications). */
+  async getDevicesOf(userId: string): Promise<DeviceInfo[]> {
+    return this.getUserDevices(userId);
+  }
+
+  /** The Ed25519 key the server has published for a device. */
+  async getDeviceEd25519(userId: string, deviceId: string): Promise<string | null> {
+    const devices = await this.getUserDevices(userId);
+    return devices.find((device) => device.deviceId === deviceId)?.ed25519 ?? null;
+  }
+
+  /** Record a SAS-verified device key (trust replaces TOFU for the pair). */
+  async markDeviceVerified(
+    userId: string,
+    deviceId: string,
+    ed25519: string
+  ): Promise<void> {
+    await this._store.put(`verified:${userId}:${deviceId}`, ed25519);
+  }
+
+  /** The verified Ed25519 key for a device, or null when unverified. */
+  async getVerifiedKey(userId: string, deviceId: string): Promise<string | null> {
+    return this._store.get(`verified:${userId}:${deviceId}`);
+  }
 
   /**
    * Send an olm-encrypted to-device message of an arbitrary type to one
@@ -631,11 +687,14 @@ export class E2eeCrypto {
     if (payload.type === "m.room_key") {
       this._ingestRoomKey(senderKey, payload.content);
     } else {
-      /* other olm-protected payloads (MSC3401 call signaling) */
-      this.toDevicePayloadHandler?.(event.sender, {
-        type: payload.type,
-        content: payload.content,
-      });
+      /* other olm-protected payloads (call signaling, SAS verification) */
+      for (const listener of [...this._payloadListeners]) {
+        try {
+          listener(event.sender, payload.type, payload.content);
+        } catch (err) {
+          console.error("[e2ee] payload listener failed:", err);
+        }
+      }
     }
   }
 

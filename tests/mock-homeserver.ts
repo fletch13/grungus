@@ -39,6 +39,10 @@ interface MockRoom {
   /** userId -> membership (mock-side routing bookkeeping) */
   members: Map<string, string>;
   events: MockEvent[];
+  /** typing: userId -> active-until timestamp */
+  typingUntil: Map<string, number>;
+  /** bumped on typing changes so long-polls wake */
+  typingSeq: number;
 }
 
 interface MockDevice {
@@ -59,6 +63,8 @@ export class MockHomeserver {
   readonly users = new Map<string, MockUser>();
   readonly tokens = new Map<string, string>(); /* token -> username */
   readonly rooms = new Map<string, MockRoom>();
+  /** media: id -> { bytes, mime } */
+  readonly media = new Map<string, { bytes: Buffer; mime: string }>();
   /** username -> deviceId -> device (keys + one-time keys). */
   readonly devices = new Map<string, Map<string, MockDevice>>();
   /** username -> queued to-device events (with global seq for sync wakeups). */
@@ -171,6 +177,8 @@ export class MockHomeserver {
       isSpace: opts.isSpace,
       members: new Map(),
       events: [],
+      typingUntil: new Map(),
+      typingSeq: 0,
     };
     this.rooms.set(roomId, room);
 
@@ -213,6 +221,14 @@ export class MockHomeserver {
       this._send(res, 204, null);
       return;
     }
+
+    /* media upload carries raw bytes — bypass the JSON body reader */
+    const uploadUrl = new URL(req.url ?? "/", "http://mock.hs");
+    if (req.method === "POST" && uploadUrl.pathname === "/_matrix/media/v3/upload") {
+      this._handleUpload(req, res);
+      return;
+    }
+
     this._readBody(req)
       .then((body) => this._route(req, res, body))
       .catch((err: unknown) => {
@@ -221,6 +237,39 @@ export class MockHomeserver {
           error: String(err),
         });
       });
+  }
+
+  private _handleUpload(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const user = this._authUser(req);
+    if (!user) {
+      this._err(res, 401, "M_UNKNOWN_TOKEN", "Unrecognised access token");
+      return;
+    }
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      const bytes = Buffer.concat(chunks);
+      const id = crypto.randomBytes(16).toString("hex");
+      const mime = String(req.headers["content-type"] ?? "application/octet-stream");
+      this.media.set(id, { bytes, mime });
+      this._send(res, 200, { content_uri: `mxc://mock.hs/${id}` });
+    });
+  }
+
+  private _sendBytes(
+    res: http.ServerResponse,
+    status: number,
+    mime: string,
+    bytes: Buffer
+  ): void {
+    res.writeHead(status, {
+      "Content-Type": mime,
+      "Content-Length": bytes.length,
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    });
+    res.end(bytes);
   }
 
   private _readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
@@ -280,6 +329,21 @@ export class MockHomeserver {
 
     if (req.method === "GET" && parts.join("/") === "_matrix/client/versions") {
       this._send(res, 200, { versions: ["v1.11.0"] });
+      return;
+    }
+
+    /* media endpoints live under _matrix/media (not client/v3) */
+    if (parts[0] === "_matrix" && parts[1] === "media" && req.method === "GET") {
+      const mediaRoute = parts.slice(2).join("/"); /* v3/download/{server}/{id} */
+      const mediaMatch = mediaRoute.match(/^v3\/(?:download|thumbnail)\/([^/]+)\/([^/]+)$/);
+      const item = mediaMatch
+        ? this.media.get(decodeURIComponent(mediaMatch[2] ?? ""))
+        : null;
+      if (item) {
+        this._sendBytes(res, 200, item.mime, item.bytes);
+      } else {
+        this._err(res, 404, "M_NOT_FOUND", "Unknown media");
+      }
       return;
     }
 
@@ -547,6 +611,38 @@ export class MockHomeserver {
       return;
     }
 
+    /* media download/thumbnail (authenticated) — mock serves the raw bytes */
+    const downloadMatch = route.match(/^(?:media\/v3\/)?(?:download|thumbnail)\/([^/]+)\/([^/]+)$/);
+    if (req.method === "GET" && downloadMatch) {
+      const item = this.media.get(decodeURIComponent(downloadMatch[2] ?? ""));
+      if (!item) {
+        this._err(res, 404, "M_NOT_FOUND", "Unknown media");
+        return;
+      }
+      this._sendBytes(res, 200, item.mime, item.bytes);
+      return;
+    }
+
+    /* typing notifications */
+    const typingMatch = route.match(/^rooms\/([^/]+)\/typing\/(.+)$/);
+    if (req.method === "PUT" && typingMatch) {
+      const room = this.rooms.get(typingMatch[1] ?? "");
+      if (!room) {
+        this._err(res, 404, "M_NOT_FOUND", "Unknown room");
+        return;
+      }
+      const typingUserId = decodeURIComponent(typingMatch[2] ?? "");
+      const active = body.typing === true;
+      if (active) {
+        room.typingUntil.set(typingUserId, Date.now() + Number(body.timeout ?? 30000));
+      } else {
+        room.typingUntil.delete(typingUserId);
+      }
+      room.typingSeq = ++this._seq; /* wake long-polls */
+      this._send(res, 200, {});
+      return;
+    }
+
     if (req.method === "GET" && route === "sync") {
       this._handleSync(res, user, query);
       return;
@@ -575,8 +671,10 @@ export class MockHomeserver {
   private _hasNew(user: MockUser, sinceNum: number): boolean {
     const toDevice = this.toDeviceQueue.get(user.username) ?? [];
     if (toDevice.some((entry) => entry.seq > sinceNum)) return true;
-    return this._joinedRooms(user).some((room) =>
-      room.events.some((event) => event.seq > sinceNum)
+    return this._joinedRooms(user).some(
+      (room) =>
+        room.typingSeq > sinceNum ||
+        room.events.some((event) => event.seq > sinceNum)
     );
   }
 
@@ -623,7 +721,10 @@ export class MockHomeserver {
       const joinedCount = [...room.members.values()].filter(
         (membership) => membership === "join"
       ).length;
-      join[room.id] = {
+      const typingNow = [...room.typingUntil.entries()]
+        .filter(([, until]) => until > Date.now())
+        .map(([userId]) => userId);
+      const joinEntry: Record<string, unknown> = {
         state: { events: stateEvents },
         timeline: { events: timelineEvents },
         summary: {
@@ -631,6 +732,18 @@ export class MockHomeserver {
           "m.invited_member_count": 0,
         },
       };
+      if (room.typingSeq > 0) {
+        joinEntry.ephemeral = {
+          events: [
+            {
+              type: "m.typing",
+              sender: "@mock:hs",
+              content: { user_ids: typingNow },
+            },
+          ],
+        };
+      }
+      join[room.id] = joinEntry;
     }
 
     /* to-device: deliver queued events once (initial sync delivers all). */

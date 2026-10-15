@@ -70,6 +70,7 @@ export class CallManager {
   private _notice: string | null = null;
   private _localMuted = false;
   private _localDeviceId = "";
+  private _removePayloadListener: (() => void) | null = null;
 
   constructor(client: MatrixClient) {
     this.client = client;
@@ -121,11 +122,11 @@ export class CallManager {
     /* register signal hooks */
     this.client.onToDevice = (event) => this._onPlainSignal(event);
     const crypto = this.client.crypto;
-    if (crypto) {
-      crypto.toDevicePayloadHandler = (sender, payload) => {
-        this._onSignal(sender, payload.type, payload.content);
-      };
-    }
+    this._removePayloadListener = crypto
+      ? crypto.addPayloadListener((sender, type, content) => {
+          this._onSignal(sender, type, content);
+        })
+      : null;
 
     await this._publishMember(true);
     this._reconcileMesh();
@@ -164,7 +165,8 @@ export class CallManager {
     this._roomId = null;
     this._notice = null;
     this._localMuted = false;
-    if (this.client.crypto) this.client.crypto.toDevicePayloadHandler = null;
+    this._removePayloadListener?.();
+    this._removePayloadListener = null;
     if (this.client.onToDevice) this.client.onToDevice = null;
     this._emit();
   }

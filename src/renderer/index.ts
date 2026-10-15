@@ -14,4 +14,5 @@ import "./components/chat-view.ts";
 import "./components/member-list.ts";
 import "./components/app-shell.ts";
 import "./components/call-view.ts";
+import "./components/verify-view.ts";
 import "./app.ts";

@@ -39,6 +39,7 @@ export interface MatrixEvent {
 interface SyncJoinedRoom {
   state?: { events?: MatrixEvent[] };
   timeline?: { events?: MatrixEvent[]; limited?: boolean };
+  ephemeral?: { events?: MatrixEvent[] };
   summary?: {
     "m.joined_member_count"?: number;
     "m.invited_member_count"?: number;
@@ -129,6 +130,8 @@ export interface Room {
   encryptionAlgorithm: string | null;
   /** m.call.member state: userId -> content (MSC3401 call membership). */
   callMembers: Map<string, Record<string, unknown>>;
+  /** Users currently typing (from ephemeral m.typing), self excluded. */
+  typingUsers: string[];
   children: Set<string>;
   members: Map<string, MemberRecord>;
   timeline: TimelineItem[];
@@ -556,6 +559,7 @@ export class MatrixClient {
         isEncrypted: false,
         encryptionAlgorithm: null,
         callMembers: new Map(),
+        typingUsers: [],
         children: new Set(),
         members: new Map(),
         timeline: [],
@@ -893,6 +897,20 @@ export class MatrixClient {
       if (rd.summary?.["m.joined_member_count"] != null) {
         room.summaryJoinedCount = rd.summary["m.joined_member_count"];
       }
+
+      /* ephemeral: typing notifications */
+      const typingEvent = rd.ephemeral?.events?.find((event) => event.type === "m.typing");
+      if (typingEvent) {
+        const raw = (typingEvent.content as { user_ids?: unknown }).user_ids;
+        const typingUsers = Array.isArray(raw)
+          ? (raw as string[]).filter((userId) => userId !== this.userId)
+          : [];
+        const typingChanged =
+          typingUsers.length !== room.typingUsers.length ||
+          typingUsers.some((userId) => !room.typingUsers.includes(userId));
+        room.typingUsers = typingUsers;
+        if (typingChanged) changedRooms.push({ room, newEvents: [] });
+      }
       if (rd.unread_notifications?.notification_count != null) {
         room.serverNotifications = rd.unread_notifications.notification_count;
       }
@@ -1081,6 +1099,135 @@ export class MatrixClient {
       {
         body: { messages: { [targetUserId]: { [targetDeviceId]: content } } },
       }
+    );
+  }
+
+  /** Upload raw bytes to the media store; resolves the mxc:// URI. */
+  async uploadMedia(
+    filename: string,
+    mimeType: string,
+    bytes: Uint8Array
+  ): Promise<string> {
+    const url = new URL(
+      `${this.baseUrl}/_matrix/media/v3/upload`
+    );
+    url.searchParams.set("filename", filename);
+    const res = await fetch(url.toString(), {
+      method: "POST",
+      headers: {
+        "Content-Type": mimeType,
+        ...(this.accessToken ? { Authorization: `Bearer ${this.accessToken}` } : {}),
+      },
+      body: bytes as unknown as BodyInit,
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      content_uri?: string;
+      errcode?: string;
+      error?: string;
+    };
+    if (!res.ok || !data.content_uri) {
+      throw new HttpError(res.status, data as never);
+    }
+    return data.content_uri;
+  }
+
+  /**
+   * Send an image (m.image) — megolm-encrypted in encrypted rooms (the
+   * mxc URI is then only visible to room members). Echoes locally with
+   * media metadata so it renders instantly.
+   */
+  async sendMedia(
+    roomId: string,
+    media: {
+      mxc: string;
+      name: string;
+      mimeType: string;
+      width?: number | null;
+      height?: number | null;
+      size?: number | null;
+    }
+  ): Promise<string | null> {
+    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
+    const room = this.rooms.get(roomId);
+    const info: Record<string, unknown> = { mimetype: media.mimeType };
+    if (media.width != null) info.w = media.width;
+    if (media.height != null) info.h = media.height;
+    if (media.size != null) info.size = media.size;
+    const content: Record<string, unknown> = {
+      msgtype: "m.image",
+      body: media.name,
+      url: media.mxc,
+      info,
+    };
+
+    if (room?.isEncrypted === true && !this.crypto) {
+      throw new Error("Cannot send: E2EE is unavailable in this encrypted room");
+    }
+
+    const echo: MessageItem = {
+      kind: "message",
+      id: `pending-${txnId}`,
+      txnId,
+      pending: true,
+      sender: this.userId ?? "",
+      senderName: "You",
+      ts: Date.now(),
+      msgtype: "m.image",
+      body: media.name,
+      media: {
+        mxc: media.mxc,
+        mimetype: media.mimeType,
+        width: media.width ?? null,
+        height: media.height ?? null,
+        size: media.size ?? null,
+        name: media.name,
+      },
+    };
+    if (room) {
+      room.timeline.push(echo);
+      room.lastActivityTs = echo.ts;
+      this.emit("room", { room, newEvents: [echo] });
+      this.emit("rooms", this.getRooms());
+    }
+    try {
+      const encrypted = room?.isEncrypted === true && this.crypto !== null;
+      const sendType = encrypted ? "m.room.encrypted" : "m.room.message";
+      const payload: Record<string, unknown> = encrypted
+        ? await this.crypto!.encryptRoomMessage(roomId, content)
+        : content;
+      const res = await this.api<{ event_id?: string }>(
+        "PUT",
+        `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/${sendType}/${encodeURIComponent(txnId)}`,
+        { body: payload }
+      );
+      if (res?.event_id) {
+        echo.eventId = res.event_id;
+        this._acked.set(res.event_id, txnId);
+        return res.event_id;
+      }
+      return null;
+    } catch (err) {
+      echo.pending = false;
+      echo.failed = true;
+      if (room) {
+        this.emit("room", { room, newEvents: [{ kind: "echo-failed", txnId }] });
+      }
+      throw err;
+    }
+  }
+
+  /** Publish (or clear) typing state for the current user in a room. */
+  async setTyping(
+    roomId: string,
+    typing: boolean,
+    timeoutMs = 30_000
+  ): Promise<void> {
+    const userId = this.userId ?? "";
+    if (!userId) return;
+    await this.api(
+      "PUT",
+      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/typing/${encodeURIComponent(userId)}`,
+      { body: { typing, timeout: timeoutMs } }
     );
   }
 
