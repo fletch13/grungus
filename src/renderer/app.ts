@@ -14,6 +14,7 @@ import type { MemberList } from "./components/member-list.ts";
 import type { AppShell } from "./components/app-shell.ts";
 import { MatrixClient, type Room } from "./services/matrix-client.ts";
 import { E2eeCrypto, type CryptoStore } from "./services/e2ee.ts";
+import { CallManager, type CallUiState } from "./services/calls.ts";
 
 export interface SavedSession {
   baseUrl: string;
@@ -169,6 +170,12 @@ function makeCryptoStore(): CryptoStore {
 
 /** Attach the E2EE layer; the app degrades gracefully when it fails. */
 async function attachCrypto(c: MatrixClient): Promise<void> {
+  /* escape hatch for constrained environments (and call-only testing):
+     ?noe2ee boots without the E2EE layer */
+  if (new URLSearchParams(location.search).has("noe2ee")) {
+    console.warn("[grungus] E2EE disabled via ?noe2ee");
+    return;
+  }
   try {
     const crypto = new E2eeCrypto({ host: c, store: makeCryptoStore() });
     await crypto.init();
@@ -224,6 +231,30 @@ function startShell(): void {
       active
     );
   };
+
+  /* ---- calls (MSC3401, full-mesh WebRTC) ---- */
+  const callManager = new CallManager(active);
+  const callView = document.createElement("call-view");
+  root.appendChild(callView);
+  callManager.setUiListener((callState: CallUiState) => {
+    callView.update(callState, callManager);
+    if (state.roomId) {
+      const room = active.getRoom(state.roomId);
+      chat.setCallState(CallManager.callOngoing(room, active.userId), callState.active);
+    }
+  });
+
+  const startCall = (roomId: string): void => {
+    void callManager.start(roomId).catch((err: unknown) => {
+      chat.setNotice(
+        `Could not start call: ${err instanceof Error ? err.message : "unknown error"}`
+      );
+    });
+  };
+
+  chat.addEventListener("grungus:start-call", (event) => {
+    startCall((event as CustomEvent<{ roomId: string }>).detail.roomId);
+  });
 
   const selectRoom = (roomId: string): void => {
     const room = active.getRoom(roomId);
@@ -283,9 +314,14 @@ function startShell(): void {
 
   active.on("room", (update) => {
     if (!client) return;
+    callManager.onRoomUpdate(update.room);
     if (update.room.id === state.roomId) {
       chat.appendEvents(update.room, update.newEvents);
       members.update(update.room, client, client.userId);
+      chat.setCallState(
+        CallManager.callOngoing(update.room, active.userId),
+        callManager.active
+      );
     }
     refreshSidebar();
   });

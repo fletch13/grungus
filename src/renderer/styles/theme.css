@@ -488,6 +488,14 @@ chat-view {
   box-shadow: 0 1px 0 rgba(0, 0, 0, 0.24);
   z-index: 1;
   user-select: text;
+  position: relative;
+}
+
+.header-call-controls {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
 }
 
 .chat-header .title {
@@ -788,6 +796,150 @@ g-avatar .av img {
 
 g-avatar.squared .av {
   border-radius: 16px;
+}
+
+.call-btn-header {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.call-btn-header:hover {
+  color: var(--text-bright);
+  background: var(--bg-hover);
+}
+
+.call-live {
+  color: var(--ok);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* call overlay */
+
+.call-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(15, 16, 19, 0.97);
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+}
+
+.call-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 8px 16px;
+}
+
+.call-title {
+  color: var(--text-bright);
+  font-weight: 800;
+  font-size: 20px;
+}
+
+.call-notice {
+  color: var(--warn);
+  font-size: 13px;
+}
+
+.call-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  align-content: center;
+}
+
+.call-tile {
+  position: relative;
+  background: #1a1b1e;
+  border-radius: 12px;
+  overflow: hidden;
+  aspect-ratio: 4 / 3;
+}
+
+.call-tile video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.call-tile-label {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+
+.call-tile-name {
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.call-tile-status {
+  color: var(--warn);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.call-tile-status.ok {
+  color: var(--ok);
+}
+
+.call-empty {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.call-footer {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  padding-top: 16px;
+}
+
+.call-btn {
+  background: #4b4d54;
+  color: #fff;
+  border: none;
+  border-radius: 24px;
+  padding: 10px 24px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.call-btn:hover {
+  background: #5a5c63;
+}
+
+.call-btn.muted {
+  background: var(--warn);
+}
+
+.call-btn.danger {
+  background: var(--danger);
+}
+
+.call-btn.danger:hover {
+  background: #d83c3f;
 }
 
 /* narrow screens: drop the member pane */

@@ -524,6 +524,29 @@ export class MockHomeserver {
       return;
     }
 
+    /* generic state event send (e.g. m.call.member) */
+    const stateMatch = route.match(/^rooms\/([^/]+)\/state\/([^/]+)\/(.*)$/);
+    if (req.method === "PUT" && stateMatch) {
+      const room = this.rooms.get(stateMatch[1] ?? "");
+      if (!room) {
+        this._err(res, 404, "M_NOT_FOUND", "Unknown room");
+        return;
+      }
+      if (room.members.get(user.userId) !== "join") {
+        this._err(res, 403, "M_FORBIDDEN", "Not in room");
+        return;
+      }
+      const ev = this._appendEvent(
+        room,
+        stateMatch[2] ?? "",
+        user.userId,
+        body,
+        { state_key: stateMatch[3] ?? "" }
+      );
+      this._send(res, 200, { event_id: ev.event_id });
+      return;
+    }
+
     if (req.method === "GET" && route === "sync") {
       this._handleSync(res, user, query);
       return;

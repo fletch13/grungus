@@ -13,4 +13,5 @@ import "./components/message-item.ts";
 import "./components/chat-view.ts";
 import "./components/member-list.ts";
 import "./components/app-shell.ts";
+import "./components/call-view.ts";
 import "./app.ts";

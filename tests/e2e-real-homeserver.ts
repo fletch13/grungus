@@ -311,6 +311,24 @@ async function main(): Promise<void> {
   );
   log("reverse-direction encrypted message decrypted ✓");
 
+  /* 4b. MSC3401: call membership state */
+  await a.sendStateEvent(encRoomId, "m.call.member", a.userId!, {
+    "m.calls": [
+      { "m.call_id": "", "m.devices": [{ device_id: a.deviceId ?? "", muted: false }] },
+    ],
+  });
+  await waitFor(
+    () => b.getRoom(encRoomId)?.callMembers.has(a.userId!) === true,
+    "b sees a's call membership"
+  );
+  log("m.call.member state published and visible to the other member ✓");
+  await a.sendStateEvent(encRoomId, "m.call.member", a.userId!, { "m.calls": [] });
+  await waitFor(
+    () => !b.getRoom(encRoomId)?.callMembers.has(a.userId!),
+    "membership cleared"
+  );
+  log("call membership cleared ✓");
+
   a.stopSync();
   b.stopSync();
   log("ALL E2E CHECKS PASSED against", HOME);

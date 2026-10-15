@@ -20,6 +20,14 @@ for an open protocol.
   to-device messages to every member device, including your own.
   Encrypted rooms show a 🔒 badge; sends fail closed rather than leaking
   plaintext; undecryptable history shows an explicit notice.
+- **Native group calls (MSC3401, full-mesh WebRTC)** — start or join a
+  call from the chat header; m.call.member state announces membership,
+  SDP offers/answers and ICE candidates flow over olm-encrypted
+  (encrypted rooms) or plaintext to-device messages, media rides
+  WebRTC DTLS-SRTP with one peer connection per member device. Mute,
+  hang up, per-peer connection state. When no capture devices exist,
+  a synthetic canvas/oscillator stream keeps calls working (with a
+  visible notice) — handy on headless hosts.
 - **Discord-style layout** — space rail (servers), room/channel list,
   chat with grouped messages and day dividers, member list, composer.
 - **Spaces as servers** — Matrix Spaces appear in the left rail like
@@ -52,6 +60,7 @@ for an open protocol.
 │   app.ts ── orchestrates state and wiring                     │
 │     ├── services/matrix-client.ts  typed Matrix CS API client │
 │     ├── services/e2ee.ts           Olm/Megolm via libolm WASM │
+│     ├── services/calls.ts          MSC3401 calls, mesh WebRTC │
 │     └── components/*.ts             custom elements:           │
 │           login-view, app-shell, space-rail, room-list,        │
 │           chat-view, message-item, member-list, g-avatar       │
@@ -97,6 +106,7 @@ Client-Server API (v3 paths, spec v1.x):
 | Device keys | `POST /keys/upload`, `POST /keys/query`, `POST /keys/claim` |
 | Room key sharing | `PUT /sendToDevice/m.room.encrypted/{txnId}` (olm) |
 | Avatars / media | `GET /_matrix/media/v3/{thumbnail,download}/…` (Bearer) |
+| Calls (MSC3401) | `m.call.member` state; `m.call.negotiate` / `m.call.candidates` to-device (olm in encrypted rooms, plaintext otherwise) |
 
 Room state (names, topics, members, spaces, encryption) is derived from
 `m.room.*` state events in the sync response, following the same model
@@ -151,6 +161,11 @@ In this mode the session and E2EE pickles are stored in `localStorage`
   it as protection against the server, not against device substitution.
 - Sends fail closed: an encrypted room without a working E2EE layer never
   receives plaintext.
+- **Calls**: signaling is olm-encrypted inside encrypted rooms; media is
+  WebRTC DTLS-SRTP, and in a full mesh there is no middleman. New rooms
+  are created with `m.call.member` permitted at power level 0 (the same
+  grant Element Call uses); in legacy rooms with restrictive power
+  levels, joining members cannot publish call state.
 - Messages render as text only; HTML from other clients is not executed.
 - Media is fetched with authenticated requests (Bearer header) and
   rendered from blob object URLs — compatible with homeservers that
@@ -181,15 +196,23 @@ homeserver: bidirectional encrypted chat with a headless second device,
 sender self-visibility, and correct "unable to decrypt" notices for
 history predating the device.
 
+Calls are verified in layers: signaling suites (member state visibility,
+plaintext signals, olm-encrypted signals — all in `npm test`), the
+real-homeserver e2e (membership publish/clear), and a live two-party
+call in a real browser against the real homeserver — full mesh
+established, `connectionState: connected` on both peers, two media
+tracks delivered and the video decoding over DTLS-SRTP, hangup via the
+product UI.
+
 Small CLI tools in `examples/` (list-rooms, tail-room, send-message) use
 the same client from Node — handy for debugging and demos.
 
 ## Roadmap
 
-- **Voice/video calls (MSC3401)** — the E2EE prerequisite is in place;
-  next comes call signaling over to-device events, then WebRTC media
-  transport (ideally via an SFU). Interim option: embed Element Call in
-  a `<webview>` window before native calls land.
+- **Calls hardening** — an SFU for larger rooms (full mesh scales to a
+  handful of participants), screenshare, Element Call interoperability
+  (the signaling is modeled on MSC3401 but interop is untested), and
+  insertable-streams E2EE media on top of DTLS-SRTP.
 - **E2EE hardening** — SAS/QR device verification, cross-signing, key
   backup, key forwarding (session sharing to newly-seen devices), room
   key rotation on membership change.

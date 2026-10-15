@@ -127,6 +127,8 @@ export interface Room {
   joinRule: string | null;
   isEncrypted: boolean;
   encryptionAlgorithm: string | null;
+  /** m.call.member state: userId -> content (MSC3401 call membership). */
+  callMembers: Map<string, Record<string, unknown>>;
   children: Set<string>;
   members: Map<string, MemberRecord>;
   timeline: TimelineItem[];
@@ -239,6 +241,11 @@ export class MatrixClient {
   connectionState: ConnectionState = "connecting";
   /** E2EE layer — attached by the app after login; null in plain mode. */
   crypto: E2eeCrypto | null = null;
+  /**
+   * Hook for PLAINTEXT to-device events (non-m.room.encrypted), e.g.
+   * MSC3401 call signaling in unencrypted rooms. Set by the call layer.
+   */
+  onToDevice: ((event: ToDeviceEvent) => void) | null = null;
 
   private _since: string | null = null;
   private _seen = new Set<string>();
@@ -548,6 +555,7 @@ export class MatrixClient {
         joinRule: null,
         isEncrypted: false,
         encryptionAlgorithm: null,
+        callMembers: new Map(),
         children: new Set(),
         members: new Map(),
         timeline: [],
@@ -594,6 +602,21 @@ export class MatrixClient {
           typeof content.algorithm === "string" ? content.algorithm : null;
         room.isEncrypted = algorithm !== null;
         room.encryptionAlgorithm = algorithm;
+        break;
+      }
+      case "m.call.member": {
+        if (typeof ev.state_key !== "string") break;
+        const calls = content["m.calls"];
+        const hasDevices =
+          Array.isArray(calls) &&
+          (calls as { "m.devices"?: unknown[] }[]).some(
+            (call) => Array.isArray(call["m.devices"]) && call["m.devices"]!.length > 0
+          );
+        if (hasDevices) {
+          room.callMembers.set(ev.state_key, content);
+        } else {
+          room.callMembers.delete(ev.state_key);
+        }
         break;
       }
       case "m.room.member": {
@@ -801,14 +824,25 @@ export class MatrixClient {
     /* to-device first: room keys must be processed before encrypted room
        events arriving in the same sync batch are handled. A crypto error
        must never abort room processing. */
-    if (this.crypto) {
+    if (this.crypto || this.onToDevice) {
       try {
         const toDevice = data.to_device?.events ?? [];
-        if (toDevice.length > 0) this.crypto.onToDeviceEvents(toDevice);
-        const keyCounts = data.device_one_time_keys_count;
-        if (keyCounts) void this.crypto.onOneTimeKeyCounts(keyCounts);
-        const changed = data.device_lists?.changed;
-        if (changed && changed.length > 0) this.crypto.onDeviceListChange(changed);
+        for (const event of toDevice) {
+          if (event.type === "m.room.encrypted") continue; /* handled by crypto */
+          this.onToDevice?.(event);
+        }
+        if (this.crypto) {
+          const encryptedToDevice = toDevice.filter(
+            (event) => event.type === "m.room.encrypted"
+          );
+          if (encryptedToDevice.length > 0) {
+            this.crypto.onToDeviceEvents(encryptedToDevice);
+          }
+          const keyCounts = data.device_one_time_keys_count;
+          if (keyCounts) void this.crypto.onOneTimeKeyCounts(keyCounts);
+          const changed = data.device_lists?.changed;
+          if (changed && changed.length > 0) this.crypto.onDeviceListChange(changed);
+        }
       } catch (err) {
         console.error("[grungus] crypto sync handling failed:", err);
       }
@@ -986,6 +1020,12 @@ export class MatrixClient {
         },
       ];
     }
+    /* MSC3401 calls: every member must be able to publish their call
+       membership state — grant m.call.member at power level 0 (the same
+       thing Element Call does for call rooms). */
+    body.power_level_content_override = {
+      events: { "m.call.member": 0 },
+    };
     const res = await this.api<{ room_id?: string }>(
       "POST",
       `${CLIENT_PREFIX}/createRoom`,
@@ -1009,6 +1049,38 @@ export class MatrixClient {
       "POST",
       `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/invite`,
       { body: { user_id: userId } }
+    );
+  }
+
+  /** Send/overwrite a room state event (e.g. m.call.member). */
+  async sendStateEvent(
+    roomId: string,
+    type: string,
+    stateKey: string,
+    content: Record<string, unknown>
+  ): Promise<string | null> {
+    const res = await this.api<{ event_id?: string }>(
+      "PUT",
+      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/state/${encodeURIComponent(type)}/${encodeURIComponent(stateKey)}`,
+      { body: content }
+    );
+    return res?.event_id ?? null;
+  }
+
+  /** Send a plaintext to-device message to one device. */
+  async sendToDevice(
+    targetUserId: string,
+    targetDeviceId: string,
+    type: string,
+    content: Record<string, unknown>
+  ): Promise<void> {
+    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
+    await this.api(
+      "PUT",
+      `/_matrix/client/v3/sendToDevice/${encodeURIComponent(type)}/${encodeURIComponent(txnId)}`,
+      {
+        body: { messages: { [targetUserId]: { [targetDeviceId]: content } } },
+      }
     );
   }
 

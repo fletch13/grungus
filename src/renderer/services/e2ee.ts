@@ -334,6 +334,55 @@ export class E2eeCrypto {
     }
   }
 
+  /**
+   * Handler for olm-decrypted to-device payloads that are NOT room keys
+   * (e.g. MSC3401 call signaling). Set by the call layer.
+   */
+  toDevicePayloadHandler:
+    | ((sender: string, payload: { type: string; content: Record<string, unknown> }) => void)
+    | null = null;
+
+  /**
+   * Send an olm-encrypted to-device message of an arbitrary type to one
+   * device (MSC3401 call signaling in encrypted rooms uses this).
+   */
+  async sendToDeviceEncrypted(
+    targetUserId: string,
+    targetDeviceId: string,
+    type: string,
+    content: Record<string, unknown>
+  ): Promise<void> {
+    const devices = await this.getUserDevices(targetUserId);
+    const device = devices.find((d) => d.deviceId === targetDeviceId);
+    if (!device) throw new Error(`unknown device ${targetUserId}/${targetDeviceId}`);
+    const session = await this.getOrCreateOlmSession(device, targetUserId);
+    if (!session) throw new Error(`no olm session to ${targetUserId}/${targetDeviceId}`);
+
+    const payload = JSON.stringify({ type, content, sender: this.host.userId });
+    const encrypted = session.encrypt(payload);
+    const messages: Record<string, Record<string, unknown>> = {
+      [targetUserId]: {
+        [targetDeviceId]: {
+          algorithm: ALGORITHM_OLM,
+          sender_key: this._curve25519,
+          ciphertext: {
+            [device.curve25519]: {
+              type: encrypted.type,
+              body: encrypted.body,
+            },
+          },
+          recipient_keys: { [`ed25519:${device.deviceId}`]: device.ed25519 },
+        },
+      },
+    };
+    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
+    await this.host.api(
+      "PUT",
+      `/_matrix/client/v3/sendToDevice/m.room.encrypted/${encodeURIComponent(txnId)}`,
+      { body: { messages } }
+    );
+  }
+
   /* --------------------------- device discovery --------------------------- */
 
   private async getUserDevices(userId: string): Promise<DeviceInfo[]> {
@@ -577,26 +626,38 @@ export class E2eeCrypto {
     } catch {
       return;
     }
-    if (payload.type !== "m.room_key" || !payload.content) return;
+    if (!payload.type || !payload.content) return;
 
-    const roomKey = payload.content as {
-      room_id?: string;
-      session_id?: string;
-      session_key?: string;
-    };
-    if (!roomKey.room_id || !roomKey.session_id || !roomKey.session_key) return;
+    if (payload.type === "m.room_key") {
+      this._ingestRoomKey(senderKey, payload.content);
+    } else {
+      /* other olm-protected payloads (MSC3401 call signaling) */
+      this.toDevicePayloadHandler?.(event.sender, {
+        type: payload.type,
+        content: payload.content,
+      });
+    }
+  }
+
+  private _ingestRoomKey(senderCurve25519: string, roomKey: Record<string, unknown>): void {
+    const roomId = typeof roomKey.room_id === "string" ? roomKey.room_id : null;
+    const sessionId = typeof roomKey.session_id === "string" ? roomKey.session_id : null;
+    const sessionKey = typeof roomKey.session_key === "string" ? roomKey.session_key : null;
+    if (!roomId || !sessionId || !sessionKey) return;
 
     const olm = this._olm!;
     const igs = new olm.InboundGroupSession();
     try {
-      igs.create(roomKey.session_key);
+      igs.create(sessionKey);
     } catch (err) {
       console.error("[e2ee] bad inbound session key:", err);
       return;
     }
-    this._inbound.set(`${senderKey}|${roomKey.session_id}`, {
+    /* indexed by the sender's curve25519 key — that is what m.room.encrypted
+       events carry in content.sender_key, and what decryptRoomEvent uses */
+    this._inbound.set(`${senderCurve25519}|${sessionId}`, {
       session: igs,
-      roomId: roomKey.room_id,
+      roomId,
     });
   }
 

@@ -21,6 +21,8 @@ export class ChatView extends HTMLElement {
   private _scroll!: HTMLElement;
   private _input!: HTMLTextAreaElement;
   private _hint!: HTMLElement;
+  private _callOngoing = false;
+  private _callJoined = false;
 
   connectedCallback(): void {
     this._renderSkeleton();
@@ -102,6 +104,35 @@ export class ChatView extends HTMLElement {
       ? `${room.topic}  ·  ${room.joinedMemberCount} members`
       : `${room.joinedMemberCount} members`;
     this._header.appendChild(el("span", { class: "topic", text: sub }));
+
+    /* call controls */
+    const controls = el("div", { class: "header-call-controls" });
+    if (this._callJoined) {
+      controls.appendChild(el("span", { class: "call-live", text: "● in call" }));
+    } else {
+      const callBtn = el("button", {
+        class: "call-btn-header",
+        text: this._callOngoing ? "Join call" : "📞",
+        title: this._callOngoing ? "Join the ongoing call" : "Start a call",
+      });
+      callBtn.addEventListener("click", () => {
+        this.dispatchEvent(
+          new CustomEvent("grungus:start-call", {
+            detail: { roomId: room.id },
+            bubbles: true,
+          })
+        );
+      });
+      controls.appendChild(callBtn);
+    }
+    this._header.appendChild(controls);
+  }
+
+  /** Re-render the header's call controls (call state changed). */
+  setCallState(ongoing: boolean, joined: boolean): void {
+    this._callOngoing = ongoing;
+    this._callJoined = joined;
+    if (this._room) this._renderHeader();
   }
 
   private _clearTimeline(): void {
