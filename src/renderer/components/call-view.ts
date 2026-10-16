@@ -2,13 +2,26 @@
  * Grungus — <call-view>: full-screen call overlay.
  * Local + remote tiles, mute toggle, screenshare start/stop, a large
  * presentation tile for the active screen, hangup, per-peer state.
+ * Works with the MSC3401 mesh manager or the LiveKit SFU adapter —
+ * anything satisfying the controller interface below.
  */
 import { el } from "./ui.ts";
-import { CallManager, type CallUiState, type CallParticipant } from "../services/calls.ts";
+import type { CallUiState } from "../services/calls.ts";
+
+/** What the overlay needs from whichever call backend drives it. */
+export interface CallController {
+  setMuted(muted: boolean): void;
+  hangUp(): void;
+  startScreenshare(): void;
+  stopScreenshare(): void;
+  localStream: MediaStream | null;
+  /** the sharer's own screen stream, when driving with mesh calls */
+  localScreenStream?: MediaStream | null;
+}
 
 export class CallView extends HTMLElement {
   private _state: CallUiState | null = null;
-  private _manager: CallManager | null = null;
+  private _manager: CallController | null = null;
   /** key -> video element, reused across renders to avoid flicker. */
   private _videos = new Map<string, HTMLVideoElement>();
 
@@ -16,7 +29,7 @@ export class CallView extends HTMLElement {
     this._render();
   }
 
-  update(state: CallUiState, manager: CallManager): void {
+  update(state: CallUiState, manager: CallController): void {
     this._state = state;
     this._manager = manager;
     this._render();

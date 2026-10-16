@@ -799,8 +799,8 @@ export class MockHomeserver {
       return;
     }
 
-    /* generic state event send (e.g. m.call.member) */
-    const stateMatch = route.match(/^rooms\/([^/]+)\/state\/([^/]+)\/(.*)$/);
+    /* generic state event send (e.g. m.call.member, com.grungus.livekit) */
+    const stateMatch = route.match(/^rooms\/([^/]+)\/state\/([^/]+)(?:\/(.*))?$/);
     if (req.method === "PUT" && stateMatch) {
       const room = this.rooms.get(stateMatch[1] ?? "");
       if (!room) {
@@ -811,12 +811,13 @@ export class MockHomeserver {
         this._err(res, 403, "M_FORBIDDEN", "Not in room");
         return;
       }
+      const stateKey = stateMatch[3] ?? "";
       const ev = this._appendEvent(
         room,
         stateMatch[2] ?? "",
         user.userId,
         body,
-        { state_key: stateMatch[3] ?? "" }
+        { state_key: stateKey }
       );
       this._send(res, 200, { event_id: ev.event_id });
       return;

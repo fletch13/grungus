@@ -72,8 +72,19 @@ for an open protocol.
   at a time. m.call.screenshare start/stop rides the same encrypted
   signaling (a Grungus extension, Element interop untested). Hosts
   without display capture fall back to a synthetic screen so the whole
-  pipeline stays verifiable. For larger rooms the real fix is an SFU
-  (LiveKit — the Element Call stack — is the roadmap choice).
+  pipeline stays verifiable.
+- **Calls through a LiveKit SFU (optional)** — rooms with a
+  `com.grungus.livekit` state event ({url, room, auth_url}) route calls
+  through a LiveKit server instead of the mesh: the bandwidth ceiling
+  is gone (the SFU does simulcast — publish once, the server fans out
+  appropriate layers to each receiver). Identity flow (Element
+  lk-jwt-service pattern): the client proves its Matrix identity to a
+  token service (OpenID token, with whoami fallback for homeservers
+  with federation disabled) and receives a short-lived LiveKit access
+  token; the API secret never touches the client. Media falls back to
+  synthetic streams on headless hosts. Rooms without a LiveKit state
+  event use the mesh unchanged. `livekit/auth-service.ts` is the
+  deployable token service (single-file Node, jsonwebtoken).
 - **Discord-style layout** — space rail (servers), room/channel list,
   chat with grouped messages and day dividers, member list, composer.
 - **Spaces as servers** — Matrix Spaces appear in the left rail like
@@ -318,13 +329,11 @@ the same client from Node — handy for debugging and demos.
 
 ## Roadmap
 
-- **Calls hardening** — an SFU for larger rooms (full mesh scales to a
-  handful of participants; LiveKit — the Element Call stack — is the
-  choice, and the real fix for large-room screenshare bandwidth), an
-  in-app screen/source picker, Element Call interoperability (the
-  signaling is modeled on MSC3401 but interop is untested), and
-  insertable-streams E2EE media on top of DTLS-SRTP. (Screenshare
-  itself shipped — see above.)
+- **Calls hardening** — in-app screen/source picker, Element Call
+  interoperability (the signaling is modeled on MSC3401 and LiveKit
+  but interop is untested), and insertable-streams E2EE media on top
+  of DTLS-SRTP. (Screenshare shipped; the LiveKit SFU shipped — see
+  above.)
 - **E2EE hardening** — QR device verification, cross-signing.
   (SAS verification, key forwarding to own/verified devices, rotation
   on membership change, and server-side key backup shipped — see above;

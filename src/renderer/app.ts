@@ -15,6 +15,7 @@ import type { AppShell } from "./components/app-shell.ts";
 import { MatrixClient, type Room } from "./services/matrix-client.ts";
 import { E2eeCrypto, type CryptoStore } from "./services/e2ee.ts";
 import { CallManager, type CallUiState } from "./services/calls.ts";
+import { LkCallManager, type LkCallState } from "./services/calls-livekit.ts";
 import { VerificationManager, type SasUiState } from "./services/sas.ts";
 
 export interface SavedSession {
@@ -360,19 +361,81 @@ function startShell(): void {
     );
   };
 
-  /* ---- calls (MSC3401, full-mesh WebRTC) ---- */
+  /* ---- calls (MSC3401 mesh, or LiveKit SFU when configured) ---- */
   const callManager = new CallManager(active);
+  const lkManager = new LkCallManager(active);
   const callView = document.createElement("call-view");
   root.appendChild(callView);
-  callManager.setUiListener((callState: CallUiState) => {
-    callView.update(callState, callManager);
+  let callMode: "mesh" | "livekit" = "mesh";
+
+  const refreshCallHeader = (): void => {
     if (state.roomId) {
       const room = active.getRoom(state.roomId);
-      chat.setCallState(CallManager.callOngoing(room, active.userId), callState.active);
+      const ongoing =
+        callMode === "livekit" ? lkManager.connected : callManager.active;
+      chat.setCallState(
+        CallManager.callOngoing(room, active.userId),
+        ongoing
+      );
+    }
+  };
+
+  callManager.setUiListener((callState: CallUiState) => {
+    if (callMode === "mesh") {
+      callView.update(callState, callManager);
+      refreshCallHeader();
+    }
+  });
+  lkManager.setListener((lkState) => {
+    if (callMode === "livekit") {
+      /* adapt the SFU state to the overlay's shape */
+      callView.update(
+        {
+          active: lkState.connected,
+          roomId: state.roomId,
+          participants: lkState.participants.map((p) => ({
+            key: p.identity,
+            userId: p.identity,
+            deviceId: "sfu",
+            name: p.name,
+            stream: p.stream,
+            screenStream: p.screenStream,
+            sharing: p.sharing,
+            connectionState: "connected",
+          })),
+          notice: lkState.notice,
+          localMuted: lkState.localMuted,
+          localSharing: lkState.localSharing,
+          localKey: active.userId,
+        },
+        {
+          /* route the overlay buttons to the SFU manager */
+          setMuted: (m) => lkManager.setMuted(m),
+          hangUp: () => void lkManager.leave(),
+          startScreenshare: () => void lkManager.setSharing(true),
+          stopScreenshare: () => void lkManager.setSharing(false),
+          localStream: null,
+        }
+      );
+      refreshCallHeader();
     }
   });
 
   const startCall = (roomId: string): void => {
+    const room = active.getRoom(roomId);
+    if (room?.livekitService) {
+      /* LiveKit path: publish the service state for others, then join the SFU */
+      callMode = "livekit";
+      lkManager.setRoomId(roomId);
+      void lkManager.join().catch((err: unknown) => {
+        chat.setNotice(
+          `Could not join the LiveKit call: ${err instanceof Error ? err.message : "unknown error"}`
+        );
+        callMode = "mesh";
+      });
+      return;
+    }
+    callMode = "mesh";
     void callManager.start(roomId).catch((err: unknown) => {
       chat.setNotice(
         `Could not start call: ${err instanceof Error ? err.message : "unknown error"}`

@@ -148,6 +148,12 @@ export interface Room {
   encryptionAlgorithm: string | null;
   /** m.call.member state: userId -> content (MSC3401 call membership). */
   callMembers: Map<string, Record<string, unknown>>;
+  /** com.grungus.livekit state: the room's LiveKit call service, if any. */
+  livekitService: {
+    url: string;
+    room: string;
+    authUrl: string;
+  } | null;
   /** Users currently typing (from ephemeral m.typing), self excluded. */
   typingUsers: string[];
   children: Set<string>;
@@ -532,6 +538,25 @@ export class MatrixClient {
     return res;
   }
 
+  /**
+   * Request a scoped OpenID token for THIS user (used to prove identity to
+   * trusted services like the LiveKit token service without handing over
+   * the session token).
+   */
+  async requestOpenIdToken(): Promise<{ access_token: string; matrix_server_name: string }> {
+    const userId = this.userId ?? "";
+    const res = await this.api<{ access_token?: string; matrix_server_name?: string }>(
+      "POST",
+      `${CLIENT_PREFIX}/user/${encodeURIComponent(userId)}/openid/request_token`,
+      { body: {} }
+    );
+    if (!res.access_token) throw new Error("homeserver issued no OpenID token");
+    return {
+      access_token: res.access_token,
+      matrix_server_name: res.matrix_server_name ?? "",
+    };
+  }
+
   /** Validate an access token; resolves the whoami payload or throws. */
   async whoami(): Promise<{ user_id: string }> {
     const res = await this.api<{ user_id?: string }>(
@@ -644,6 +669,7 @@ export class MatrixClient {
         isEncrypted: false,
         encryptionAlgorithm: null,
         callMembers: new Map(),
+        livekitService: null,
         typingUsers: [],
         children: new Set(),
         members: new Map(),
@@ -691,6 +717,14 @@ export class MatrixClient {
           typeof content.algorithm === "string" ? content.algorithm : null;
         room.isEncrypted = algorithm !== null;
         room.encryptionAlgorithm = algorithm;
+        break;
+      }
+      case "com.grungus.livekit": {
+        const url = typeof content.url === "string" ? content.url : null;
+        const lkRoom = typeof content.room === "string" ? content.room : null;
+        const authUrl = typeof content.auth_url === "string" ? content.auth_url : null;
+        room.livekitService =
+          url && lkRoom && authUrl ? { url, room: lkRoom, authUrl } : null;
         break;
       }
       case "m.call.member": {
