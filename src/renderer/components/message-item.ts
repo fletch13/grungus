@@ -1,9 +1,10 @@
 /*
  * Grungus — <message-item>: one chat message, Discord-style.
  * Handles grouped rendering (consecutive messages from the same sender),
- * pending/failed local echoes, emote/notice formatting, and image/GIF
- * media rendering via authenticated media downloads (GIFs animate
- * natively in an <img>).
+ * pending/failed local echoes, emote/notice formatting, image/GIF
+ * media rendering via authenticated media downloads, reactions
+ * (emoji chips with counts), edits (m.replace with "(edited)"),
+ * and reply chains (m.in_reply_to with quoted parent).
  */
 import { el, colorFor, formatTime } from "./ui.ts";
 import type { MatrixClient, MessageItem, Room } from "../services/matrix-client.ts";
@@ -15,15 +16,23 @@ export interface MessageItemOptions {
   meUserId?: string | null;
 }
 
+export interface MessageActions {
+  onReply?: (item: MessageItem) => void;
+  onReact?: (item: MessageItem, emoji: string) => void;
+  onEdit?: (item: MessageItem) => void;
+}
+
+const QUICK_REACTIONS = ["👍", "❤️", "😂", "🎉", "😮", "😢"];
+
 export class MessageItemElement extends HTMLElement {
   private _item: MessageItem | null = null;
 
-  update(item: MessageItem, opts: MessageItemOptions): void {
+  update(item: MessageItem, opts: MessageItemOptions, actions?: MessageActions): void {
     this._item = item;
-    this._render(opts);
+    this._render(opts, actions ?? {});
   }
 
-  private _render(opts: MessageItemOptions): void {
+  private _render(opts: MessageItemOptions, actions: MessageActions): void {
     const item = this._item;
     if (!item) return;
     const client = opts.client;
@@ -32,6 +41,26 @@ export class MessageItemElement extends HTMLElement {
     this.classList.toggle("grouped", opts.grouped === true);
     this.classList.toggle("pending", item.pending === true);
     this.classList.toggle("failed", item.failed === true);
+
+    /* hover toolbar (reply / react / edit) */
+    const toolbar = el("div", { class: "msg-toolbar" });
+    if (actions.onReply) {
+      const replyBtn = el("button", { class: "msg-toolbar-btn", title: "Reply", text: "↩" });
+      replyBtn.addEventListener("click", () => actions.onReply?.(item));
+      toolbar.appendChild(replyBtn);
+    }
+    /* quick reactions */
+    for (const emoji of QUICK_REACTIONS.slice(0, 3)) {
+      const rBtn = el("button", { class: "msg-toolbar-btn", title: `React ${emoji}`, text: emoji });
+      rBtn.addEventListener("click", () => actions.onReact?.(item, emoji));
+      toolbar.appendChild(rBtn);
+    }
+    if (actions.onEdit && item.sender === opts.meUserId && item.id && !item.pending) {
+      const editBtn = el("button", { class: "msg-toolbar-btn", title: "Edit", text: "✏️" });
+      editBtn.addEventListener("click", () => actions.onEdit?.(item));
+      toolbar.appendChild(editBtn);
+    }
+    this.appendChild(toolbar);
 
     /* avatar column (kept for alignment when grouped) */
     const avatarCol = el("div", { class: "avatar-col" });
@@ -67,12 +96,51 @@ export class MessageItemElement extends HTMLElement {
       main.appendChild(head);
     }
 
+    /* reply context (quoted parent) */
+    if (item.replyTo) {
+      const quote = el("div", { class: "msg-reply" });
+      const line = el("div", { class: "msg-reply-line" });
+      quote.appendChild(line);
+      const replyBody = el("div", { class: "msg-reply-body" });
+      replyBody.appendChild(
+        el("span", { class: "msg-reply-sender", text: item.replyTo.senderName })
+      );
+      replyBody.appendChild(
+        el("span", { class: "msg-reply-text", text: item.replyTo.body })
+      );
+      quote.appendChild(replyBody);
+      main.appendChild(quote);
+    }
+
     /* media (images, GIFs, stickers) — renders instead of the body text */
     const media = item.media;
     if (media && media.mxc) {
       main.appendChild(this._buildMedia(item, media.mxc, client));
     } else {
       main.appendChild(this._buildBody(item));
+    }
+
+    /* reactions (emoji chips with counts) */
+    if (item.reactions && item.reactions.size > 0) {
+      const reactions = el("div", { class: "msg-reactions" });
+      for (const [emoji, senders] of item.reactions) {
+        if (senders.size === 0) continue;
+        const chip = el("button", {
+          class: "msg-reaction-chip" +
+            (senders.has(opts.meUserId ?? "") ? " mine" : ""),
+        });
+        chip.appendChild(el("span", { class: "msg-reaction-emoji", text: emoji }));
+        chip.appendChild(
+          el("span", { class: "msg-reaction-count", text: String(senders.size) })
+        );
+        chip.addEventListener("click", () => {
+          actions.onReact?.(item, emoji);
+        });
+        reactions.appendChild(chip);
+      }
+      if (reactions.children.length > 0) {
+        main.appendChild(reactions);
+      }
     }
 
     if (item.failed === true) {
@@ -125,6 +193,16 @@ export class MessageItemElement extends HTMLElement {
       body.style.color = "var(--text-muted)";
     } else {
       body.textContent = item.body;
+    }
+    /* "(edited)" indicator for m.replace'd messages */
+    if (item.edited) {
+      body.appendChild(
+        el("span", {
+          class: "msg-edited",
+          text: " (edited)",
+          title: item.editTs ? formatTime(item.editTs) : undefined,
+        })
+      );
     }
     return body;
   }

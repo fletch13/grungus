@@ -101,6 +101,19 @@ for an open protocol.
 - **Typing notifications** — the composer emits `m.typing` while you
   type (server-rate-limited); other members' typing state shows above
   the composer.
+- **Message reactions** — hover any message for the quick-reaction
+  toolbar (👍 ❤️ 😂); reactions ride the spec's m.reaction /
+  m.annotation events, aggregate as emoji chips with live counts, and
+  highlight your own.
+- **Replies** — the ↩ action quotes the parent (m.in_reply_to) above
+  the composer; sent replies render with the quoted sender + snippet
+  and the spec's fallback quote is stripped from the body
+  reply-aware clients.
+- **Message editing** — the ✏️ action on your own messages sends
+  m.replace with m.new_content; the timeline updates the original in
+  place with an "(edited)" marker instead of appending a new entry.
+  Redactions remove their targets from the timeline (m.room.redaction,
+  power-levels enforced server-side).
 - **Device verification (SAS)** — the 🛡 button in encrypted rooms starts
   emoji-based SAS verification (m.key.verification, real libolm
   SAS + HKDF MACs) with every other member's unverified device; both

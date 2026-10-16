@@ -1104,6 +1104,154 @@ g-avatar.squared .av {
   color: #43b581;
 }
 
+.msg-toolbar {
+  position: absolute;
+  top: -14px;
+  right: 8px;
+  display: none;
+  gap: 4px;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 4px;
+  z-index: 2;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+message-item:hover .msg-toolbar {
+  display: flex;
+}
+
+.msg-toolbar-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 5px;
+  border-radius: 4px;
+}
+
+.msg-toolbar-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-bright);
+}
+
+.msg-reply {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  cursor: default;
+  align-items: baseline;
+}
+
+.msg-reply-line {
+  width: 3px;
+  border-radius: 2px;
+  background: var(--sender-color, #5865f2);
+  align-self: stretch;
+  min-height: 18px;
+}
+
+.msg-reply-body {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.msg-reply-sender {
+  color: var(--text-bright);
+  font-weight: 600;
+  margin-right: 4px;
+}
+
+.msg-reply-text {
+  color: var(--text-muted);
+}
+
+.msg-edited {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-style: italic;
+}
+
+.msg-reactions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+
+.msg-reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: var(--bg-chat);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1px 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.msg-reaction-chip.mine {
+  background: rgba(88, 101, 242, 0.2);
+  border-color: #5865f2;
+}
+
+.msg-reaction-chip:hover {
+  border-color: var(--text-muted);
+}
+
+.msg-reaction-emoji {
+  font-size: 14px;
+}
+
+.msg-reaction-count {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.reply-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: rgba(88, 101, 242, 0.1);
+  border-radius: 6px 6px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+}
+
+.reply-bar-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+}
+
+.reply-bar-close:hover {
+  color: var(--text-bright);
+}
+
+.reply-bar-text {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reply-bar-sender {
+  color: var(--text-bright);
+  font-weight: 600;
+}
+
 .verify-card {
   background: var(--bg-sidebar);
   border-radius: 12px;

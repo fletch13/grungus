@@ -27,6 +27,7 @@ interface MockEvent {
   origin_server_ts: number;
   seq: number;
   state_key?: string;
+  redacts?: string;
   unsigned?: { prev_content?: Record<string, unknown>; [key: string]: unknown };
 }
 
@@ -158,7 +159,7 @@ export class MockHomeserver {
     type: string,
     sender: string,
     content: Record<string, unknown>,
-    extra?: { state_key?: string }
+    extra?: { state_key?: string; redacts?: string }
   ): MockEvent {
     const ev: MockEvent = {
       event_id: "$e" + ++this._eventCounter,
@@ -169,6 +170,7 @@ export class MockHomeserver {
       seq: ++this._seq,
     };
     if (extra && extra.state_key !== undefined) ev.state_key = extra.state_key;
+    if (extra && extra.redacts !== undefined) ev.redacts = extra.redacts;
     /* real servers attach unsigned.prev_content on membership transitions —
        the client's key rotation depends on it */
     if (
@@ -725,6 +727,36 @@ export class MockHomeserver {
         user.userId,
         body
       );
+      this._send(res, 200, { event_id: ev.event_id });
+      return;
+    }
+
+    /* redaction: PUT rooms/{id}/redact/{eventId}/{txnId} */
+    const redactMatch = route.match(/^rooms\/([^/]+)\/redact\/([^/]+)\/([^/]+)$/);
+    if (req.method === "PUT" && redactMatch) {
+      const room = this.rooms.get(redactMatch[1] ?? "");
+      if (!room) {
+        this._err(res, 404, "M_NOT_FOUND", "Unknown room");
+        return;
+      }
+      if (room.members.get(user.userId) !== "join") {
+        this._err(res, 403, "M_FORBIDDEN", "Not in room");
+        return;
+      }
+      const targetId = redactMatch[2] ?? "";
+      /* find the target event — the redaction strips its content */
+      const target = room.events.find((e) => e.event_id === targetId);
+      const ev = this._appendEvent(
+        room,
+        "m.room.redaction",
+        user.userId,
+        body && Object.keys(body).length > 0 ? body : {},
+        { redacts: targetId }
+      );
+      /* strip the target's content (server-side redaction semantics) */
+      if (target) {
+        target.content = {};
+      }
       this._send(res, 200, { event_id: ev.event_id });
       return;
     }

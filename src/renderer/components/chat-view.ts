@@ -5,7 +5,7 @@
  * re-renders (echo reconciliation markers).
  */
 import { el, formatDay, sameDay } from "./ui.ts";
-import type { MatrixClient, Room, RoomEvent, TimelineItem } from "../services/matrix-client.ts";
+import type { MatrixClient, MessageItem, Room, RoomEvent, TimelineItem } from "../services/matrix-client.ts";
 
 function isTimelineItem(event: RoomEvent): event is TimelineItem {
   return event.kind === "message" || event.kind === "system";
@@ -26,6 +26,9 @@ export class ChatView extends HTMLElement {
   private _callJoined = false;
   private _typingSentAt = 0;
   private _typingStopTimer: ReturnType<typeof setTimeout> | null = null;
+  private _replyTarget: { eventId: string; sender: string; senderName: string; body: string } | null = null;
+  private _replyBar: HTMLElement | null = null;
+  private _editTarget: MessageItem | null = null;
 
   connectedCallback(): void {
     this._renderSkeleton();
@@ -51,6 +54,8 @@ export class ChatView extends HTMLElement {
       class: "hidden-file-input",
     }) as HTMLInputElement;
     this._typingBar = el("div", { class: "typing-bar" });
+    this._replyBar = el("div", { class: "reply-bar" });
+    this._replyBar.style.display = "none";
     this._input = el("textarea", {
       rows: "1",
       placeholder: "Message…",
@@ -60,6 +65,7 @@ export class ChatView extends HTMLElement {
     composer.appendChild(attach);
     composer.appendChild(fileInput);
     composer.appendChild(this._input);
+    wrap.appendChild(this._replyBar);
     wrap.appendChild(this._typingBar);
     wrap.appendChild(composer);
     wrap.appendChild(this._hint);
@@ -254,9 +260,71 @@ export class ChatView extends HTMLElement {
       client: this._client,
       room: this._room,
       meUserId: this._meUserId,
+    }, {
+      onReply: (msg) => this._startReply(msg),
+      onReact: (msg, emoji) => {
+        this.dispatchEvent(
+          new CustomEvent("grungus:react", {
+            detail: { roomId: this._room?.id, eventId: msg.id, emoji },
+            bubbles: true,
+          })
+        );
+      },
+      onEdit: (msg) => this._startEdit(msg),
     });
     this._scroll.appendChild(node);
     this._lastItem = item;
+  }
+
+  /* ------------------------- reply / edit state ------------------------- */
+
+  /** Show the reply bar and prefill the composer for a reply. */
+  private _startReply(msg: MessageItem): void {
+    if (!msg.id || !this._replyBar) return;
+    this._replyTarget = {
+      eventId: msg.id,
+      sender: msg.sender,
+      senderName: msg.senderName,
+      body: msg.body.slice(0, 120),
+    };
+    this._editTarget = null;
+    this._renderReplyBar();
+    this._input.placeholder = `Reply to ${msg.senderName}…`;
+    this._input.focus();
+  }
+
+  /** Pre-fill the composer for editing one of your own messages. */
+  private _startEdit(msg: MessageItem): void {
+    if (!msg.id) return;
+    this._editTarget = msg;
+    this._replyTarget = null;
+    this._replyBar!.style.display = "none";
+    this._input.value = msg.body;
+    this._input.placeholder = "Edit message…";
+    this._autosize();
+    this._input.focus();
+  }
+
+  private _clearReplyEdit(): void {
+    this._replyTarget = null;
+    this._editTarget = null;
+    if (this._replyBar) this._replyBar.style.display = "none";
+    this._input.placeholder = "Message…";
+  }
+
+  private _renderReplyBar(): void {
+    if (!this._replyBar || !this._replyTarget) return;
+    this._replyBar.style.display = "";
+    this._replyBar.textContent = "";
+    this._replyBar.appendChild(
+      el("span", { class: "reply-bar-sender", text: this._replyTarget.senderName })
+    );
+    this._replyBar.appendChild(
+      el("span", { class: "reply-bar-text", text: this._replyTarget.body })
+    );
+    const close = el("button", { class: "reply-bar-close", text: "✕" });
+    close.addEventListener("click", () => this._clearReplyEdit());
+    this._replyBar.appendChild(close);
   }
 
   /** Update the "X is typing…" bar from the room's ephemeral state. */
@@ -295,6 +363,45 @@ export class ChatView extends HTMLElement {
   private _submit(): void {
     const body = this._input.value;
     if (!body.trim() || !this._room) return;
+
+    /* edit mode: dispatch an edit event instead of a new message */
+    if (this._editTarget && this._editTarget.id) {
+      const editId = this._editTarget.id;
+      this._clearReplyEdit();
+      this._input.value = "";
+      this._autosize();
+      this.dispatchEvent(
+        new CustomEvent("grungus:edit", {
+          detail: { roomId: this._room.id, eventId: editId, body },
+          bubbles: true,
+        })
+      );
+      setTimeout(() => this._input.focus(), 0);
+      return;
+    }
+
+    /* reply mode: include the parent context */
+    if (this._replyTarget) {
+      const rt = this._replyTarget;
+      this._clearReplyEdit();
+      this._input.value = "";
+      this._autosize();
+      this.dispatchEvent(
+        new CustomEvent("grungus:send-reply", {
+          detail: {
+            roomId: this._room.id,
+            parentEventId: rt.eventId,
+            parentSender: rt.sender,
+            parentBody: rt.body,
+            body,
+          },
+          bubbles: true,
+        })
+      );
+      setTimeout(() => this._input.focus(), 0);
+      return;
+    }
+
     this.dispatchEvent(
       new CustomEvent("grungus:send", {
         detail: { roomId: this._room.id, body },

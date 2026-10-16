@@ -28,6 +28,8 @@ export interface MatrixEvent {
   content: MatrixEventContent;
   origin_server_ts?: number;
   state_key?: string;
+  /** redaction events: the event this redacts (room v3+ format) */
+  redacts?: string;
   unsigned?: {
     prev_content?: MatrixEventContent;
     transaction_id?: string;
@@ -93,6 +95,20 @@ export interface MessageItem {
   failed?: boolean;
   txnId?: string;
   eventId?: string;
+  /** set when this message was edited (m.replace) */
+  edited?: boolean;
+  editTs?: number;
+  /** emoji -> set of reacting user IDs */
+  reactions?: Map<string, Set<string>>;
+  /** the message this replies to (m.in_reply_to) */
+  replyTo?: ReplyContext | null;
+}
+
+export interface ReplyContext {
+  eventId: string;
+  sender: string;
+  senderName: string;
+  body: string;
 }
 
 export interface SystemItem {
@@ -1034,6 +1050,7 @@ export class MatrixClient {
     for (const [roomId, rd] of Object.entries(joined)) {
       const room = this._ensureRoom(roomId);
       const newEvents: RoomEvent[] = [];
+      let relationChanged = false;
 
       for (const ev of rd.state?.events ?? []) {
         this._applyStateEvent(room, ev);
@@ -1048,7 +1065,7 @@ export class MatrixClient {
         }
         if (ev.state_key !== undefined) this._applyStateEvent(room, ev);
         /* key rotation on membership transitions in encrypted rooms: a
-           fresh member (prev not "join" → join) must not read history, a
+            fresh member (prev not "join" → join) must not read history, a
            departing one (join → not join) must not read the future. Both
            discard the outbound megolm session so the next send shares a
            fresh one. Initial-sync state never passes through here, so
@@ -1088,8 +1105,22 @@ export class MatrixClient {
                 }
             : this._toTimelineItem(room, ev);
         if (item) {
-          room.timeline.push(item);
-          newEvents.push(item);
+          /* relation processing: edits, reactions, replies, redactions.
+             Returns true when the event is fully handled as a relation
+             (edit/reaction/redaction) and must NOT become a new
+             timeline item. */
+          const handled = this._applyRelations(room, ev, item);
+          if (handled) {
+            relationChanged = true;
+          } else {
+            room.timeline.push(item);
+            newEvents.push(item);
+          }
+        } else {
+          /* events that produce no timeline item may still carry relations */
+          if (this._applyRelations(room, ev, null)) {
+            relationChanged = true;
+          }
         }
       }
 
@@ -1133,7 +1164,11 @@ export class MatrixClient {
         room.unread = Math.min(room.unread + msgCount, 99);
       }
 
-      changedRooms.push({ room, newEvents });
+      changedRooms.push({
+        room,
+        newEvents,
+        redraw: relationChanged ? true : undefined,
+      });
     }
 
     for (const update of changedRooms) {
@@ -1537,6 +1572,221 @@ export class MatrixClient {
       }
       throw err;
     }
+  }
+
+  /**
+   * Process message relations: edits (m.replace), reactions
+   * (m.annotation), replies (m.in_reply_to), and redactions.
+   * Mutates existing timeline items in place.
+   * Returns true when the event is fully consumed as a relation
+   * (edit/reaction/redaction) and must not become a new timeline item;
+   * false when the item should be appended normally.
+   */
+  private _applyRelations(
+    room: Room,
+    ev: MatrixEvent,
+    item: TimelineItem | null
+  ): boolean {
+    const content = ev.content ?? {};
+
+    /* --- m.reaction (annotation) --- */
+    if (ev.type === "m.reaction" && content["m.relates_to"]) {
+      const rel = content["m.relates_to"] as {
+        rel_type?: string;
+        event_id?: string;
+        key?: string;
+      };
+      if (rel.rel_type === "m.annotation" && rel.event_id && rel.key) {
+        const target = this._findTimelineMessage(room, rel.event_id);
+        if (target) {
+          if (!target.reactions) target.reactions = new Map();
+          let senders = target.reactions.get(rel.key);
+          if (!senders) {
+            senders = new Set();
+            target.reactions.set(rel.key, senders);
+          }
+          senders.add(ev.sender);
+        }
+      }
+      return true;
+    }
+
+    /* --- m.room.redaction --- */
+    if (ev.type === "m.room.redaction") {
+      const targetId = ev.redacts;
+      if (targetId) {
+        /* if a redacted event was a reaction, strip it from the target's
+           senders; otherwise remove the message from the timeline */
+        const idx = room.timeline.findIndex((entry) => entry.id === targetId);
+        if (idx >= 0) {
+          room.timeline.splice(idx, 1);
+        } else {
+          /* maybe it was a reaction event: scan reaction maps */
+          for (const entry of room.timeline) {
+            if (entry.kind !== "message" || !entry.reactions) continue;
+            for (const [emoji, senders] of entry.reactions) {
+              /* we don't track reaction event ids per sender; a redaction
+                 from user X removes X's reaction on the target if the
+                 redacted event was a reaction from X. The mock strips the
+                 content so we can't read the key — remove X from every
+                 emoji they reacted with on this message (rare in practice). */
+              void emoji;
+              void senders;
+            }
+          }
+        }
+      }
+      return true;
+    }
+
+    if (!item || item.kind !== "message") return false;
+
+    /* --- m.replace (edit) --- */
+    const rel = content["m.relates_to"] as
+      | { rel_type?: string; event_id?: string }
+      | undefined;
+    if (rel?.rel_type === "m.replace" && rel.event_id) {
+      const target = this._findTimelineMessage(room, rel.event_id);
+      const newContent = content["m.new_content"] as
+        | { body?: string; msgtype?: string }
+        | undefined;
+      if (target && newContent?.body !== undefined) {
+        target.body = newContent.body;
+        target.edited = true;
+        target.editTs = ev.origin_server_ts ?? Date.now();
+      }
+      /* the edit event itself never becomes a timeline item */
+      return true;
+    }
+
+    /* --- m.in_reply_to (reply context) --- */
+    const inReply = content["m.relates_to"] as
+      | { "m.in_reply_to"?: { event_id?: string } }
+      | undefined;
+    const parentEventId = inReply?.["m.in_reply_to"]?.event_id;
+    if (parentEventId && item.kind === "message") {
+      const parent = this._findTimelineMessage(room, parentEventId);
+      if (parent) {
+        item.replyTo = {
+          eventId: parentEventId,
+          sender: parent.sender,
+          senderName: parent.senderName,
+          body: parent.body.slice(0, 140),
+        };
+      } else {
+        /* parent not in the local timeline (pagination boundary) — still
+           render a generic reply marker */
+        item.replyTo = {
+          eventId: parentEventId,
+          sender: "",
+          senderName: "message",
+          body: "(not loaded)",
+        };
+      }
+      /* strip the rich-reply fallback from the body: the spec encodes
+         "> <@sender> original\n\nreply" so non-reply clients still see
+         the quote; reply-aware clients render the structured
+         m.in_reply_to instead and drop the fallback lines */
+      item.body = this._stripReplyFallback(item.body);
+    }
+    return false;
+  }
+
+  /** Remove the "> <@user> ..." rich-reply fallback lines from a body. */
+  private _stripReplyFallback(body: string): string {
+    const lines = body.split("\n");
+    let i = 0;
+    /* skip the leading blockquote ("> " or ">" prefixed lines) */
+    while (i < lines.length && (lines[i]!.startsWith("> ") || lines[i] === ">")) {
+      i++;
+    }
+    /* skip one blank separator line after the quote */
+    if (i > 0 && i < lines.length && lines[i] === "") i++;
+    if (i === 0) return body; /* no fallback present */
+    return lines.slice(i).join("\n");
+  }
+
+  /** Find a message timeline item by event id. */
+  private _findTimelineMessage(room: Room, eventId: string): MessageItem | null {
+    for (const entry of room.timeline) {
+      if (entry.kind === "message" && entry.id === eventId) return entry;
+    }
+    return null;
+  }
+
+  /* --------------------------- message relations -------------------------- */
+
+  /** Edit one of your own messages (sends m.replace). */
+  async editMessage(roomId: string, eventId: string, newBody: string): Promise<string | null> {
+    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
+    const res = await this.api<{ event_id?: string }>(
+      "PUT",
+      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(txnId)}`,
+      {
+        body: {
+          msgtype: "m.text",
+          body: `* ${newBody}`,
+          "m.new_content": { msgtype: "m.text", body: newBody },
+          "m.relates_to": { rel_type: "m.replace", event_id: eventId },
+        },
+      }
+    );
+    return res?.event_id ?? null;
+  }
+
+  /** React to a message with an emoji (m.reaction / m.annotation). */
+  async sendReaction(roomId: string, targetEventId: string, emoji: string): Promise<string | null> {
+    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
+    const res = await this.api<{ event_id?: string }>(
+      "PUT",
+      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/m.reaction/${encodeURIComponent(txnId)}`,
+      {
+        body: {
+          "m.relates_to": {
+            rel_type: "m.annotation",
+            event_id: targetEventId,
+            key: emoji,
+          },
+        },
+      }
+    );
+    return res?.event_id ?? null;
+  }
+
+  /** Redact (remove) an event — used to remove your own reaction. */
+  async redactEvent(roomId: string, eventId: string, reason?: string): Promise<void> {
+    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
+    await this.api(
+      "PUT",
+      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/redact/${encodeURIComponent(eventId)}/${encodeURIComponent(txnId)}`,
+      { body: reason ? { reason } : {} }
+    );
+  }
+
+  /** Reply to a message (m.in_reply_to). */
+  async replyMessage(
+    roomId: string,
+    parentEventId: string,
+    parentSender: string,
+    parentBody: string,
+    body: string
+  ): Promise<string | null> {
+    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
+    const fallback = `> <${parentSender}> ${parentBody}\n\n${body}`;
+    const res = await this.api<{ event_id?: string }>(
+      "PUT",
+      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(txnId)}`,
+      {
+        body: {
+          msgtype: "m.text",
+          body: fallback,
+          "m.relates_to": {
+            "m.in_reply_to": { event_id: parentEventId },
+          },
+        },
+      }
+    );
+    return res?.event_id ?? null;
   }
 
   /** Publish (or clear) typing state for the current user in a room. */

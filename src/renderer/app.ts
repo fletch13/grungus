@@ -688,6 +688,52 @@ function startShell(): void {
       });
   });
 
+  chat.addEventListener("grungus:edit", (event) => {
+    const detail = (event as CustomEvent<{ roomId: string; eventId: string; body: string }>).detail;
+    void active
+      .editMessage(detail.roomId, detail.eventId, detail.body)
+      .catch((err: unknown) => {
+        chat.setNotice(
+          `Failed to edit: ${err instanceof Error ? err.message : "network error"}`
+        );
+      });
+  });
+
+  chat.addEventListener("grungus:send-reply", (event) => {
+    const detail = (event as CustomEvent<{
+      roomId: string;
+      parentEventId: string;
+      parentSender: string;
+      parentBody: string;
+      body: string;
+    }>).detail;
+    void active
+      .replyMessage(
+        detail.roomId,
+        detail.parentEventId,
+        detail.parentSender,
+        detail.parentBody,
+        detail.body
+      )
+      .catch((err: unknown) => {
+        chat.setNotice(
+          `Failed to reply: ${err instanceof Error ? err.message : "network error"}`
+        );
+      });
+  });
+
+  chat.addEventListener("grungus:react", (event) => {
+    const detail = (event as CustomEvent<{ roomId: string; eventId: string | null; emoji: string }>).detail;
+    if (!detail.eventId) return;
+    void active
+      .sendReaction(detail.roomId, detail.eventId, detail.emoji)
+      .catch((err: unknown) => {
+        chat.setNotice(
+          `Failed to react: ${err instanceof Error ? err.message : "network error"}`
+        );
+      });
+  });
+
   active.on("room", (update) => {
     if (!client) return;
     callManager.onRoomUpdate(update.room);
