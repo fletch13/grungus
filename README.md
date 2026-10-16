@@ -62,6 +62,18 @@ for an open protocol.
   hang up, per-peer connection state. When no capture devices exist,
   a synthetic canvas/oscillator stream keeps calls working (with a
   visible notice) — handy on headless hosts.
+- **Screen sharing** — "Share screen" in the call overlay captures the
+  display (getDisplayMedia; in Electron the primary screen is picked
+  automatically) and adds it to every peer connection with mid-call
+  renegotiation from either role (perfect negotiation with polite-side
+  rollback). The active screen renders as a large presentation tile.
+  Mesh bandwidth discipline: content-hinted screen encoding (~1.5 Mbps
+  cap, 10 fps — screens tolerate low fps, text stays sharp), one share
+  at a time. m.call.screenshare start/stop rides the same encrypted
+  signaling (a Grungus extension, Element interop untested). Hosts
+  without display capture fall back to a synthetic screen so the whole
+  pipeline stays verifiable. For larger rooms the real fix is an SFU
+  (LiveKit — the Element Call stack — is the roadmap choice).
 - **Discord-style layout** — space rail (servers), room/channel list,
   chat with grouped messages and day dividers, member list, composer.
 - **Spaces as servers** — Matrix Spaces appear in the left rail like
@@ -307,9 +319,12 @@ the same client from Node — handy for debugging and demos.
 ## Roadmap
 
 - **Calls hardening** — an SFU for larger rooms (full mesh scales to a
-  handful of participants), screenshare, Element Call interoperability
-  (the signaling is modeled on MSC3401 but interop is untested), and
-  insertable-streams E2EE media on top of DTLS-SRTP.
+  handful of participants; LiveKit — the Element Call stack — is the
+  choice, and the real fix for large-room screenshare bandwidth), an
+  in-app screen/source picker, Element Call interoperability (the
+  signaling is modeled on MSC3401 but interop is untested), and
+  insertable-streams E2EE media on top of DTLS-SRTP. (Screenshare
+  itself shipped — see above.)
 - **E2EE hardening** — QR device verification, cross-signing.
   (SAS verification, key forwarding to own/verified devices, rotation
   on membership change, and server-side key backup shipped — see above;

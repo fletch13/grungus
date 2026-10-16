@@ -10,7 +10,7 @@
  * esbuild bundles this to dist/main.js (CJS); "main" in package.json
  * points there. dist/ also holds preload.js, index.html, renderer.js.
  */
-import { app, BrowserWindow, ipcMain, safeStorage, shell } from "electron";
+import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
 import { startSsoLoopback, type SsoLoopback } from "./sso-loopback.ts";
@@ -231,6 +231,20 @@ function createWindow(): BrowserWindow {
       spellcheck: true,
     },
   });
+
+  /* screenshare: getDisplayMedia from the renderer — pick the primary
+     screen automatically (a source-picker UI can come later) */
+  win.webContents.session.setDisplayMediaRequestHandler(
+    async (_request, callback) => {
+      try {
+        const sources = await desktopCapturer.getSources({ types: ["screen"] });
+        const primary = sources[0];
+        callback(primary ? { video: primary, audio: "loopback" } : {});
+      } catch {
+        callback({});
+      }
+    }
+  );
 
   /* dist/ holds main.js, preload.js, index.html, renderer.js, styles/ */
   void win.loadFile(path.join(__dirname, "index.html"));

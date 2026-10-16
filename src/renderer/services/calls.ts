@@ -13,9 +13,17 @@
  * a synthetic canvas/oscillator stream is used so calls remain testable
  * and demonstrable — the UI shows a notice.
  *
- * v1 limits (documented in the README): full mesh only (no SFU), no
- * screenshare, no Element Call interoperability (modeled on it, not
- * verified against it).
+ * Screenshare: getDisplayMedia (or a synthetic screen on hosts without
+ * display capture), added to every peer connection mid-call with
+ * renegotiation from either role. Bandwidth discipline for the mesh:
+ * content-hinted screen encoding (~1.5 Mbps, 10fps cap) and one share
+ * at a time. m.call.screenshare (active start/stop) rides the same
+ * encrypted signaling — a Grungus extension, not verified against
+ * Element Call.
+ *
+ * v1 limits (documented in the README): full mesh only (no SFU — an SFU
+ * is the real fix for large-room screenshare bandwidth), no Element Call
+ * interoperability (modeled on it, not verified against it).
  */
 
 import type { MatrixClient, Room, ToDeviceEvent } from "./matrix-client.ts";
@@ -29,6 +37,9 @@ export interface CallParticipant {
   deviceId: string;
   name: string;
   stream: MediaStream | null;
+  /** the peer's screen when they are sharing (separate from their camera) */
+  screenStream: MediaStream | null;
+  sharing: boolean;
   connectionState: string;
 }
 
@@ -38,6 +49,7 @@ export interface CallUiState {
   participants: CallParticipant[];
   notice: string | null;
   localMuted: boolean;
+  localSharing: boolean;
   localKey: string | null;
 }
 
@@ -51,12 +63,19 @@ interface PeerEntry {
   pendingCandidates: RTCIceCandidateInit[];
   remoteDescriptionSet: boolean;
   stream: MediaStream | null;
+  screenStream: MediaStream;
+  screenActive: boolean;
   connectionState: string;
 }
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
 ];
+
+/* screen encoding caps — mesh bandwidth discipline: screens tolerate
+   low fps, text needs sharpness; ~1.5 Mbps instead of camera defaults */
+const SCREEN_MAX_BITRATE = 1_500_000;
+const SCREEN_MAX_FPS = 10;
 
 export class CallManager {
   private readonly client: MatrixClient;
@@ -71,6 +90,11 @@ export class CallManager {
   private _localMuted = false;
   private _localDeviceId = "";
   private _removePayloadListener: (() => void) | null = null;
+  /* screenshare state (this device as the sharer) */
+  private _sharing = false;
+  private _screenStream: MediaStream | null = null;
+  private _syntheticScreenCanvas: HTMLCanvasElement | null = null;
+  private _syntheticScreenTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(client: MatrixClient) {
     this.client = client;
@@ -162,6 +186,7 @@ export class CallManager {
       void this._audioCtx.close().catch(() => {});
       this._audioCtx = null;
     }
+    this._stopScreenTracks();
     this._roomId = null;
     this._notice = null;
     this._localMuted = false;
@@ -169,6 +194,19 @@ export class CallManager {
     this._removePayloadListener = null;
     if (this.client.onToDevice) this.client.onToDevice = null;
     this._emit();
+  }
+
+  private _stopScreenTracks(): void {
+    if (this._screenStream) {
+      for (const track of this._screenStream.getTracks()) track.stop();
+      this._screenStream = null;
+    }
+    if (this._syntheticScreenTimer) {
+      clearInterval(this._syntheticScreenTimer);
+      this._syntheticScreenTimer = null;
+    }
+    this._syntheticScreenCanvas = null;
+    this._sharing = false;
   }
 
   /* -------------------------------- media -------------------------------- */
@@ -251,6 +289,182 @@ export class CallManager {
     this._emit();
   }
 
+  /* ------------------------------ screenshare ------------------------------ */
+
+  get localSharing(): boolean {
+    return this._sharing;
+  }
+
+  /** The locally captured/synthetic screen stream (for the local tile). */
+  get localScreenStream(): MediaStream | null {
+    return this._screenStream;
+  }
+
+  /**
+   * Start sharing this device's screen with everyone in the call. One share
+   * at a time (mesh bandwidth discipline): a remote share blocks starting.
+   * Falls back to a synthetic screen when the host has no display capture
+   * (headless/CI) so the whole pipeline stays verifiable.
+   */
+  async startScreenshare(): Promise<void> {
+    if (!this.active || this._sharing) return;
+
+    const remoteSharer = this.remoteSharer();
+    if (remoteSharer) {
+      this._notice = `${remoteSharer.name} is already sharing — one share at a time`;
+      this._emit();
+      return;
+    }
+
+    const captured = await this._acquireScreen();
+    this._screenStream = captured.stream;
+    if (captured.synthetic) {
+      this._notice = "No display capture available — sharing a synthetic screen";
+    } else if (this._notice && this._notice.includes("synthetic")) {
+      this._notice = null;
+    }
+    this._sharing = true;
+
+    /* tell the peers BEFORE the media can arrive so their track routing
+       knows the next video track is a screen */
+    await this._broadcastSignal("m.call.screenshare", { active: true });
+
+    const screenStream = this._screenStream;
+    for (const entry of this._peers.values()) {
+      for (const track of screenStream.getTracks()) {
+        try {
+          const sender = entry.pc.addTrack(track, screenStream);
+          this._capScreenSender(sender);
+        } catch (err) {
+          console.error("[call] addTrack(screen) failed:", err);
+        }
+      }
+    }
+    this._emit();
+  }
+
+  async stopScreenshare(): Promise<void> {
+    if (!this._sharing) return;
+    await this._broadcastSignal("m.call.screenshare", { active: false });
+    const screenStream = this._screenStream;
+    for (const entry of this._peers.values()) {
+      if (!screenStream) continue;
+      for (const track of screenStream.getTracks()) {
+        for (const sender of entry.pc.getSenders()) {
+          if (sender.track === track) {
+            try {
+              entry.pc.removeTrack(sender);
+            } catch (err) {
+              console.warn("[call] removeTrack(screen) failed:", err);
+            }
+          }
+        }
+      }
+    }
+    this._stopScreenTracks();
+    if (this._notice && this._notice.includes("synthetic screen")) {
+      this._notice = null;
+    }
+    this._emit();
+  }
+
+  /** The peer currently sharing, if any (soft one-share-at-a-time). */
+  remoteSharer(): CallParticipant | null {
+    const entry = [...this._peers.values()].find((p) => p.screenActive);
+    if (!entry) return null;
+    return {
+      key: `${entry.userId}|${entry.deviceId}`,
+      userId: entry.userId,
+      deviceId: entry.deviceId,
+      name: this._nameFor(entry.userId),
+      stream: entry.stream,
+      screenStream: entry.screenStream,
+      sharing: true,
+      connectionState: entry.connectionState,
+    };
+  }
+
+  private async _acquireScreen(): Promise<{ stream: MediaStream; synthetic: boolean }> {
+    try {
+      const md = navigator.mediaDevices;
+      if (md && typeof md.getDisplayMedia === "function") {
+        const stream = await md.getDisplayMedia({
+          video: { frameRate: { ideal: SCREEN_MAX_FPS, max: SCREEN_MAX_FPS } },
+          audio: false,
+        });
+        for (const track of stream.getVideoTracks()) {
+          /* text/detail keeps small UI text sharp at low bitrates */
+          if (typeof track.contentHint === "string") track.contentHint = "detail";
+        }
+        return { stream, synthetic: false };
+      }
+    } catch (err) {
+      console.warn("[call] getDisplayMedia failed, falling back to synthetic screen:", err);
+    }
+    return { stream: this._syntheticScreen(), synthetic: true };
+  }
+
+  /** A synthetic screen: animated text canvas producing REAL RTP frames. */
+  private _syntheticScreen(): MediaStream {
+    const canvas = document.createElement("canvas");
+    canvas.width = 640;
+    canvas.height = 360;
+    this._syntheticScreenCanvas = canvas;
+    const ctx = canvas.getContext("2d")!;
+    let tick = 0;
+    const draw = (): void => {
+      tick += 1;
+      ctx.fillStyle = "#101319";
+      ctx.fillRect(0, 0, 640, 360);
+      ctx.fillStyle = "#7ee787";
+      ctx.font = "18px monospace";
+      const lines = [
+        "GRUNGUS — synthetic screen share",
+        "",
+        "$ grungus --share-screen",
+        "reading frame " + tick + " ...",
+        "",
+        "[ok] renegotiation: offer -> answer",
+        "[ok] screen track flowing (10 fps cap)",
+      ];
+      lines.forEach((line, i) => ctx.fillText(line, 16, 40 + i * 26));
+    };
+    draw();
+    this._syntheticScreenTimer = setInterval(draw, 100);
+    const stream = canvas.captureStream(SCREEN_MAX_FPS) as MediaStream;
+    for (const track of stream.getVideoTracks()) {
+      if (typeof track.contentHint === "string") track.contentHint = "text";
+    }
+    return stream;
+  }
+
+  /** Best-effort sender-side caps for the mesh (~1.5 Mbps, 10fps). */
+  private _capScreenSender(sender: RTCRtpSender): void {
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}];
+      }
+      params.encodings[0]!.maxBitrate = SCREEN_MAX_BITRATE;
+      params.encodings[0]!.maxFramerate = SCREEN_MAX_FPS;
+      void sender.setParameters(params).catch(() => {
+        /* encoder defaults then — caps are best-effort */
+      });
+    } catch {
+      /* getParameters unsupported — best-effort only */
+    }
+  }
+
+  private async _broadcastSignal(type: string, content: Record<string, unknown>): Promise<void> {
+    for (const entry of this._peers.values()) {
+      await this._sendSignal(entry.userId, entry.deviceId, type, {
+        call_id: "",
+        device_id: this._localDeviceId,
+        ...content,
+      });
+    }
+  }
+
   /* ------------------------------ membership ------------------------------ */
 
   private async _publishMember(activeInCall: boolean): Promise<void> {
@@ -327,6 +541,8 @@ export class CallManager {
       remoteDescriptionSet: false,
       pendingCandidates: [],
       stream: new MediaStream(),
+      screenStream: new MediaStream(),
+      screenActive: false,
       connectionState: "new",
     };
     this._peers.set(key, entry);
@@ -337,9 +553,31 @@ export class CallManager {
         pc.addTrack(track, this._localStream);
       }
     }
+    /* a share started before this peer joined still reaches them */
+    if (this._screenStream) {
+      for (const track of this._screenStream.getTracks()) {
+        try {
+          const sender = pc.addTrack(track, this._screenStream);
+          this._capScreenSender(sender);
+        } catch (err) {
+          console.error("[call] addTrack(screen) failed:", err);
+        }
+      }
+    }
     pc.ontrack = (event) => {
       for (const stream of event.streams) {
         for (const track of stream.getTracks()) {
+          /* route the screen track to its own stream when we know a share
+             is active; the signal usually precedes the media (the sharer
+             broadcasts before adding the track) */
+          if (
+            entry.screenActive &&
+            track.kind === "video" &&
+            entry.screenStream.getVideoTracks().length === 0
+          ) {
+            entry.screenStream.addTrack(track);
+            continue;
+          }
           entry.stream?.addTrack(track);
         }
       }
@@ -365,7 +603,9 @@ export class CallManager {
       this._emit();
     };
     pc.onnegotiationneeded = async () => {
-      if (entry.polite) return; /* only the impolite side offers */
+      /* BOTH roles may need to renegotiate mid-call (a screenshare adds a
+         track from either side); perfect negotiation resolves collisions:
+         the polite peer rolls back on glare (see _handleNegotiate) */
       try {
         entry.makingOffer = true;
         await pc.setLocalDescription(await pc.createOffer());
@@ -443,7 +683,32 @@ export class CallManager {
       void this._handleNegotiate(entry, content);
     } else if (type === "m.call.candidates") {
       void this._handleCandidates(entry, content);
+    } else if (type === "m.call.screenshare") {
+      this._handleScreenshareSignal(entry, content);
     }
+  }
+
+  /** A peer started/stopped sharing their screen. */
+  private _handleScreenshareSignal(entry: PeerEntry, content: Record<string, unknown>): void {
+    const active = content.active === true;
+    if (active) {
+      entry.screenActive = true;
+      /* tolerate the media having raced ahead of the signal: a second
+         video track already sitting in the camera stream is the screen */
+      const cameraVideos = entry.stream?.getVideoTracks() ?? [];
+      if (cameraVideos.length > 1) {
+        const maybeScreen = cameraVideos[cameraVideos.length - 1]!;
+        entry.stream?.removeTrack(maybeScreen);
+        entry.screenStream.addTrack(maybeScreen);
+      }
+    } else {
+      entry.screenActive = false;
+      for (const track of entry.screenStream.getTracks()) {
+        track.stop(); /* remote track — stopping locally frees the tile */
+      }
+      entry.screenStream = new MediaStream();
+    }
+    this._emit();
   }
 
   private async _handleNegotiate(
@@ -460,6 +725,16 @@ export class CallManager {
 
     entry.ignoreOffer = !entry.polite && offerCollision;
     if (entry.ignoreOffer) return;
+
+    /* glare: the polite peer was mid-offer when the peer's offer arrived —
+       roll back ours and accept theirs (canonical perfect negotiation) */
+    if (description.type === "offer" && entry.polite && offerCollision) {
+      try {
+        await entry.pc.setLocalDescription(); /* implicit rollback */
+      } catch (err) {
+        console.warn("[call] rollback failed:", err);
+      }
+    }
 
     try {
       if (description.type === "offer" && entry.polite) {
@@ -531,6 +806,10 @@ export class CallManager {
         deviceId: entry.deviceId,
         name: this._nameFor(entry.userId),
         stream: entry.stream,
+        screenStream: entry.screenActive && entry.screenStream.getTracks().length > 0
+          ? entry.screenStream
+          : null,
+        sharing: entry.screenActive,
         connectionState: entry.connectionState,
       });
     }
@@ -540,6 +819,7 @@ export class CallManager {
       participants,
       notice: this._notice,
       localMuted: this._localMuted,
+      localSharing: this._sharing,
       localKey: this._roomId ? this.localKey : null,
     });
   }
