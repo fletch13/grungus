@@ -163,6 +163,14 @@ export class LoginView extends HTMLElement {
     if (providers.length > 0 && this._hasPasswordFlow()) {
       form.appendChild(el("div", { class: "login-divider", text: "or" }));
     }
+    if (providers.length > 0) {
+      form.appendChild(
+        el("div", {
+          class: "hint login-sso-hint",
+          text: "SSO opens your system browser — passkeys offered by your provider work there.",
+        })
+      );
+    }
 
     const userInput = el("input", {
       type: "text",

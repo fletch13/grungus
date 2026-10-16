@@ -11,6 +11,8 @@ import { mxidLocalpart } from "../services/matrix-client.ts";
 export class VerifyView extends HTMLElement {
   private _states: SasUiState[] = [];
   private _manager: VerificationManager | null = null;
+  private _sessionMode = false;
+  private _sessionRequested = false;
 
   update(states: SasUiState[], manager: VerificationManager): void {
     this._states = states;
@@ -18,10 +20,22 @@ export class VerifyView extends HTMLElement {
     this._render();
   }
 
+  /** Show the "verify this session" entry card (footer 🛡). */
+  setSessionMode(on: boolean): void {
+    this._sessionMode = on;
+    this._render();
+  }
+
+  markSessionRequested(): void {
+    this._sessionRequested = true;
+    this._render();
+  }
+
   private _render(): void {
     const manager = this._manager;
     this.textContent = "";
-    if (!manager || this._states.length === 0) return;
+    const hasCards = this._states.length > 0 || (this._sessionMode && !this._sessionRequested);
+    if (!manager || !hasCards) return;
 
     this.classList.add("call-overlay");
 
@@ -35,6 +49,28 @@ export class VerifyView extends HTMLElement {
     );
     this.appendChild(header);
 
+    /* session-verification entry card (opened from the sidebar) */
+    if (this._sessionMode && !this._sessionRequested) {
+      const card = el("div", { class: "verify-card" });
+      card.appendChild(el("div", { class: "verify-peer", text: "This device" }));
+      card.appendChild(
+        el("div", {
+          class: "verify-phase",
+          text: "Ask your other devices to verify this session (emoji comparison).",
+        })
+      );
+      const buttons = el("div", { class: "call-footer" });
+      const go = el("button", { class: "call-btn", text: "Verify my other devices" });
+      go.addEventListener("click", () => {
+        this.dispatchEvent(
+          new CustomEvent("grungus:request-session-verify", { bubbles: true })
+        );
+      });
+      buttons.appendChild(go);
+      card.appendChild(buttons);
+      this.appendChild(card);
+    }
+
     for (const state of this._states) {
       const card = el("div", { class: "verify-card" });
       const peer = `${mxidLocalpart(state.peerUserId)} (${state.peerDeviceId.slice(0, 10)}…)`;
@@ -44,19 +80,60 @@ export class VerifyView extends HTMLElement {
         el("div", { class: "verify-phase", text: this._phaseText(state.phase, state.error) })
       );
 
+      /* an incoming request waits for THIS user to accept — never
+         auto-accept silently; the human decides */
+      if (state.phase === "requested" && !state.initiatedByMe) {
+        card.appendChild(
+          el("div", {
+            class: "verify-phase",
+            text: "wants to be verified",
+          })
+        );
+        const buttons = el("div", { class: "call-footer" });
+        const accept = el("button", { class: "call-btn", text: "Verify" });
+        accept.addEventListener("click", () => {
+          this.dispatchEvent(
+            new CustomEvent("grungus:accept-verify", {
+              detail: { transactionId: state.transactionId },
+              bubbles: true,
+            })
+          );
+        });
+        const ignore = el("button", { class: "call-btn danger", text: "Ignore" });
+        ignore.addEventListener("click", () => {
+          this.dispatchEvent(
+            new CustomEvent("grungus:decline-verify", {
+              detail: { transactionId: state.transactionId },
+              bubbles: true,
+            })
+          );
+        });
+        buttons.appendChild(accept);
+        buttons.appendChild(ignore);
+        card.appendChild(buttons);
+        this.appendChild(card);
+        continue;
+      }
+
       if (state.emoji.length > 0 && state.phase === "show-emoji") {
         card.appendChild(el("div", { class: "verify-emoji", text: state.emoji.join(" ") }));
         const buttons = el("div", { class: "call-footer" });
         const match = el("button", { class: "call-btn", text: "They match" });
         match.addEventListener("click", () => {
-          void manager.transactions
-            .find((txn) => txn.transactionId === state.transactionId)
-            ?.confirmEmojiMatch();
+          this.dispatchEvent(
+            new CustomEvent("grungus:confirm-sas", {
+              detail: { transactionId: state.transactionId },
+              bubbles: true,
+            })
+          );
         });
         const reject = el("button", { class: "call-btn danger", text: "They don't match" });
         reject.addEventListener("click", () => {
-          card.replaceChildren(
-            el("div", { class: "verify-phase", text: "Rejected — devices not verified." })
+          this.dispatchEvent(
+            new CustomEvent("grungus:decline-verify", {
+              detail: { transactionId: state.transactionId },
+              bubbles: true,
+            })
           );
         });
         buttons.appendChild(match);

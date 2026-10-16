@@ -303,6 +303,17 @@ export class RoomList extends HTMLElement {
     });
     footer.appendChild(backup);
 
+    const verifySession = el("button", {
+      class: "backup-btn",
+      title: "Verify this session against your other devices",
+      "aria-label": "Verify session",
+      text: "🛡",
+    });
+    verifySession.addEventListener("click", () => {
+      this.dispatchEvent(new CustomEvent("grungus:verify-session", { bubbles: true }));
+    });
+    footer.appendChild(verifySession);
+
     return footer;
   }
 

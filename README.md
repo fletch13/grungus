@@ -18,11 +18,14 @@ for an open protocol.
   exactly what that server supports: password, access token, and SSO.
 - **SSO / redirect login (m.login.sso)** — for homeservers that federate
   an IdP (e.g. a university Keycloak), each advertised identity provider
-  becomes a "Continue with …" button. In Electron an auth window opens
-  and the loginToken callback is intercepted before any network
-  connection; in the browser the redirect returns to the app, which
-  completes the login via m.login.token and strips the single-use token
-  from the URL.
+  becomes a "Continue with …" button. The redirect dance runs in the
+  HOST SYSTEM BROWSER (passkeys/WebAuthn prompts are OS-native there,
+  and IdPs increasingly block embedded webviews): a temporary loopback
+  HTTP listener on 127.0.0.1 captures the loginToken callback
+  (RFC 8252 style) and completes the login via m.login.token. An
+  embedded auth window with redirect interception is the fallback; in
+  the browser dev build the whole tab redirects and boot() completes
+  the exchange, stripping the single-use token from the URL.
 - **End-to-end encryption (Olm/Megolm)** — messages in encrypted rooms
   are megolm-encrypted via libolm (WASM); room keys are shared over olm
   to-device messages to every member device, including your own.
@@ -75,11 +78,18 @@ for an open protocol.
 - **Typing notifications** — the composer emits `m.typing` while you
   type (server-rate-limited); other members' typing state shows above
   the composer.
-- **Device verification (SAS)** — the 🛡 button in encrypted rooms
-  starts emoji-based SAS verification (m.key.verification, real libolm
+- **Device verification (SAS)** — the 🛡 button in encrypted rooms starts
+  emoji-based SAS verification (m.key.verification, real libolm
   SAS + HKDF MACs) with every other member's unverified device; both
   sides see the same emoji, confirming marks the device's Ed25519 key
-  trusted.
+  trusted. Incoming requests always PROMPT (Verify / Ignore) — nothing
+  is ever auto-accepted.
+- **Session verification** — the 🛡 button in the sidebar asks every
+  other device of YOUR OWN user to verify this session (the "new
+  login" flow): your existing device shows the request, the handshake
+  runs, and both devices mark each other's Ed25519 keys trusted. The
+  transaction completes only when BOTH sides have exchanged MACs —
+  receiving the peer's MAC early never skips sending your own.
 - **Unread badges** — per-room counters, cleared when you open the room.
 - **Room creation** — inline "new room" form in the sidebar.
 - **Strict TypeScript throughout** — typed Matrix event/sync shapes and

@@ -37,6 +37,10 @@ export interface GrungusPlatform {
     url: string,
     callbackPrefix: string
   ): Promise<{ loginToken: string | null }>;
+  /** Present in Electron — system-browser SSO (passkeys work in the IdP). */
+  ssoLoopbackPrepare?(): Promise<{ redirectUrl: string }>;
+  ssoSystemBrowser?(url: string): Promise<{ loginToken: string | null }>;
+  ssoLoopbackAbort?(): Promise<boolean>;
 }
 
 /* Exposed by the preload bridge when running inside Electron. */
@@ -130,18 +134,65 @@ async function handleServerChosen(
 }
 
 /**
- * SSO (e.g. Keycloak): open the redirect URL and capture the loginToken
- * callback. In Electron the main process opens an auth window and
- * intercepts the callback; in browser dev mode the whole tab goes to the
- * IdP and returns with ?loginToken=… which boot() completes.
+ * SSO (e.g. Keycloak): the redirect dance runs wherever passkeys and
+ * WebAuthn prompts work best — the HOST SYSTEM BROWSER (loopback HTTP
+ * captures the loginToken, RFC 8252 style). The embedded auth window is
+ * the fallback; browser dev mode uses a full-page redirect that boot()
+ * completes on return.
  */
 async function handleSsoLogin(idpId: string, view: LoginView): Promise<void> {
   const baseUrl = loginBaseUrl;
   if (!baseUrl) return;
   const platform = window.grungusPlatform;
 
+  if (platform?.ssoLoopbackPrepare && platform.ssoSystemBrowser) {
+    /* Electron + system browser (preferred — OS-native passkeys) */
+    view.setBusy(true);
+    view.setStatus("Opening your system browser…", false);
+    try {
+      const { redirectUrl } = await platform.ssoLoopbackPrepare();
+      const ssoUrl = new MatrixClient({ baseUrl }).ssoLoginUrl(idpId, redirectUrl);
+      const result = await platform.ssoSystemBrowser(ssoUrl);
+      if (!result.loginToken) {
+        await platform.ssoLoopbackAbort?.();
+        throw new Error("Sign-in did not complete in the browser window");
+      }
+      const client = new MatrixClient({ baseUrl });
+      await client.loginWithToken(result.loginToken);
+      await finishLogin(baseUrl, client);
+    } catch (err) {
+      view.setBusy(false);
+      /* fall back to the embedded auth window */
+      if (platform.ssoLogin) {
+        view.setStatus("Retrying inside Grungus…", false);
+        try {
+          const callbackPrefix = "http://127.0.0.1/grungus-sso";
+          const ssoUrl = new MatrixClient({ baseUrl }).ssoLoginUrl(idpId, callbackPrefix);
+          const result = await platform.ssoLogin(ssoUrl, callbackPrefix);
+          if (!result.loginToken) throw new Error("SSO window closed before sign-in finished");
+          const client = new MatrixClient({ baseUrl });
+          await client.loginWithToken(result.loginToken);
+          await finishLogin(baseUrl, client);
+          return;
+        } catch (err2) {
+          view.setBusy(false);
+          view.setStatus(
+            `SSO login failed: ${err2 instanceof Error ? err2.message : "unknown error"}`,
+            true
+          );
+          return;
+        }
+      }
+      view.setStatus(
+        `SSO login failed: ${err instanceof Error ? err.message : "unknown error"}`,
+        true
+      );
+    }
+    return;
+  }
+
   if (platform?.ssoLogin) {
-    /* Electron: auth window with redirect interception */
+    /* Electron fallback: embedded auth window with redirect interception */
     view.setBusy(true);
     view.setStatus("Complete the sign-in in the opened window…", false);
     try {
@@ -411,11 +462,8 @@ function startShell(): void {
     cryptoLayer.addPayloadListener((sender, type, content) => {
       verification?.handlePayload(sender, type, content);
     });
-    /* v1: incoming requests are accepted automatically — the emoji
-       comparison remains the human checkpoint */
-    verification.onIncoming = (txn) => {
-      void txn.sendStart();
-    };
+    /* incoming verification requests PROMPT — never auto-accept; the
+       human decides whether to verify the other device */
     const refreshVerify = (): void => {
       if (!verification) return;
       verifyView.update(
@@ -423,11 +471,40 @@ function startShell(): void {
         verification
       );
     };
+    verification.onIncoming = () => {
+      refreshVerify();
+    };
     verification.onUi = refreshVerify;
     verification.onVerified = () => {
       refreshVerify();
       setTimeout(refreshVerify, 1500); /* let the verified card show */
     };
+    /* the user accepted an incoming request (or re-verifies a card) */
+    verifyView.addEventListener("grungus:accept-verify", (event) => {
+      const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
+      const txn = verification?.transactions.find((t) => t.transactionId === id);
+      if (txn) void txn.sendStart();
+    });
+    verifyView.addEventListener("grungus:decline-verify", (event) => {
+      const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
+      void verification?.cancel(id);
+      refreshVerify();
+    });
+    verifyView.addEventListener("grungus:confirm-sas", (event) => {
+      const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
+      const txn = verification?.transactions.find((t) => t.transactionId === id);
+      if (txn) void txn.confirmEmojiMatch();
+    });
+    /* session verification: this device asks its own other devices */
+    verifyView.addEventListener("grungus:request-session-verify", () => {
+      verifyView.markSessionRequested();
+      void verification?.startSessionVerification().then(() => refreshVerify());
+    });
+    roomList.addEventListener("grungus:verify-session", () => {
+      if (!verification) return;
+      verifyView.setSessionMode(true);
+      refreshVerify();
+    });
   }
 
   /* ---- typing + media ---- */

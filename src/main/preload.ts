@@ -25,4 +25,12 @@ contextBridge.exposeInMainWorld("grungusPlatform", {
   /** SSO auth window: resolves with the loginToken from the redirect. */
   ssoLogin: (url: string, callbackPrefix: string): Promise<{ loginToken: string | null }> =>
     ipcRenderer.invoke("sso:login", url, callbackPrefix),
+  /** System-browser SSO: start the loopback return channel. */
+  ssoLoopbackPrepare: (): Promise<{ redirectUrl: string }> =>
+    ipcRenderer.invoke("sso:loopback-prepare"),
+  /** System-browser SSO: open the URL externally and await the callback. */
+  ssoSystemBrowser: (url: string): Promise<{ loginToken: string | null }> =>
+    ipcRenderer.invoke("sso:system-browser", url),
+  /** Abort a pending system-browser SSO flow. */
+  ssoLoopbackAbort: (): Promise<boolean> => ipcRenderer.invoke("sso:loopback-abort"),
 });

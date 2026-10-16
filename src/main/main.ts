@@ -10,9 +10,10 @@
  * esbuild bundles this to dist/main.js (CJS); "main" in package.json
  * points there. dist/ also holds preload.js, index.html, renderer.js.
  */
-import { app, BrowserWindow, ipcMain, safeStorage } from "electron";
+import { app, BrowserWindow, ipcMain, safeStorage, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
+import { startSsoLoopback, type SsoLoopback } from "./sso-loopback.ts";
 
 const SMOKE = process.argv.includes("--smoke");
 const DEBUG = process.argv.includes("--debug");
@@ -120,7 +121,43 @@ ipcMain.handle("crypto:put", (_event, key: string, value: string): boolean => {
   return true;
 });
 
-/* ---- SSO (Electron): auth window with callback interception ---- */
+/* ---- SSO (Electron): system browser with a loopback capture ---- */
+
+let activeSsoLoopback: SsoLoopback | null = null;
+
+function abortSsoLoopback(): void {
+  activeSsoLoopback?.close();
+  activeSsoLoopback = null;
+}
+
+/** Start the loopback listener; the renderer embeds its URL as redirectUrl. */
+ipcMain.handle("sso:loopback-prepare", async (): Promise<{ redirectUrl: string }> => {
+  abortSsoLoopback();
+  const loopback = await startSsoLoopback();
+  activeSsoLoopback = loopback;
+  return { redirectUrl: loopback.redirectUrl };
+});
+
+/** Open the SSO URL in the HOST SYSTEM BROWSER (passkeys/WebAuthn are
+ *  OS-native there) and wait for the loopback callback. */
+ipcMain.handle(
+  "sso:system-browser",
+  async (_event, url: string): Promise<{ loginToken: string | null }> => {
+    const loopback = activeSsoLoopback;
+    if (!loopback) return { loginToken: null };
+    await shell.openExternal(url);
+    const loginToken = await loopback.waitForToken(300_000);
+    activeSsoLoopback = null;
+    return { loginToken };
+  }
+);
+
+ipcMain.handle("sso:loopback-abort", (): boolean => {
+  abortSsoLoopback();
+  return true;
+});
+
+/* ---- SSO (Electron): embedded auth window fallback ---- */
 
 ipcMain.handle(
   "sso:login",

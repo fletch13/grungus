@@ -62,6 +62,8 @@ export type SasPhase =
 
 export interface SasUiState {
   transactionId: string;
+  /** true when THIS device initiated the transaction. */
+  initiatedByMe: boolean;
   peerUserId: string;
   peerDeviceId: string;
   phase: SasPhase;
@@ -103,6 +105,9 @@ export class SasTransaction {
   private _olmSas: OlmSasApi | null = null;
   private _gotTheirKey = false;
   private _macSent = false;
+  /** their MAC arrived and verified — completes once ours is sent too */
+  private _theirMacVerified = false;
+  private _theirEd25519 = "";
 
   onUi: ((state: SasUiState) => void) | null = null;
   /** Called when this transaction verifies the peer device. */
@@ -146,6 +151,7 @@ export class SasTransaction {
   uiState(): SasUiState {
     return {
       transactionId: this.transactionId,
+      initiatedByMe: this.initiatedByMe,
       peerUserId: this.peerUserId,
       peerDeviceId: this.peerDeviceId,
       phase: this.phase,
@@ -164,12 +170,25 @@ export class SasTransaction {
   async sendRequest(): Promise<void> {
     this.phase = "requested";
     this._emit();
-    await this.send("m.verification.request", {
+    await this.send("m.key.verification.request", {
       from_device: this.myDeviceId,
       methods: [SAS_METHOD],
       timestamp: Date.now(),
       to: this.peerUserId,
     });
+  }
+
+  /** Either side: decline before the handshake starts (m.key.verification.cancel). */
+  async decline(): Promise<void> {
+    if (this.phase !== "requested") return;
+    await this.send("m.key.verification.cancel", {
+      code: "m.user",
+      reason: "declined",
+    });
+    this.phase = "cancelled";
+    this._emit();
+    this._olmSas?.free();
+    this._olmSas = null;
   }
 
   /** Initiator: respond to the responder's m.key.verification.start. */
@@ -266,8 +285,9 @@ export class SasTransaction {
   /* ------------------------------ MAC phase ---------------------------- */
 
   /**
-   * Called when the user confirms the emoji match (headless tests call it
-   * directly). Sends our MAC; on receiving theirs both devices verify.
+   * Called when the user confirms the emoji match. Sends our MAC; the
+   * transaction only completes once BOTH sides have exchanged MACs
+   * (receiving theirs first does not excuse us from sending ours).
    */
   async confirmEmojiMatch(): Promise<void> {
     if (this.phase !== "show-emoji" && this.phase !== "mac-sent") return;
@@ -288,6 +308,9 @@ export class SasTransaction {
       await this.send("m.key.verification.mac", { mac, keys });
       this.phase = "mac-sent";
       this._emit();
+    }
+    if (this._theirMacVerified) {
+      this._complete();
     }
   }
 
@@ -336,12 +359,27 @@ export class SasTransaction {
       return;
     }
 
-    /* success: mark their device trusted */
+    /* success: mark their device trusted; the transaction completes only
+       when BOTH sides have exchanged MACs — if we have not sent ours yet
+       (the user has not confirmed the emoji), stay open so we still can */
     await this.crypto.markDeviceVerified(this.peerUserId, this.peerDeviceId, theirEd25519);
     await this.send("m.key.verification.done", {});
+    this._theirMacVerified = true;
+    this._theirEd25519 = theirEd25519;
+    if (this._macSent) {
+      this._complete();
+    } else {
+      /* their MAC arrived before our user confirmed — keep the emoji up */
+      this._emit();
+    }
+  }
+
+  /** Both MACs exchanged: the transaction is complete. */
+  private _complete(): void {
+    if (this.phase === "verified") return;
     this.phase = "verified";
     this._emit();
-    this.onVerified?.(this.peerUserId, this.peerDeviceId, theirEd25519);
+    this.onVerified?.(this.peerUserId, this.peerDeviceId, this._theirEd25519);
     this._olmSas?.free();
     this._olmSas = null;
   }
@@ -385,6 +423,36 @@ export class VerificationManager {
     return txn;
   }
 
+  /**
+   * Session verification: ask every OTHER device of the SAME user to
+   * verify this one (the "new login" flow). Returns the started
+   * transactions (one per device; offline devices simply never answer).
+   */
+  async startSessionVerification(): Promise<SasTransaction[]> {
+    const ownUserId = this._crypto.host.userId ?? "";
+    if (!ownUserId) return [];
+    const devices = await this._crypto.getDevicesOf(ownUserId);
+    const txns: SasTransaction[] = [];
+    for (const device of devices) {
+      if (device.deviceId === this._crypto.deviceId) continue;
+      txns.push(this.start(ownUserId, device.deviceId));
+    }
+    return txns;
+  }
+
+  /** Decline/cancel a pending transaction by id. */
+  async cancel(transactionId: string): Promise<void> {
+    const txn = this._transactions.get(transactionId);
+    if (!txn) return;
+    this._transactions.delete(transactionId);
+    await txn.decline();
+  }
+
+  /** Remove a transaction from the UI (e.g. an ignored request). */
+  discard(transactionId: string): void {
+    this._transactions.delete(transactionId);
+  }
+
   /** Payload dispatch — called by E2eeCrypto for non-room-key payloads. */
   handlePayload(
     sender: string,
@@ -402,8 +470,8 @@ export class VerificationManager {
       : null;
     if (!transactionId) return true;
 
-    /* incoming request as the responder */
-    if (type === "m.verification.request") {
+    /* incoming request as the responder — spec name, legacy alias kept */
+    if (type === "m.key.verification.request" || type === "m.verification.request") {
       if (!fromDevice || this._transactions.has(transactionId)) return true;
       const txn = this._makeTxn(transactionId, false, sender, fromDevice);
       this.onIncoming?.(txn);
