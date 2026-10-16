@@ -14,6 +14,7 @@
  */
 
 import type { E2eeCrypto } from "./e2ee.ts";
+import { QrTransaction, type QrUiState } from "./qr-verify.ts";
 
 /** The spec's 64 SAS emoji, in index order. */
 export const SAS_EMOJI: readonly [string, string][] = [
@@ -172,7 +173,12 @@ export class SasTransaction {
     this._emit();
     await this.send("m.key.verification.request", {
       from_device: this.myDeviceId,
-      methods: [SAS_METHOD],
+      methods: [
+        SAS_METHOD,
+        "m.qr_code.show.v1",
+        "m.qr_code.scan.v1",
+        "m.reciprocate.v1",
+      ],
       timestamp: Date.now(),
       to: this.peerUserId,
     });
@@ -395,11 +401,16 @@ export class SasTransaction {
 
 /**
  * Routes m.verification / m.key.verification payloads to transactions and
- * exposes UI callbacks. One per client, wired by app.ts.
+ * exposes UI callbacks. One per client, wired by app.ts. Holds SAS
+ * transactions (emoji comparison) and QR transactions (show/scan a
+ * code) — a request starts as SAS and can switch to QR while it is
+ * still in the "requested" phase; both share the transaction id.
  */
 export class VerificationManager {
   private readonly _transactions = new Map<string, SasTransaction>();
+  private readonly _qrTransactions = new Map<string, QrTransaction>();
   onUi: ((state: SasUiState) => void) | null = null;
+  onQrUi: ((state: QrUiState) => void) | null = null;
   onIncoming: ((txn: SasTransaction) => void) | null = null;
   onVerified:
     | ((peerUserId: string, peerDeviceId: string, peerEd25519: string) => void)
@@ -413,6 +424,40 @@ export class VerificationManager {
 
   get transactions(): SasTransaction[] {
     return [...this._transactions.values()];
+  }
+
+  get qrTransactions(): QrTransaction[] {
+    return [...this._qrTransactions.values()];
+  }
+
+  /**
+   * Get (or create) the QR transaction sharing this request's id. The
+   * QR transaction carries the same peer and initiatedByMe as the SAS
+   * transaction for the id, so both sides reference one request.
+   */
+  asQr(transactionId: string): QrTransaction | null {
+    const existing = this._qrTransactions.get(transactionId);
+    if (existing) return existing;
+    const base = this._transactions.get(transactionId);
+    if (!base) return null;
+    const txn = new QrTransaction({
+      transactionId,
+      initiatedByMe: base.initiatedByMe,
+      myUserId: this._crypto.host.userId ?? "",
+      myDeviceId: this._crypto.deviceId,
+      peerUserId: base.peerUserId,
+      peerDeviceId: base.peerDeviceId,
+      crypto: this._crypto,
+    });
+    txn.onUi = (state) => this.onQrUi?.(state);
+    txn.onVerified = (userId, deviceId, ed25519) => {
+      /* the request is finished — drop both the QR and SAS entries */
+      this._qrTransactions.delete(transactionId);
+      this._transactions.delete(transactionId);
+      this.onVerified?.(userId, deviceId, ed25519);
+    };
+    this._qrTransactions.set(transactionId, txn);
+    return txn;
   }
 
   /** Start a verification with a specific device of another user. */
@@ -457,7 +502,8 @@ export class VerificationManager {
   handlePayload(
     sender: string,
     type: string,
-    content: Record<string, unknown>
+    content: Record<string, unknown>,
+    senderKey?: string
   ): boolean {
     if (!type.startsWith("m.verification.") && !type.startsWith("m.key.verification.")) {
       return false;
@@ -469,6 +515,26 @@ export class VerificationManager {
       ? content.from_device
       : null;
     if (!transactionId) return true;
+
+    /* QR reciprocate: the scanner's m.key.verification.start with
+       method m.reciprocate.v1 goes to the shower's QR transaction */
+    if (type === "m.key.verification.start" && content.method === "m.reciprocate.v1") {
+      const qr = this._qrTransactions.get(transactionId) ?? this.asQr(transactionId);
+      if (qr) void qr.handleReciprocateStart(content);
+      return true;
+    }
+
+    /* done events complete QR transactions (SAS completes via MACs) */
+    if (type === "m.key.verification.done" || type === "m.verification.done") {
+      const qr = this._qrTransactions.get(transactionId);
+      if (qr) {
+        void qr.handleDone(senderKey ?? null);
+        return true;
+      }
+      /* no QR transaction for this id — an SAS done; SAS completes via
+         MAC exchange, so nothing to do */
+      return true;
+    }
 
     /* incoming request as the responder — spec name, legacy alias kept */
     if (type === "m.key.verification.request" || type === "m.verification.request") {

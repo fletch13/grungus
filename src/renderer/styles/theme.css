@@ -1264,6 +1264,30 @@ message-item:hover .msg-toolbar {
   align-items: center;
 }
 
+.verify-qr-canvas {
+  width: 240px;
+  height: 240px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  image-rendering: pixelated;
+}
+
+.verify-scanner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+}
+
+.verify-scan-video {
+  width: 240px;
+  height: 180px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #000;
+  object-fit: cover;
+}
+
 .verify-peer {
   color: var(--text-bright);
   font-weight: 700;

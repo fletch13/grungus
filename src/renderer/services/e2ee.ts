@@ -446,12 +446,12 @@ export class E2eeCrypto {
    * addPayloadListener; returns an unsubscribe function.
    */
   private readonly _payloadListeners = new Set<
-    (sender: string, type: string, content: Record<string, unknown>) => void
+    (sender: string, type: string, content: Record<string, unknown>, senderKey?: string) => void
   >();
 
   addPayloadListener(
-    cb: (sender: string, type: string, content: Record<string, unknown>) => void
-  ): () => void {
+    cb: (sender: string, type: string, content: Record<string, unknown>, senderKey?: string) => void
+  ): () => boolean {
     this._payloadListeners.add(cb);
     return () => this._payloadListeners.delete(cb);
   }
@@ -466,6 +466,11 @@ export class E2eeCrypto {
     return this._ed25519;
   }
 
+  /** This device's Curve25519 identity key (unpadded base64). */
+  get curve25519Key(): string {
+    return this._curve25519;
+  }
+
   createSas(): OlmSasApi {
     return new this._olm!.SAS();
   }
@@ -477,8 +482,14 @@ export class E2eeCrypto {
 
   /** The Ed25519 key the server has published for a device. */
   async getDeviceEd25519(userId: string, deviceId: string): Promise<string | null> {
-    const device = await this.findDevice(userId, deviceId);
-    return device?.ed25519 ?? null;
+    const devices = await this.getUserDevices(userId);
+    return devices.find((d) => d.deviceId === deviceId)?.ed25519 ?? null;
+  }
+
+  /** A device's Curve25519 identity key from the server directory. */
+  async getDeviceCurve25519(userId: string, deviceId: string): Promise<string | null> {
+    const devices = await this.getUserDevices(userId);
+    return devices.find((d) => d.deviceId === deviceId)?.curve25519 ?? null;
   }
 
   /** Record a SAS-verified device key (trust replaces TOFU for the pair). */
@@ -1194,7 +1205,7 @@ export class E2eeCrypto {
       /* other olm-protected payloads (call signaling, SAS verification) */
       for (const listener of [...this._payloadListeners]) {
         try {
-          listener(event.sender, payload.type, payload.content);
+          listener(event.sender, payload.type, payload.content, senderKey);
         } catch (err) {
           console.error("[e2ee] payload listener failed:", err);
         }

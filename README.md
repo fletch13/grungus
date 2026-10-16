@@ -114,6 +114,20 @@ for an open protocol.
   place with an "(edited)" marker instead of appending a new entry.
   Redactions remove their targets from the timeline (m.room.redaction,
   power-levels enforced server-side).
+- **QR code verification (MSC3906)** — devices can verify each other by
+  showing/scanning a QR instead of comparing emoji. The code carries
+  the MSC3906 v2 binary payload ("MATRIX" + version + mode +
+  transaction id + the shower's Ed25519/Curve25519 device keys + an
+  11-byte shared secret). The scanner echoes the secret via
+  m.reciprocate.v1 over the olm channel (physical-presence proof),
+  MACs its own device key with the secret, and requires the shower's
+  m.key.verification.done to arrive olm-authenticated by the SAME
+  curve25519 the QR carried (substitution defense). Both sides land in
+  the same trust store SAS uses. Scanning works via camera preview or
+  image upload (headless hosts). Mode 0x03 is a Grungus extension
+  (device-key verification) — Element's cross-signing modes 0x00-0x02
+  wait for cross-signing support; Element interop for QR is not
+  claimed yet.
 - **Device verification (SAS)** — the 🛡 button in encrypted rooms starts
   emoji-based SAS verification (m.key.verification, real libolm
   SAS + HKDF MACs) with every other member's unverified device; both

@@ -522,15 +522,18 @@ function startShell(): void {
   const cryptoLayer = active.crypto;
   if (cryptoLayer) {
     verification = new VerificationManager(cryptoLayer);
-    cryptoLayer.addPayloadListener((sender, type, content) => {
-      verification?.handlePayload(sender, type, content);
+    cryptoLayer.addPayloadListener((sender, type, content, senderKey) => {
+      verification?.handlePayload(sender, type, content, senderKey);
     });
     /* incoming verification requests PROMPT — never auto-accept; the
        human decides whether to verify the other device */
     const refreshVerify = (): void => {
       if (!verification) return;
       verifyView.update(
-        verification.transactions.map((txn) => txn.uiState()),
+        [
+          ...verification.transactions.map((txn) => txn.uiState()),
+          ...verification.qrTransactions.map((txn) => txn.uiState()),
+        ],
         verification
       );
     };
@@ -538,6 +541,7 @@ function startShell(): void {
       refreshVerify();
     };
     verification.onUi = refreshVerify;
+    verification.onQrUi = refreshVerify;
     verification.onVerified = () => {
       refreshVerify();
       setTimeout(refreshVerify, 1500); /* let the verified card show */
@@ -551,12 +555,38 @@ function startShell(): void {
     verifyView.addEventListener("grungus:decline-verify", (event) => {
       const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
       void verification?.cancel(id);
+      verification?.asQr(id)?.decline();
       refreshVerify();
     });
     verifyView.addEventListener("grungus:confirm-sas", (event) => {
       const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
       const txn = verification?.transactions.find((t) => t.transactionId === id);
       if (txn) void txn.confirmEmojiMatch();
+    });
+    /* QR: shower renders its code, scanner opens camera/upload */
+    verifyView.addEventListener("grungus:show-qr", (event) => {
+      const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
+      verification?.asQr(id)?.showQrCode();
+      refreshVerify();
+    });
+    verifyView.addEventListener("grungus:scan-qr", (event) => {
+      const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
+      verification?.asQr(id)?.startScanning();
+      refreshVerify();
+    });
+    verifyView.addEventListener("grungus:qr-scanned", (event) => {
+      const detail = (event as CustomEvent<{ transactionId: string; bytes: Uint8Array }>).detail;
+      void verification?.asQr(detail.transactionId)?.scanQrCode(detail.bytes);
+      refreshVerify();
+    });
+    verifyView.addEventListener("grungus:qr-scan-error", (event) => {
+      const detail = (event as CustomEvent<{ error: string }>).detail;
+      console.warn("[grungus] qr scan:", detail.error);
+    });
+    verifyView.addEventListener("grungus:confirm-scan", (event) => {
+      const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
+      void verification?.asQr(id)?.confirmScanned();
+      refreshVerify();
     });
     /* session verification: this device asks its own other devices */
     verifyView.addEventListener("grungus:request-session-verify", () => {
