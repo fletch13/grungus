@@ -114,6 +114,23 @@ for an open protocol.
   place with an "(edited)" marker instead of appending a new entry.
   Redactions remove their targets from the timeline (m.room.redaction,
   power-levels enforced server-side).
+- **Cross-signing** — the Matrix trust hierarchy: a master key (MSK)
+  signs a self-signing key (SSK) and a user-signing key (USK); the SSK
+  signs your own device keys. "Set up cross-signing" in the 🛡 overlay
+  creates and publishes the keys (UIA password prompt — used once,
+  never stored). After that, verify a new device ONCE and every device
+  that trusts your master key trusts it too: when a verification of
+  one of your own devices completes, this device signs its key with
+  the SSK and uploads the signature; other devices validate the chain
+  (locally-verified device → MSK → SSK → signed device) before
+  trusting. Signatures use the spec's canonical JSON + Ed25519
+  (accepted by conduwuit's server-side checks). Private-key
+  distribution to other own devices (SSSS secret storage) is a
+  follow-up — the bootstrapping device holds the signing keys; other
+  devices verify chains but cannot sign until SSSS ships. Cross-user
+  USK signing exists; fetching OTHER users' MSKs depends on the server
+  distributing them via /keys/query (Synapse does; this conduwuit
+  build does not).
 - **QR code verification (MSC3906)** — devices can verify each other by
   showing/scanning a QR instead of comparing emoji. The code carries
   the MSC3906 v2 binary payload ("MATRIX" + version + mode +

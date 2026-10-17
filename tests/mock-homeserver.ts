@@ -66,6 +66,12 @@ export class MockHomeserver {
   /** token -> { username, deviceId } — tokens are device-bound like real servers. */
   readonly tokens = new Map<string, { username: string; deviceId: string }>();
   readonly rooms = new Map<string, MockRoom>();
+  /** username -> account data type -> content (cross-signing keys etc.) */
+  readonly accountData = new Map<string, Map<string, Record<string, unknown>>>();
+  /** username -> cross-signing key objects by type (device_signing/upload). */
+  readonly crossSigning = new Map<string, Record<string, Record<string, unknown>>>();
+  /** username -> seq of the last account-data change (wakes long-polls) */
+  readonly accountDataSeq = new Map<string, number>();
   /** media: id -> { bytes, mime } */
   readonly media = new Map<string, { bytes: Buffer; mime: string }>();
   /** username -> deviceId -> device (keys + one-time keys). */
@@ -643,6 +649,122 @@ export class MockHomeserver {
       return;
     }
 
+    /* cross-signing: publish key objects (POST /keys/device_signing/upload).
+       The mock accepts without UIA — the live servers' UIA dance is
+       exercised against conduwuit in e2e. */
+    if (req.method === "POST" && route === "keys/device_signing/upload") {
+      const existing = this.crossSigning.get(user.username) ?? {};
+      for (const type of ["master", "self_signing", "user_signing"]) {
+        if (body[type] && typeof body[type] === "object") {
+          existing[type] = body[type] as Record<string, unknown>;
+        }
+      }
+      this.crossSigning.set(user.username, existing);
+      this._send(res, 200, {});
+      return;
+    }
+
+    /* cross-signing: publish signatures (POST /keys/signatures/upload).
+       Merges into the stored device entries — the shape conduwuit
+       serves back in /keys/query. */
+    if (req.method === "POST" && route === "keys/signatures/upload") {
+      const failures: Record<string, unknown> = {};
+      for (const [targetUserId, entries] of Object.entries(
+        body as Record<string, Record<string, Record<string, unknown>>>
+      )) {
+        const username = this._usernameForUserId(targetUserId);
+        const userDevices = username ? this.devices.get(username) : undefined;
+        if (!userDevices) {
+          failures[targetUserId] = { errcode: "M_NOT_FOUND" };
+          continue;
+        }
+        for (const [id, signedObj] of Object.entries(entries ?? {})) {
+          const device = userDevices.get(id);
+          if (device && signedObj && typeof signedObj === "object") {
+            /* merge the signatures into the stored device keys */
+            const stored = device.deviceKeys as {
+              signatures?: Record<string, Record<string, string>>;
+            };
+            const incoming = (signedObj as {
+              signatures?: Record<string, Record<string, string>>;
+            }).signatures;
+            if (incoming) {
+              stored.signatures = stored.signatures ?? {};
+              for (const [sigUser, sigs] of Object.entries(incoming)) {
+                stored.signatures[sigUser] = {
+                  ...(stored.signatures[sigUser] ?? {}),
+                  ...sigs,
+                };
+              }
+            }
+          } else if (username) {
+            /* cross-signing key objects can also receive signatures */
+            const cs = this.crossSigning.get(username);
+            if (cs) {
+              for (const type of ["master", "self_signing", "user_signing"]) {
+                const keyObj = cs[type] as
+                  | { keys?: Record<string, string>; signatures?: Record<string, Record<string, string>> }
+                  | undefined;
+                if (keyObj && Object.values(keyObj.keys ?? {})[0] === id) {
+                  const incoming = (signedObj as {
+                    signatures?: Record<string, Record<string, string>>;
+                  }).signatures;
+                  if (incoming) {
+                    keyObj.signatures = keyObj.signatures ?? {};
+                    for (const [sigUser, sigs] of Object.entries(incoming)) {
+                      keyObj.signatures[sigUser] = {
+                        ...(keyObj.signatures[sigUser] ?? {}),
+                        ...sigs,
+                      };
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      this._send(res, 200, { failures });
+      return;
+    }
+
+    /* account data: PUT /user/{userId}/account_data/{type} */
+    const acctPutMatch = route.match(/^user\/([^/]+)\/account_data\/([^/]+)$/);
+    if (req.method === "PUT" && acctPutMatch) {
+      const targetUserId = decodeURIComponent(acctPutMatch[1] ?? "");
+      if (targetUserId !== user.userId) {
+        this._err(res, 403, "M_FORBIDDEN", "Cannot set another user's account data");
+        return;
+      }
+      let perUser = this.accountData.get(user.username);
+      if (!perUser) {
+        perUser = new Map();
+        this.accountData.set(user.username, perUser);
+      }
+      perUser.set(acctPutMatch[2] ?? "", body);
+      this.accountDataSeq.set(user.username, ++this._seq); /* wake long-polls */
+      this._send(res, 200, {});
+      return;
+    }
+
+    /* account data: GET /user/{userId}/account_data/{type} */
+    if (req.method === "GET" && acctPutMatch) {
+      const targetUserId = decodeURIComponent(acctPutMatch[1] ?? "");
+      if (targetUserId !== user.userId) {
+        this._err(res, 404, "M_NOT_FOUND", "No such account data");
+        return;
+      }
+      const content = this.accountData
+        .get(user.username)
+        ?.get(acctPutMatch[2] ?? "");
+      if (!content) {
+        this._err(res, 404, "M_NOT_FOUND", "No such account data");
+        return;
+      }
+      this._send(res, 200, content);
+      return;
+    }
+
     if (req.method === "POST" && route === "keys/claim") {
       const requested = (body.one_time_keys as Record<string, Record<string, string>>) ?? {};
       const claimed: Record<string, Record<string, Record<string, unknown>>> = {};
@@ -935,6 +1057,7 @@ export class MockHomeserver {
   ): boolean {
     const deviceQueue = this.toDeviceQueue.get(user.username)?.get(deviceId) ?? [];
     if (deviceQueue.some((entry) => entry.seq > sinceNum)) return true;
+    if ((this.accountDataSeq.get(user.username) ?? 0) > sinceNum) return true;
     return (
       this._invitedRooms(user).some((room) =>
         room.events.some((event) => event.seq > sinceNum)
@@ -1061,11 +1184,22 @@ export class MockHomeserver {
     const userDevices = this.devices.get(user.username);
     const myOtks = userDevices?.get(deviceId)?.oneTimeKeys.size ?? 0;
 
+    /* account data (cross-signing keys etc.) — full list on first sync,
+       changes after */
+    const allAccountData = this.accountData.get(user.username);
+    const accountEvents = allAccountData
+      ? [...allAccountData.entries()].map(([type, content]) => ({
+          type,
+          content,
+        }))
+      : [];
+
     return {
       next_batch: String(this._seq),
       rooms: { join, invite },
       to_device: { events: delivered.map((entry) => entry.event) },
       device_one_time_keys_count: { signed_curve25519: myOtks },
+      account_data: { events: accountEvents },
     };
   }
 }

@@ -58,6 +58,7 @@ export interface SyncResponse {
   to_device?: { events?: ToDeviceEvent[] };
   device_one_time_keys_count?: Record<string, number>;
   device_lists?: { changed?: string[]; new?: string[] };
+  account_data?: { events?: MatrixEvent[] };
 }
 
 export interface ToDeviceEvent {
@@ -189,6 +190,8 @@ export interface Room {
 export class HttpError extends Error {
   readonly status: number;
   readonly errcode: string | null;
+  /** the raw error body (UIA challenges carry flows/session here) */
+  readonly body: Record<string, unknown> | null;
 
   constructor(status: number, body: { errcode?: string; error?: string } | null) {
     const message =
@@ -197,6 +200,7 @@ export class HttpError extends Error {
     this.name = "HttpError";
     this.status = status;
     this.errcode = (body && body.errcode) || null;
+    this.body = body as Record<string, unknown> | null;
   }
 }
 
@@ -313,6 +317,8 @@ export class MatrixClient {
   private _txnCounter = 0;
   private _syncRunning = false;
   private _stopped = true;
+  /** account data by event type (cross-signing keys, etc.) */
+  private _accountData = new Map<string, Record<string, unknown>>();
   private _syncAbort: AbortController | null = null;
   private _backoffMs = 0;
   private _readyEmitted = false;
@@ -668,6 +674,70 @@ export class MatrixClient {
     this.connectionState = "stopped";
   }
 
+  /* ----------------------------- account data ---------------------------- */
+
+  /** Latest account data content for a type (from sync), or null. */
+  getAccountData(type: string): Record<string, unknown> | null {
+    return this._accountData.get(type) ?? null;
+  }
+
+  /** Set account data for the current user. */
+  async setAccountData(type: string, content: Record<string, unknown>): Promise<void> {
+    await this.api(
+      "PUT",
+      `${CLIENT_PREFIX}/user/${encodeURIComponent(this.userId ?? "")}/account_data/${encodeURIComponent(type)}`,
+      { body: content }
+    );
+    this._accountData.set(type, content);
+  }
+
+  /* --------------------------- key signing upload ------------------------- */
+
+  /**
+   * Publish cross-signing keys (POST /keys/device_signing/upload). Some
+   * homeservers (Synapse, conduwuit) protect this with UIA — when the
+   * server answers 401 with an m.login.password flow, the account
+   * password is required; it is used once and never stored.
+   */
+  async uploadDeviceSigningKeys(
+    payload: Record<string, unknown>,
+    authPassword?: string
+  ): Promise<{ uiaRequired: boolean }> {
+    try {
+      await this.api("POST", `${CLIENT_PREFIX}/keys/device_signing/upload`, {
+        body: payload,
+      });
+      return { uiaRequired: false };
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status !== 401 || !authPassword) {
+        throw err;
+      }
+      /* UIA challenge: retry with the password flow */
+      const challenge = err.body as { session?: string } | null;
+      await this.api("POST", `${CLIENT_PREFIX}/keys/device_signing/upload`, {
+        body: {
+          auth: {
+            type: "m.login.password",
+            identifier: { type: "m.id.user", user: this.userId ?? "" },
+            password: authPassword,
+            ...(challenge?.session ? { session: challenge.session } : {}),
+          },
+          ...payload,
+        },
+      });
+      return { uiaRequired: false };
+    }
+  }
+
+  /** Publish signatures over keys/devices (POST /keys/signatures/upload). */
+  async uploadKeySignatures(
+    payload: Record<string, Record<string, unknown>>
+  ): Promise<void> {
+    await this.api("POST", `${CLIENT_PREFIX}/keys/signatures/upload`, {
+      body: payload,
+    });
+  }
+
   /* --------------------------- sync processing --------------------------- */
 
   private _ensureRoom(roomId: string): Room {
@@ -1021,6 +1091,12 @@ export class MatrixClient {
   }
 
   private _applySync(data: SyncResponse): void {
+    /* account data (cross-signing keys, etc.) */
+    for (const ev of data.account_data?.events ?? []) {
+      if (ev.type && ev.content && typeof ev.content === "object") {
+        this._accountData.set(ev.type, ev.content);
+      }
+    }
     /* to-device first: room keys must be processed before encrypted room
        events arriving in the same sync batch are handled. A crypto error
        must never abort room processing. */

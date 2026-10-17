@@ -109,18 +109,21 @@ export class VerifyView extends HTMLElement {
     if (this._sessionMode && !this._sessionRequested) {
       const card = el("div", { class: "verify-card" });
       card.appendChild(el("div", { class: "verify-peer", text: "This device" }));
-      card.appendChild(
-        el("div", {
-          class: "verify-phase",
-          text: "Ask your other devices to verify this session (emoji or QR).",
-        })
-      );
-      const buttons = el("div", { class: "call-footer" });
-      const go = el("button", { class: "call-btn", text: "Verify my other devices" });
-      go.addEventListener("click", () => {
+      const setup = el("button", { class: "call-btn", text: "Verify my other devices" });
+      setup.addEventListener("click", () => {
         this._dispatch("grungus:request-session-verify");
       });
-      buttons.appendChild(go);
+      const csSetup = el("button", {
+        class: "call-btn",
+        text: "Set up cross-signing",
+        title: "Create the master/self-signing/user-signing keys for this account",
+      });
+      csSetup.addEventListener("click", () => {
+        this._renderBootstrapCard();
+      });
+      const buttons = el("div", { class: "call-footer" });
+      buttons.appendChild(setup);
+      buttons.appendChild(csSetup);
       card.appendChild(buttons);
       this.appendChild(card);
     }
@@ -135,6 +138,59 @@ export class VerifyView extends HTMLElement {
   }
 
   /* ------------------------------- SAS --------------------------------- */
+
+  /** The cross-signing bootstrap card (password prompt for homeserver UIA). */
+  private _renderBootstrapCard(): void {
+    this.textContent = "";
+    this.classList.add("call-overlay");
+    const card = el("div", { class: "verify-card" });
+    card.appendChild(el("div", { class: "verify-peer", text: "Set up cross-signing" }));
+    card.appendChild(
+      el("div", {
+        class: "verify-phase",
+        text: "Creates this account's master, self-signing and user-signing keys. Devices you verify are then trusted by every device that trusts your master key.",
+      })
+    );
+    const pwLabel = el("div", {
+      class: "verify-phase",
+      text: "Your homeserver requires your account password to publish the keys (used once, never stored):",
+    });
+    const pw = document.createElement("input");
+    pw.type = "password";
+    pw.placeholder = "account password";
+    pw.className = "cs-password-input";
+    const status = el("div", { class: "verify-phase" });
+    const go = el("button", { class: "call-btn", text: "Create keys" }) as HTMLButtonElement;
+    go.addEventListener("click", () => {
+      go.disabled = true;
+      status.textContent = "Publishing cross-signing keys…";
+      this._dispatch("grungus:bootstrap-crosssigning", { password: pw.value });
+    });
+    const cancel = el("button", { class: "call-btn danger", text: "Cancel" });
+    cancel.addEventListener("click", () => {
+      this._render();
+    });
+    const buttons = el("div", { class: "call-footer" });
+    buttons.appendChild(go);
+    buttons.appendChild(cancel);
+    card.appendChild(pwLabel);
+    card.appendChild(pw);
+    card.appendChild(buttons);
+    card.appendChild(status);
+    this.appendChild(card);
+  }
+
+  /** Report the bootstrap result (called by app.ts wiring). */
+  setBootstrapResult(result: { ok: boolean; message: string }): void {
+    const status = this.querySelector(".verify-card .verify-phase:last-child");
+    if (status) status.textContent = result.message;
+    if (result.ok) {
+      setTimeout(() => {
+        this._sessionRequested = false;
+        this._render();
+      }, 1800);
+    }
+  }
 
   private _renderSasCard(state: SasUiState): void {
     const card = el("div", { class: "verify-card" });

@@ -95,6 +95,20 @@ export interface OlmApi {
   SAS: new () => OlmSasApi;
   PkEncryption: new () => OlmPkEncryptionApi;
   PkDecryption: new () => OlmPkDecryptionApi;
+  PkSigning: new () => OlmPkSigningApi;
+  Utility: new () => OlmUtilityApi;
+}
+
+export interface OlmPkSigningApi {
+  generate_seed(): Uint8Array;
+  init_with_seed(seed: Uint8Array): string;
+  sign(message: string): string;
+  free(): void;
+}
+
+export interface OlmUtilityApi {
+  ed25519_verify(key: string, message: string, signature: string): void;
+  free(): void;
 }
 
 export interface OlmPkEncryptionApi {
@@ -469,6 +483,55 @@ export class E2eeCrypto {
   /** This device's Curve25519 identity key (unpadded base64). */
   get curve25519Key(): string {
     return this._curve25519;
+  }
+
+  /** The olm module (for cross-signing PkSigning/Utility access). */
+  get olmModule(): OlmApi | null {
+    return this._olm;
+  }
+
+  /** The crypto store (cross-signing private seeds live here). */
+  get store(): CryptoStore {
+    return this._store;
+  }
+
+  /** Sign a message with this device's Ed25519 key (olm account sign). */
+  signWithDevice(message: string): string {
+    if (!this._account) throw new Error("olm account not initialised");
+    return this._account.sign(message);
+  }
+
+  /**
+   * Raw device-key entries for a user as published by /keys/query —
+   * includes the signatures map (SSK device signatures for the
+   * cross-signing trust chain).
+   */
+  async getRawDeviceKeys(
+    userId: string
+  ): Promise<Record<string, { algorithms: string[]; keys: Record<string, string>; signatures?: Record<string, Record<string, string>> }>> {
+    /* re-query (bypasses the parsed cache) */
+    const res = await this.host.api<{
+      device_keys?: Record<
+        string,
+        Record<string, { algorithms?: string[]; keys?: Record<string, string>; signatures?: Record<string, Record<string, string>> } | undefined>
+      >;
+    }>("POST", "/_matrix/client/v3/keys/query", {
+      body: { device_keys: { [userId]: [] } },
+    });
+    const entries = res.device_keys?.[userId] ?? {};
+    const out: Record<string, { algorithms: string[]; keys: Record<string, string>; signatures?: Record<string, Record<string, string>> }> = {};
+    for (const [deviceId, entryOpt] of Object.entries(entries)) {
+      const entry = entryOpt ?? { algorithms: [], keys: {} };
+      const keys = entry.keys ?? {};
+      /* cross-signing pseudo-entries (ed25519-only) are not devices */
+      if (!keys[`curve25519:${deviceId}`]) continue;
+      out[deviceId] = {
+        algorithms: entry.algorithms ?? [],
+        keys,
+        signatures: entry.signatures,
+      };
+    }
+    return out;
   }
 
   createSas(): OlmSasApi {

@@ -17,6 +17,7 @@ import { E2eeCrypto, type CryptoStore } from "./services/e2ee.ts";
 import { CallManager, type CallUiState } from "./services/calls.ts";
 import { LkCallManager, type LkCallState } from "./services/calls-livekit.ts";
 import { VerificationManager, type SasUiState } from "./services/sas.ts";
+import { CrossSigning } from "./services/cross-signing.ts";
 
 export interface SavedSession {
   baseUrl: string;
@@ -521,6 +522,7 @@ function startShell(): void {
 
   const cryptoLayer = active.crypto;
   if (cryptoLayer) {
+    const crossSigning = new CrossSigning(cryptoLayer, active);
     verification = new VerificationManager(cryptoLayer);
     cryptoLayer.addPayloadListener((sender, type, content, senderKey) => {
       verification?.handlePayload(sender, type, content, senderKey);
@@ -542,9 +544,16 @@ function startShell(): void {
     };
     verification.onUi = refreshVerify;
     verification.onQrUi = refreshVerify;
-    verification.onVerified = () => {
+    verification.onVerified = (peerUserId, peerDeviceId) => {
       refreshVerify();
       setTimeout(refreshVerify, 1500); /* let the verified card show */
+      /* cross-signing propagation: when THIS device holds the self-
+         signing key and we verified one of OUR OWN devices, sign its
+         device key — every device that trusts our master key then
+         trusts it too (verify once, trust everywhere) */
+      if (peerUserId === active.userId) {
+        void crossSigning.signDevice(peerDeviceId).catch(() => {});
+      }
     };
     /* the user accepted an incoming request (or re-verifies a card) */
     verifyView.addEventListener("grungus:accept-verify", (event) => {
@@ -587,6 +596,24 @@ function startShell(): void {
       const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
       void verification?.asQr(id)?.confirmScanned();
       refreshVerify();
+    });
+    /* cross-signing bootstrap (UIA password prompt on the view) */
+    verifyView.addEventListener("grungus:bootstrap-crosssigning", (event) => {
+      const detail = (event as CustomEvent<{ password: string }>).detail;
+      void (async () => {
+        try {
+          const res = await crossSigning.bootstrap(detail.password || undefined);
+          verifyView.setBootstrapResult({
+            ok: true,
+            message: `✅ Cross-signing ready — master key ${res.masterPub.slice(0, 12)}…`,
+          });
+        } catch (err) {
+          verifyView.setBootstrapResult({
+            ok: false,
+            message: `❌ Bootstrap failed: ${err instanceof Error ? err.message : "unknown error"}`,
+          });
+        }
+      })();
     });
     /* session verification: this device asks its own other devices */
     verifyView.addEventListener("grungus:request-session-verify", () => {
