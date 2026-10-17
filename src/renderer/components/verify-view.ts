@@ -62,6 +62,15 @@ export class VerifyView extends HTMLElement {
     this._render();
   }
 
+  /** Close the overlay completely (the ✕) — resets session state too,
+   *  so the 🛡 opens fresh next time. */
+  closeAll(): void {
+    this._sessionMode = false;
+    this._sessionRequested = false;
+    this._accepted.clear();
+    this._render();
+  }
+
   markSessionRequested(): void {
     this._sessionRequested = true;
     this._render();
@@ -108,6 +117,17 @@ export class VerifyView extends HTMLElement {
         text: "Compare emoji or scan a QR code",
       })
     );
+    /* the universal close: cancels every active transaction and clears
+       the overlay — nothing here should ever trap the user */
+    const closeBtn = el("button", {
+      class: "overlay-close-btn",
+      text: "✕",
+      title: "Close verification",
+    });
+    closeBtn.addEventListener("click", () => {
+      this._dispatch("grungus:close-verify");
+    });
+    header.appendChild(closeBtn);
     this.appendChild(header);
 
     /* session-verification entry card (opened from the sidebar) */
@@ -329,9 +349,27 @@ export class VerifyView extends HTMLElement {
 
     if (state.error) {
       card.appendChild(el("div", { class: "verify-phase", text: `❌ ${state.error}` }));
+      const buttons = el("div", { class: "call-footer" });
+      const dismiss = el("button", { class: "call-btn", text: "Dismiss" });
+      dismiss.addEventListener("click", () => {
+        this._dispatch("grungus:discard-verify", { transactionId: state.transactionId });
+      });
+      buttons.appendChild(dismiss);
+      card.appendChild(buttons);
       this.appendChild(card);
       return;
     }
+
+    /* every in-progress QR phase gets a way out */
+    const addCancel = (target: HTMLElement): void => {
+      const buttons = el("div", { class: "call-footer" });
+      const cancel = el("button", { class: "call-btn danger", text: "Cancel" });
+      cancel.addEventListener("click", () => {
+        this._dispatch("grungus:decline-verify", { transactionId: state.transactionId });
+      });
+      buttons.appendChild(cancel);
+      target.appendChild(buttons);
+    };
 
     switch (state.phase) {
       case "show-qr": {
@@ -342,6 +380,7 @@ export class VerifyView extends HTMLElement {
         card.appendChild(
           el("div", { class: "verify-phase", text: "Waiting for the scan…" })
         );
+        addCancel(card);
         break;
       }
       case "scan-qr": {
@@ -349,6 +388,7 @@ export class VerifyView extends HTMLElement {
           el("div", { class: "verify-phase", text: "Scan the code shown on the other device:" })
         );
         card.appendChild(this._renderScanner(state.transactionId));
+        addCancel(card);
         break;
       }
       case "confirm-scan": {
@@ -382,6 +422,7 @@ export class VerifyView extends HTMLElement {
         card.appendChild(
           el("div", { class: "verify-phase", text: "Scanned ✓ Waiting for them to confirm…" })
         );
+        addCancel(card);
         break;
       }
       case "verified": {

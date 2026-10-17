@@ -30,11 +30,19 @@ export class BackupView extends HTMLElement {
 
   hide(): void {
     this.hidden = true;
+    /* the .call-overlay class carries display:flex — the [hidden]
+       attribute loses against it, so the class must go too or the
+       "closed" overlay stays on screen */
+    this.classList.remove("call-overlay");
+    this.textContent = "";
   }
 
   private _render(): void {
     this.textContent = "";
-    if (this.hidden) return;
+    if (this.hidden) {
+      this.classList.remove("call-overlay");
+      return;
+    }
     this.classList.add("call-overlay");
 
     const card = el("div", { class: "backup-card" });

@@ -184,9 +184,10 @@ export class SasTransaction {
     });
   }
 
-  /** Either side: decline before the handshake starts (m.key.verification.cancel). */
+  /** Either side: cancel the transaction (works from ANY active phase —
+   *  the overlay's close buttons use this; terminal phases are no-ops). */
   async decline(): Promise<void> {
-    if (this.phase !== "requested") return;
+    if (this.phase === "verified" || this.phase === "cancelled") return;
     await this.send("m.key.verification.cancel", {
       code: "m.user",
       reason: "declined",
@@ -496,9 +497,24 @@ export class VerificationManager {
     await txn.decline();
   }
 
-  /** Remove a transaction from the UI (e.g. an ignored request). */
+  /** Remove a transaction from the UI without touching the wire
+   *  (declined/failed cards' Dismiss) — SAS and QR alike. */
   discard(transactionId: string): void {
     this._transactions.delete(transactionId);
+    this._qrTransactions.delete(transactionId);
+  }
+
+  /** Cancel EVERYTHING (the overlay's ✕): all SAS + QR transactions,
+   *  removed from the UI as well. */
+  cancelAll(): void {
+    for (const [id, txn] of [...this._transactions]) {
+      this._transactions.delete(id);
+      void txn.decline();
+    }
+    for (const [id, txn] of [...this._qrTransactions]) {
+      this._qrTransactions.delete(id);
+      void txn.decline();
+    }
   }
 
   /** Payload dispatch — called by E2eeCrypto for non-room-key payloads. */

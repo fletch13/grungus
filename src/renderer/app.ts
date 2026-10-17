@@ -608,7 +608,23 @@ function startShell(): void {
     verifyView.addEventListener("grungus:decline-verify", (event) => {
       const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
       void verification?.cancel(id);
-      verification?.asQr(id)?.decline();
+      const qr = verification?.asQr(id);
+      if (qr) {
+        void qr.decline();
+        verification?.discard(id);
+      }
+      refreshVerify();
+    });
+    /* the overlay's ✕: cancel everything and clear the overlay */
+    verifyView.addEventListener("grungus:close-verify", () => {
+      verification?.cancelAll();
+      verifyView.closeAll();
+      refreshVerify();
+    });
+    /* failed/cancelled cards' Dismiss: remove the transaction from the UI */
+    verifyView.addEventListener("grungus:discard-verify", (event) => {
+      const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
+      verification?.discard(id);
       refreshVerify();
     });
     verifyView.addEventListener("grungus:confirm-sas", (event) => {
