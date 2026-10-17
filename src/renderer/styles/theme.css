@@ -1348,6 +1348,43 @@ message-item:hover .msg-toolbar {
   align-items: center;
 }
 
+/* incoming-call ring banner */
+incoming-call {
+  position: fixed;
+  top: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 500;
+  display: none;
+}
+
+incoming-call.incoming-call-visible {
+  display: block;
+}
+
+.incoming-call-card {
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: center;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+}
+
+.incoming-call-title {
+  color: var(--text-bright);
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.incoming-call-buttons {
+  display: flex;
+  gap: 8px;
+}
+
 .verify-qr-canvas {
   width: 240px;
   height: 240px;

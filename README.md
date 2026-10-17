@@ -131,6 +131,15 @@ for an open protocol.
   per-room remove buttons and an add-room picker (m.space.child state,
   via the user's homeserver as the routing hint). Rooms can be moved
   in and out live; every member's tree updates via sync.
+- **Incoming-call ring** — when a call starts in one of your rooms
+  (someone publishes call state), a banner with a two-tone WebAudio
+  ring offers Join/Dismiss (45s missed-call timeout). Rings only fire
+  on an OBSERVED false→true transition — a call that was already
+  ongoing when you logged in is a missed call, not an incoming one.
+  Call state carries expires_ts with a 2-minute heartbeat, so a
+  crashed client's state self-heals after 5 minutes instead of
+  lingering forever. When everyone else leaves a DM call, your side
+  auto-leaves after a short grace instead of hanging in an empty call.
 - **Element Call interop (MatrixRTC)** — Grungus speaks the MatrixRTC
   signaling Element Call uses: m.call.member state is parsed in BOTH
   current formats (the MSC4143 per-device session events Element Call

@@ -84,6 +84,12 @@ export class CallManager {
   private _localStream: MediaStream | null = null;
   private _syntheticCanvas: HTMLCanvasElement | null = null;
   private _syntheticTimer: ReturnType<typeof setInterval> | null = null;
+  /** call-state heartbeat (keeps expires_ts fresh while connected) */
+  private _memberHeartbeat: ReturnType<typeof setInterval> | null = null;
+  /** when we first noticed being alone in the call (auto-leave grace) */
+  private _aloneSince: number | null = null;
+  /** the auto-leave timer when everyone else left */
+  private _aloneTimer: ReturnType<typeof setTimeout> | null = null;
   private _audioCtx: AudioContext | null = null;
   private _peers = new Map<string, PeerEntry>();
   private _notice: string | null = null;
@@ -124,8 +130,24 @@ export class CallManager {
   /** Is there an ongoing call in the room (someone besides us)? */
   static callOngoing(room: Room | null, ownUserId: string | null): boolean {
     if (!room) return false;
-    for (const userId of room.callMembers.keys()) {
-      if (userId !== ownUserId) return true;
+    const now = Date.now();
+    for (const [userId, content] of room.callMembers) {
+      if (userId === ownUserId) continue;
+      /* the legacy m.calls format: any NON-EXPIRED device of theirs */
+      const calls = (content as { "m.calls"?: { "m.devices"?: { expires_ts?: number }[] }[] })[
+        "m.calls"
+      ];
+      if (Array.isArray(calls)) {
+        for (const call of calls) {
+          for (const device of call["m.devices"] ?? []) {
+            /* no expiry = pre-heartbeat state: treat as ongoing (the
+               clear-on-hangup contract still applies) */
+            if (device.expires_ts == null || device.expires_ts > now) return true;
+          }
+        }
+      } else {
+        return true;
+      }
     }
     return false;
   }
@@ -155,6 +177,11 @@ export class CallManager {
     await this._publishMember(true);
     this._reconcileMesh();
     this._emit();
+    /* heartbeat: keep our call state's expires_ts fresh while we are
+       in the call (a crash stops the beats and the entry expires) */
+    this._memberHeartbeat = setInterval(() => {
+      void this._publishMember(true).catch(() => {});
+    }, 2 * 60_000);
   }
 
   async hangUp(): Promise<void> {
@@ -181,6 +208,15 @@ export class CallManager {
       clearInterval(this._syntheticTimer);
       this._syntheticTimer = null;
     }
+    if (this._memberHeartbeat) {
+      clearInterval(this._memberHeartbeat);
+      this._memberHeartbeat = null;
+    }
+    if (this._aloneTimer) {
+      clearTimeout(this._aloneTimer);
+      this._aloneTimer = null;
+    }
+    this._aloneSince = null;
     this._syntheticCanvas = null;
     if (this._audioCtx) {
       void this._audioCtx.close().catch(() => {});
@@ -477,7 +513,16 @@ export class CallManager {
           "m.calls": [
             {
               "m.call_id": "",
-              "m.devices": [{ device_id: this._localDeviceId, muted: this._localMuted }],
+              "m.devices": [
+                {
+                  device_id: this._localDeviceId,
+                  muted: this._localMuted,
+                  /* a crashed client never clears its state — the
+                     heartbeat republishes every 2 min and the entry
+                     self-heals 5 min after the last beat */
+                  expires_ts: Date.now() + 5 * 60_000,
+                },
+              ],
             },
           ],
         }
@@ -522,6 +567,25 @@ export class CallManager {
       const [userId, deviceId] = key.split("|");
       if (userId === this.client.userId) continue;
       if (userId && deviceId) this._addPeer(userId, deviceId);
+    }
+
+    /* everyone else left: a DM call with nobody on the other side is
+       over — leave after a short grace so a peer's state blip does
+       not drop the call */
+    const others = [...present].some((key) => key.split("|")[0] !== this.client.userId);
+    if (!others && this._peers.size === 0) {
+      if (this._aloneTimer == null) {
+        this._aloneTimer = setTimeout(() => {
+          this._aloneTimer = null;
+          this._aloneSince = null;
+          void this.hangUp();
+        }, 4_000);
+        this._aloneSince = Date.now();
+      }
+    } else if (this._aloneTimer != null) {
+      clearTimeout(this._aloneTimer);
+      this._aloneTimer = null;
+      this._aloneSince = null;
     }
   }
 

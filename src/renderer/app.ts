@@ -15,6 +15,7 @@ import type { AppShell } from "./components/app-shell.ts";
 import { MatrixClient, type Room } from "./services/matrix-client.ts";
 import { E2eeCrypto, type CryptoStore } from "./services/e2ee.ts";
 import { CallManager, type CallUiState } from "./services/calls.ts";
+import { IncomingCall } from "./components/incoming-call.ts";
 import { LkCallManager, type LkCallState } from "./services/calls-livekit.ts";
 import { VerificationManager, type SasUiState } from "./services/sas.ts";
 import { CrossSigning } from "./services/cross-signing.ts";
@@ -368,7 +369,16 @@ function startShell(): void {
   const lkManager = new LkCallManager(active);
   const callView = document.createElement("call-view");
   root.appendChild(callView);
+  /* the incoming-call ring banner (someone started a call in one of
+     our rooms) */
+  const incomingCall = document.createElement("incoming-call");
+  root.appendChild(incomingCall);
   let callMode: "mesh" | "livekit" = "mesh";
+  /** per-room "call was ongoing last we looked" — rings only fire on an
+   *  OBSERVED false→true flip, so stale state at login never rings */
+  const callWasOngoing = new Map<string, boolean>();
+  /** the room our current call is in (no self-ring) */
+  let currentCallRoomId: string | null = null;
 
   const refreshCallHeader = (): void => {
     if (state.roomId) {
@@ -383,12 +393,16 @@ function startShell(): void {
   };
 
   callManager.setUiListener((callState: CallUiState) => {
+    currentCallRoomId = callState.active ? callState.roomId : null;
+    if (callState.active) incomingCall.dismiss();
     if (callMode === "mesh") {
       callView.update(callState, callManager);
       refreshCallHeader();
     }
   });
   lkManager.setListener((lkState) => {
+    currentCallRoomId = lkState.connected ? state.roomId : null;
+    if (lkState.connected) incomingCall.dismiss();
     if (callMode === "livekit") {
       /* adapt the SFU state to the overlay's shape */
       callView.update(
@@ -734,6 +748,14 @@ function startShell(): void {
     state.roomId = roomId;
     active.markRoomRead(roomId);
     chat.setRoom(room, active, active.userId);
+    /* the call state may have arrived in the initial sync (before this
+       room was ever selected) — refresh the header's Join call state */
+    chat.setCallState(
+      CallManager.callOngoing(room, active.userId),
+      callManager.active && callMode === "mesh"
+        ? true
+        : callMode === "livekit" && lkManager.connected
+    );
     members.update(room, active, active.userId);
     shell.setMembersVisible(true);
     refreshSidebar();
@@ -859,6 +881,27 @@ function startShell(): void {
   active.on("room", (update) => {
     if (!client) return;
     callManager.onRoomUpdate(update.room);
+    /* incoming-call ring: edge-detect "a call started in this room"
+       (mesh m.call.member state or a MatrixRTC membership with a
+       LiveKit focus) while we are not in that call ourselves. Only an
+       OBSERVED false→true flip rings — a call that was already ongoing
+       when we logged in is a missed call, not an incoming one */
+    const ongoing =
+      CallManager.callOngoing(update.room, active.userId) ||
+      update.room.rtcMemberships.some((m) => m.focusUrl);
+    const prev = callWasOngoing.get(update.room.id);
+    callWasOngoing.set(update.room.id, ongoing);
+    if (
+      ongoing &&
+      prev === false &&
+      update.room.id !== currentCallRoomId &&
+      incomingCall.ringingRoomId === null
+    ) {
+      incomingCall.show(update.room.id, update.room.title);
+    }
+    if (!ongoing && incomingCall.ringingRoomId === update.room.id) {
+      incomingCall.dismiss();
+    }
     if (update.room.id === state.roomId) {
       if (update.redraw) {
         /* timeline items changed in place (forwarded key decrypted UTD
@@ -875,6 +918,13 @@ function startShell(): void {
       chat.setTypingUsers(update.room.typingUsers);
     }
     refreshSidebar();
+  });
+
+  /* joining from the ring banner routes through the same call setup */
+  incomingCall.addEventListener("grungus:join-incoming", (event) => {
+    const roomId = (event as CustomEvent<{ roomId: string }>).detail.roomId;
+    selectRoom(roomId);
+    startCall(roomId);
   });
 
   /* ---- invites ---- */

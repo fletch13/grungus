@@ -75,6 +75,8 @@ export class LkCallManager {
   /** Join the room's LiveKit call (state event must be present). */
   /** true when the current call goes through MatrixRTC signaling. */
   private _matrixRtc = false;
+  /** call-state heartbeat (keeps the membership expiry fresh) */
+  private _memberHeartbeat: ReturnType<typeof setInterval> | null = null;
 
   /**
    * Discover the LiveKit service for a MatrixRTC call (Element Call
@@ -116,7 +118,7 @@ export class LkCallManager {
       call_id: "",
       scope: "m.room",
       device_id: deviceId,
-      expires: 3_600_000,
+      expires: 5 * 60_000,
       focus_active: {
         active_focus: { focus: "livekit", livekit_service_url: authUrl },
         joined_ts: now,
@@ -154,7 +156,7 @@ export class LkCallManager {
     );
     devices.push({
       device_id: deviceId,
-      expires_ts: now + 3_600_000,
+      expires_ts: now + 5 * 60_000,
       foci_active: [{ focus: "livekit", livekit_service_url: authUrl }],
     });
     return {
@@ -167,8 +169,9 @@ export class LkCallManager {
     };
   }
 
-  /** Clear our MatrixRTC membership (empty content = left). Tries the
-   *  per-device state key, then the legacy per-user key. */
+  /** Clear our call membership (empty content = left). Tries the
+   *  per-device state key, then filters our device out of the legacy
+   *  per-user entry (other devices of ours may still be in the call). */
   private async _clearRtcMembership(roomId: string): Promise<void> {
     const userId = this.client.userId ?? "";
     const deviceId = this.client.deviceId ?? "";
@@ -178,7 +181,24 @@ export class LkCallManager {
     } catch {
       /* per-device state keys not authorized on this server */
     }
-    await this.client.sendStateEvent(roomId, "m.call.member", userId, {}).catch(() => {});
+    /* legacy: keep the OTHER devices of ours, drop only this one */
+    const existing = this.client.getRoom(roomId)?.callMembers.get(userId) as
+      | { "m.calls"?: { "m.call_id"?: string; "m.devices"?: Record<string, unknown>[] }[] }
+      | undefined;
+    const devices = (existing?.["m.calls"]?.[0]?.["m.devices"] ?? []).filter(
+      (d) => d.device_id !== deviceId
+    );
+    const content = devices.length
+      ? {
+          "m.calls": [
+            {
+              "m.call_id": existing?.["m.calls"]?.[0]?.["m.call_id"] ?? "",
+              "m.devices": devices,
+            },
+          ],
+        }
+      : { "m.calls": [] };
+    await this.client.sendStateEvent(roomId, "m.call.member", userId, content).catch(() => {});
   }
 
   async join(): Promise<void> {
@@ -264,25 +284,32 @@ export class LkCallManager {
         name: track.kind === "video" ? "camera" : "mic",
       });
     }
-    /* publish our MatrixRTC membership so Element Call (and any
-       MatrixRTC client) sees us in this call */
-    if (this._matrixRtc) {
-      await this._publishRtcMembership(roomId ?? "", authUrl).catch((err) =>
-        console.warn("[lk-call] MatrixRTC membership publish failed:", err)
-      );
-    }
+    /* publish our call membership so others see the ongoing call and
+       get the incoming-call ring — MatrixRTC members (Element Call)
+       and mesh-style clients (callOngoing) both read it */
+    await this._publishRtcMembership(roomId ?? "", authUrl).catch((err) =>
+      console.warn("[lk-call] call membership publish failed:", err)
+    );
+    /* heartbeat: keep the membership's expiry fresh while connected
+       (a crash stops the beats and the state self-heals) */
+    this._memberHeartbeat = setInterval(() => {
+      void this._publishRtcMembership(roomId ?? "", authUrl).catch(() => {});
+    }, 2 * 60_000);
     this._emit();
   }
 
   async leave(): Promise<void> {
     const room = this._room;
     const leftRoomId = this._roomId;
-    const wasMatrixRtc = this._matrixRtc;
+    if (this._memberHeartbeat) {
+      clearInterval(this._memberHeartbeat);
+      this._memberHeartbeat = null;
+    }
     this._room = null;
     this._roomId = null;
     this._matrixRtc = false;
-    /* clear our MatrixRTC membership (Element Call then sees us leave) */
-    if (wasMatrixRtc && leftRoomId) {
+    /* clear our call membership (everyone else then sees us leave) */
+    if (leftRoomId) {
       await this._clearRtcMembership(leftRoomId);
     }
     try {

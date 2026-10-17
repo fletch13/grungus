@@ -40,7 +40,15 @@ export class CallView extends HTMLElement {
     const manager = this._manager;
     this.textContent = "";
 
-    if (!state || !state.active || !manager) return;
+    if (!state || !state.active || !manager) {
+      /* the call ended — drop the overlay backdrop too, or an empty
+         gray sheet stays over the whole app */
+      this.classList.remove("call-overlay");
+      for (const video of this._videos.values()) {
+        video.srcObject = null;
+      }
+      return;
+    }
 
     this.classList.add("call-overlay");
 

@@ -88,7 +88,12 @@ export class VerifyView extends HTMLElement {
     const manager = this._manager;
     this.textContent = "";
     const hasCards = this._states.length > 0 || (this._sessionMode && !this._sessionRequested);
-    if (!manager || !hasCards) return;
+    if (!manager || !hasCards) {
+      /* no cards — drop the overlay backdrop too, or an empty gray
+         sheet stays over the whole app */
+      this.classList.remove("call-overlay");
+      return;
+    }
 
     /* stop any camera preview from a previous render */
     this._stopScan();

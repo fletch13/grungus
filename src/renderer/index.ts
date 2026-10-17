@@ -16,4 +16,5 @@ import "./components/app-shell.ts";
 import "./components/call-view.ts";
 import "./components/verify-view.ts";
 import "./components/backup-view.ts";
+import "./components/incoming-call.ts";
 import "./app.ts";
