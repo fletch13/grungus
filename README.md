@@ -131,6 +131,18 @@ for an open protocol.
   per-room remove buttons and an add-room picker (m.space.child state,
   via the user's homeserver as the routing hint). Rooms can be moved
   in and out live; every member's tree updates via sync.
+- **Read markers + receipts** — opening a room (or new messages
+  arriving while it's open, debounced 1.5s) sends a public m.read
+  receipt (POST /rooms/{id}/receipt/m.read/{eventId}) and the
+  m.fully_read room account-data marker — other clients and
+  notification counts see exactly where you've read up to. Others'
+  receipts arrive via ephemeral m.receipt and drive the Discord-style
+  "👁 Seen" indicator under your latest DM message (receiptCoversEvent
+  compares by timeline position, so it clears when you send a new
+  message and returns when they read it). DM detection now also
+  honors the spec's m.direct account data (named DMs included), not
+  just the nameless-two-member heuristic — and an m.direct map change
+  re-resolves every room's metadata live.
 - **E2EE media (insertable streams)** — in ENCRYPTED rooms the call's
   media frames are end-to-end encrypted: a TransformStream between
   the codec and the packetizer (Chromium's

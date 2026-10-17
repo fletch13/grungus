@@ -374,6 +374,15 @@ function startShell(): void {
   const incomingCall = document.createElement("incoming-call");
   root.appendChild(incomingCall);
   let callMode: "mesh" | "livekit" = "mesh";
+  /** debounced read-marker sender for the open room */
+  let markReadTimer: ReturnType<typeof setTimeout> | null = null;
+  const scheduleMarkRead = (roomId: string): void => {
+    if (markReadTimer) clearTimeout(markReadTimer);
+    markReadTimer = setTimeout(() => {
+      markReadTimer = null;
+      if (state.roomId === roomId) active.markRoomRead(roomId);
+    }, 1_500);
+  };
   /** per-room "call was ongoing last we looked" — rings only fire on an
    *  OBSERVED false→true flip, so stale state at login never rings */
   const callWasOngoing = new Map<string, boolean>();
@@ -932,6 +941,17 @@ function startShell(): void {
         callManager.active
       );
       chat.setTypingUsers(update.room.typingUsers);
+      /* the open room is being read: keep the unread at zero and send
+         fresh read markers (debounced — receipts for every message
+         would spam the room) */
+      if (update.newEvents.some((e) => e.kind === "message")) {
+        scheduleMarkRead(update.room.id);
+      }
+      /* receipts changed (someone read our messages) — re-render the
+         Seen indicator */
+      if (update.newEvents.length === 0) {
+        chat.refreshSeenState();
+      }
     }
     refreshSidebar();
   });

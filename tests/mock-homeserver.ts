@@ -45,6 +45,10 @@ interface MockRoom {
   typingUntil: Map<string, number>;
   /** bumped on typing changes so long-polls wake */
   typingSeq: number;
+  /** read receipts: userId -> { eventId, ts } */
+  readReceipts: Map<string, { eventId: string; ts: number }>;
+  /** bumped on receipt changes so long-polls wake */
+  receiptSeq: number;
 }
 
 interface MockDevice {
@@ -72,6 +76,10 @@ export class MockHomeserver {
   readonly crossSigning = new Map<string, Record<string, Record<string, unknown>>>();
   /** username -> seq of the last account-data change (wakes long-polls) */
   readonly accountDataSeq = new Map<string, number>();
+  /** "username|roomId" -> room-scoped account data type -> content */
+  readonly roomAccountData = new Map<string, Map<string, Record<string, unknown>>>();
+  /** "username|roomId" -> seq of the last room-account-data change */
+  readonly roomAccountDataSeq = new Map<string, number>();
   /** media: id -> { bytes, mime } */
   readonly media = new Map<string, { bytes: Buffer; mime: string }>();
   /** username -> deviceId -> device (keys + one-time keys). */
@@ -216,6 +224,8 @@ export class MockHomeserver {
       events: [],
       typingUntil: new Map(),
       typingSeq: 0,
+      readReceipts: new Map(),
+      receiptSeq: 0,
     };
     this.rooms.set(roomId, room);
 
@@ -1009,6 +1019,65 @@ export class MockHomeserver {
       return;
     }
 
+    /* read receipts: POST /rooms/{roomId}/receipt/{receiptType}/{eventId} */
+    const receiptMatch = route.match(/^rooms\/([^/]+)\/receipt\/([^/]+)\/(.+)$/);
+    if (req.method === "POST" && receiptMatch) {
+      const room = this.rooms.get(receiptMatch[1] ?? "");
+      if (!room) {
+        this._err(res, 404, "M_NOT_FOUND", "Unknown room");
+        return;
+      }
+      const receiptType = receiptMatch[2] ?? "";
+      const eventId = decodeURIComponent(receiptMatch[3] ?? "");
+      if (receiptType !== "m.read" || !eventId) {
+        this._err(res, 400, "M_INVALID_PARAM", "Unsupported receipt type or event id");
+        return;
+      }
+      const changed =
+        room.readReceipts.get(user.userId)?.eventId !== eventId;
+      room.readReceipts.set(user.userId, { eventId, ts: Date.now() });
+      if (changed) room.receiptSeq = ++this._seq; /* wake long-polls */
+      this._send(res, 200, {});
+      return;
+    }
+
+    /* room-scoped account data (the m.fully_read marker):
+       PUT /user/{userId}/rooms/{roomId}/account_data/{type} */
+    const roomAcctMatch = route.match(/^user\/([^/]+)\/rooms\/([^/]+)\/account_data\/([^/]+)$/);
+    if (req.method === "PUT" && roomAcctMatch) {
+      const targetUserId = decodeURIComponent(roomAcctMatch[1] ?? "");
+      if (targetUserId !== user.userId) {
+        this._err(res, 403, "M_FORBIDDEN", "Cannot set another user's account data");
+        return;
+      }
+      const key = `${user.username}|${roomAcctMatch[2] ?? ""}`;
+      let perRoom = this.roomAccountData.get(key);
+      if (!perRoom) {
+        perRoom = new Map();
+        this.roomAccountData.set(key, perRoom);
+      }
+      perRoom.set(roomAcctMatch[3] ?? "", body);
+      this.roomAccountDataSeq.set(key, ++this._seq); /* wake long-polls */
+      this._send(res, 200, {});
+      return;
+    }
+    if (req.method === "GET" && roomAcctMatch) {
+      const targetUserId = decodeURIComponent(roomAcctMatch[1] ?? "");
+      if (targetUserId !== user.userId) {
+        this._err(res, 404, "M_NOT_FOUND", "No such account data");
+        return;
+      }
+      const content = this.roomAccountData
+        .get(`${user.username}|${roomAcctMatch[2] ?? ""}`)
+        ?.get(roomAcctMatch[3] ?? "");
+      if (!content) {
+        this._err(res, 404, "M_NOT_FOUND", "No such account data");
+        return;
+      }
+      this._send(res, 200, content);
+      return;
+    }
+
     if (req.method === "GET" && route === "sync") {
       const context = this._authContext(req);
       if (context) {
@@ -1065,6 +1134,9 @@ export class MockHomeserver {
       this._joinedRooms(user).some(
         (room) =>
           room.typingSeq > sinceNum ||
+          room.receiptSeq > sinceNum ||
+          (this.roomAccountDataSeq.get(`${user.username}|${room.id}`) ?? 0) >
+            sinceNum ||
           room.events.some((event) => event.seq > sinceNum)
       )
     );
@@ -1141,15 +1213,40 @@ export class MockHomeserver {
           "m.invited_member_count": 0,
         },
       };
+      /* ephemeral: typing + read receipts */
+      const ephemeralEvents: Record<string, unknown>[] = [];
       if (room.typingSeq > 0) {
-        joinEntry.ephemeral = {
-          events: [
-            {
-              type: "m.typing",
-              sender: "@mock:hs",
-              content: { user_ids: typingNow },
-            },
-          ],
+        ephemeralEvents.push({
+          type: "m.typing",
+          sender: "@mock:hs",
+          content: { user_ids: typingNow },
+        });
+      }
+      if (room.receiptSeq > 0 && room.readReceipts.size > 0) {
+        /* m.receipt: { [eventId]: { "m.read": { [userId]: { ts } } } } */
+        const receiptContent: Record<string, Record<string, Record<string, { ts: number }>>> = {};
+        for (const [userId, { eventId, ts }] of room.readReceipts) {
+          const bucket = (receiptContent[eventId] ??= {});
+          const reads = (bucket["m.read"] ??= {});
+          reads[userId] = { ts };
+        }
+        ephemeralEvents.push({
+          type: "m.receipt",
+          sender: "@mock:hs",
+          content: receiptContent,
+        });
+      }
+      if (ephemeralEvents.length > 0) {
+        joinEntry.ephemeral = { events: ephemeralEvents };
+      }
+      /* room-scoped account data (m.fully_read etc.) */
+      const roomAcct = this.roomAccountData.get(`${user.username}|${room.id}`);
+      if (roomAcct && roomAcct.size > 0) {
+        joinEntry.account_data = {
+          events: [...roomAcct.entries()].map(([type, content]) => ({
+            type,
+            content,
+          })),
         };
       }
       join[room.id] = joinEntry;

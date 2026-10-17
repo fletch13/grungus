@@ -47,6 +47,7 @@ interface SyncJoinedRoom {
     "m.invited_member_count"?: number;
   };
   unread_notifications?: { notification_count?: number };
+  account_data?: { events?: MatrixEvent[] };
 }
 
 export interface SyncResponse {
@@ -189,6 +190,11 @@ export interface Room {
   } | null;
   /** Users currently typing (from ephemeral m.typing), self excluded. */
   typingUsers: string[];
+  /** Other users' read receipts (m.read, from ephemeral events):
+   *  userId -> { eventId, ts }. */
+  readReceipts: Map<string, { eventId: string; ts: number }>;
+  /** this user's fully-read marker (m.fully_read room account data) */
+  fullyReadEventId: string | null;
   children: Set<string>;
   members: Map<string, MemberRecord>;
   timeline: TimelineItem[];
@@ -868,6 +874,8 @@ export class MatrixClient {
         rtcMemberships: [],
         livekitService: null,
         typingUsers: [],
+        readReceipts: new Map(),
+        fullyReadEventId: null,
         children: new Set(),
         members: new Map(),
         timeline: [],
@@ -972,6 +980,26 @@ export class MatrixClient {
     }
   }
 
+  /**
+   * The spec's DM marker: the m.direct account data maps
+   * userId -> [roomId, ...]. True when this room appears there — and
+   * the peer's id lands on room.directUserId (named DMs included).
+   */
+  private _applyDirectByAccountData(room: Room, joinedOthers: MemberRecord[]): boolean {
+    if (joinedOthers.length !== 1) return false;
+    const direct = this.getAccountData("m.direct") as
+      | Record<string, string[]>
+      | undefined;
+    if (!direct) return false;
+    const peer = joinedOthers[0]!;
+    const roomIds = direct[peer.userId];
+    if (Array.isArray(roomIds) && roomIds.includes(room.id)) {
+      room.directUserId = peer.userId;
+      return true;
+    }
+    return false;
+  }
+
   private _resolveRoomMeta(room: Room): void {
     const joinedOthers: MemberRecord[] = [];
     for (const member of room.members.values()) {
@@ -996,9 +1024,8 @@ export class MatrixClient {
 
     room.isDirect =
       !room.isSpace &&
-      !room.name &&
-      !room.canonicalAlias &&
-      joinedOthers.length === 1;
+      ((!room.name && !room.canonicalAlias && joinedOthers.length === 1) ||
+        this._applyDirectByAccountData(room, joinedOthers));
     room.joinedMemberCount =
       joinedOthers.length +
       (this._isMember(room, this.userId) ? 1 : 0);
@@ -1210,9 +1237,11 @@ export class MatrixClient {
 
   private _applySync(data: SyncResponse): void {
     /* account data (cross-signing keys, etc.) */
+    let directMapChanged = false;
     for (const ev of data.account_data?.events ?? []) {
       if (ev.type && ev.content && typeof ev.content === "object") {
         this._accountData.set(ev.type, ev.content);
+        if (ev.type === "m.direct") directMapChanged = true;
       }
     }
     /* to-device first: room keys must be processed before encrypted room
@@ -1335,6 +1364,41 @@ export class MatrixClient {
         room.typingUsers = typingUsers;
         if (typingChanged) changedRooms.push({ room, newEvents: [] });
       }
+
+      /* ephemeral: other users' read receipts (m.receipt) —
+         content = { [eventId]: { "m.read": { [userId]: { ts } } } } */
+      const receiptEvent = rd.ephemeral?.events?.find((event) => event.type === "m.receipt");
+      if (receiptEvent && receiptEvent.content && typeof receiptEvent.content === "object") {
+        let receiptsChanged = false;
+        for (const [eventId, byType] of Object.entries(
+          receiptEvent.content as Record<string, Record<string, Record<string, { ts?: number }>>>
+        )) {
+          const reads = byType?.["m.read"];
+          if (!reads) continue;
+          for (const [userId, meta] of Object.entries(reads)) {
+            if (userId === this.userId) continue;
+            const ts = typeof meta?.ts === "number" ? meta.ts : Date.now();
+            const prev = room.readReceipts.get(userId);
+            if (!prev || prev.eventId !== eventId || prev.ts !== ts) {
+              room.readReceipts.set(userId, { eventId, ts });
+              receiptsChanged = true;
+            }
+          }
+        }
+        if (receiptsChanged) changedRooms.push({ room, newEvents: [] });
+      }
+
+      /* room-scoped account data: the m.fully_read read marker */
+      for (const ev of rd.account_data?.events ?? []) {
+        if (
+          ev.type === "m.fully_read" &&
+          ev.content &&
+          typeof ev.content.event_id === "string"
+        ) {
+          room.fullyReadEventId = ev.content.event_id;
+        }
+      }
+
       if (rd.unread_notifications?.notification_count != null) {
         room.serverNotifications = rd.unread_notifications.notification_count;
       }
@@ -1363,6 +1427,19 @@ export class MatrixClient {
         newEvents,
         redraw: relationChanged ? true : undefined,
       });
+    }
+
+    /* the m.direct map changed: DM flags may have flipped — re-resolve
+       every room's metadata and notify */
+    if (directMapChanged) {
+      for (const room of this.rooms.values()) {
+        const wasDirect = room.isDirect;
+        const wasPeer = room.directUserId;
+        this._resolveRoomMeta(room);
+        if (room.isDirect !== wasDirect || room.directUserId !== wasPeer) {
+          changedRooms.push({ room, newEvents: [] });
+        }
+      }
     }
 
     for (const update of changedRooms) {
@@ -1438,10 +1515,79 @@ export class MatrixClient {
 
   /* --------------------------- room operations --------------------------- */
 
+  /**
+   * Mark a room as read: clears the local unread, sends a public
+   * m.read receipt (what others see) and the m.fully_read marker
+   * (notification state). Fire-and-forget on the wire.
+   */
   markRoomRead(roomId: string): void {
     const room = this.rooms.get(roomId);
     if (room) room.unread = 0;
     this._selectedRoomId = roomId;
+    void this._sendReadMarkers(roomId).catch((err) =>
+      console.warn("[grungus] read markers failed:", err)
+    );
+  }
+
+  /** The latest message event id in a room's timeline (null if none). */
+  latestTimelineEventId(roomId: string): string | null {
+    const room = this.rooms.get(roomId);
+    if (!room) return null;
+    for (let i = room.timeline.length - 1; i >= 0; i--) {
+      const item = room.timeline[i]!;
+      if (item.kind === "message" && item.id) return item.id;
+    }
+    return null;
+  }
+
+  /**
+   * True when the user's read receipt covers the given event (their
+   * receipt is the event itself or a LATER timeline entry).
+   */
+  receiptCoversEvent(roomId: string, userId: string, eventId: string): boolean {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+    const receipt = room.readReceipts.get(userId);
+    if (!receipt) return false;
+    if (receipt.eventId === eventId) return true;
+    /* compare by timeline position */
+    let receiptIdx = -1;
+    let eventIdx = -1;
+    room.timeline.forEach((item, idx) => {
+      if (item.kind !== "message") return;
+      if (item.id === receipt.eventId) receiptIdx = idx;
+      if (item.id === eventId) eventIdx = idx;
+    });
+    return receiptIdx >= 0 && eventIdx >= 0 && receiptIdx >= eventIdx;
+  }
+
+  /** POST a public m.read receipt for the latest read event. */
+  async sendReadReceipt(roomId: string, eventId: string): Promise<void> {
+    await this.api(
+      "POST",
+      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/receipt/m.read/${encodeURIComponent(eventId)}`,
+      { body: {} }
+    );
+  }
+
+  /** Set room-scoped account data (the m.fully_read marker lives here). */
+  async setRoomAccountData(
+    roomId: string,
+    type: string,
+    content: Record<string, unknown>
+  ): Promise<void> {
+    await this.api(
+      "PUT",
+      `${CLIENT_PREFIX}/user/${encodeURIComponent(this.userId ?? "")}/rooms/${encodeURIComponent(roomId)}/account_data/${encodeURIComponent(type)}`,
+      { body: content }
+    );
+  }
+
+  private async _sendReadMarkers(roomId: string): Promise<void> {
+    const eventId = this.latestTimelineEventId(roomId);
+    if (!eventId) return;
+    await this.sendReadReceipt(roomId, eventId);
+    await this.setRoomAccountData(roomId, "m.fully_read", { event_id: eventId });
   }
 
   clearSelectedRoom(): void {

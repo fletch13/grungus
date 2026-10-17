@@ -1065,6 +1065,15 @@ g-avatar.squared .av {
   padding: 0 4px 2px;
 }
 
+/* the DM "Seen" indicator (peer read up to our last message) */
+.seen-bar {
+  color: var(--text-muted);
+  font-size: 11px;
+  min-height: 14px;
+  padding: 0 4px 2px;
+  text-align: right;
+}
+
 .attach-btn {
   background: none;
   border: none;

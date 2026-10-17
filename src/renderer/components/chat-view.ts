@@ -26,6 +26,8 @@ export class ChatView extends HTMLElement {
   private _callJoined = false;
   private _typingSentAt = 0;
   private _typingStopTimer: ReturnType<typeof setTimeout> | null = null;
+  /** the DM "Seen" indicator bar (below the timeline) */
+  private _seenBar: HTMLElement | null = null;
   private _replyTarget: { eventId: string; sender: string; senderName: string; body: string } | null = null;
   private _replyBar: HTMLElement | null = null;
   private _editTarget: MessageItem | null = null;
@@ -54,6 +56,7 @@ export class ChatView extends HTMLElement {
       class: "hidden-file-input",
     }) as HTMLInputElement;
     this._typingBar = el("div", { class: "typing-bar" });
+    this._seenBar = el("div", { class: "seen-bar" });
     this._replyBar = el("div", { class: "reply-bar" });
     this._replyBar.style.display = "none";
     this._input = el("textarea", {
@@ -67,6 +70,7 @@ export class ChatView extends HTMLElement {
     composer.appendChild(this._input);
     wrap.appendChild(this._replyBar);
     wrap.appendChild(this._typingBar);
+    wrap.appendChild(this._seenBar);
     wrap.appendChild(composer);
     wrap.appendChild(this._hint);
 
@@ -116,6 +120,7 @@ export class ChatView extends HTMLElement {
     this._input.placeholder = `Message ${room.title}`;
     this._renderTimeline();
     this._scrollToBottom();
+    this.refreshSeenState();
   }
 
   clearRoom(): void {
@@ -336,6 +341,47 @@ export class ChatView extends HTMLElement {
         : users.length === 1
           ? `${users[0]} is typing…`
           : `${users.slice(0, 2).join(", ")}${users.length > 2 ? " and others" : ""} are typing…`;
+  }
+
+  /**
+   * Receipts changed (someone read our messages) — update the DM
+   * "Seen" indicator without a full timeline re-render.
+   */
+  refreshSeenState(): void {
+    const room = this._room;
+    const client = this._client;
+    const me = this._meUserId;
+    const prev = this._seenBar;
+    if (!room || !client || !me || !prev) {
+      if (prev) prev.textContent = "";
+      return;
+    }
+    /* DMs only; the indicator sits under OUR latest message */
+    if (!room.isDirect) {
+      prev.textContent = "";
+      return;
+    }
+    const peer = room.directUserId;
+    if (!peer) {
+      prev.textContent = "";
+      return;
+    }
+    /* our last message in the timeline */
+    let lastMine: string | null = null;
+    for (let i = room.timeline.length - 1; i >= 0; i--) {
+      const item = room.timeline[i]!;
+      if (item.kind === "message" && item.sender === me && item.id) {
+        lastMine = item.id;
+        break;
+      }
+    }
+    if (!lastMine) {
+      prev.textContent = "";
+      return;
+    }
+    prev.textContent = client.receiptCoversEvent(room.id, peer, lastMine)
+      ? "👁 Seen"
+      : "";
   }
 
   private _typingPulse(): void {
