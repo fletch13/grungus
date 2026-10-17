@@ -248,7 +248,12 @@ export class VerifyView extends HTMLElement {
         const buttons = el("div", { class: "call-footer" });
         const accept = el("button", { class: "call-btn", text: "Verify" });
         accept.addEventListener("click", () => {
+          if (this._accepted.has(state.transactionId)) return; /* once */
           this._accepted.add(state.transactionId);
+          /* the wire event: sends the ready, the requester then starts */
+          this._dispatch("grungus:accept-verify", {
+            transactionId: state.transactionId,
+          });
           this._render();
         });
         const ignore = el("button", { class: "call-btn danger", text: "Ignore" });
@@ -311,7 +316,13 @@ export class VerifyView extends HTMLElement {
     });
     const emoji = el("button", { class: "call-btn", text: "Compare emoji" });
     emoji.addEventListener("click", () => {
-      this._dispatch("grungus:accept-verify", { transactionId });
+      /* UI-only: the ready already went out with the Verify click, and the
+         SAS starts automatically when the requester sends its start —
+         re-accepting here would send a second ready and restart the
+         other side's flow. Just fold the chooser away. */
+      buttons.replaceWith(
+        el("div", { class: "verify-phase", text: "Waiting for the emoji…" })
+      );
     });
     buttons.appendChild(show);
     buttons.appendChild(scan);

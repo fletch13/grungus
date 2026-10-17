@@ -1,19 +1,29 @@
 /*
- * Grungus — SAS device verification (m.key.verification, libolm SAS).
+ * Grungus — SAS device verification (m.key.verification).
  *
  * Implements the short-authentication-string verification flow over
- * olm-encrypted to-device messages, following the same wire formats and
- * crypto derivations as matrix-js-sdk / the Matrix spec (key agreement
- * "curve25519", MAC "hkdf-hmac-sha256", 7-emoji display). Two Grungus
- * devices verify each other's Ed25519 device keys; on success both mark
- * the other device trusted, replacing trust-on-first-use for verified
- * pairs.
+ * olm-encrypted to-device messages, interoperable with Element's rust
+ * crypto stack (matrix-sdk-crypto / vodozemac):
  *
- * Element Call / matrix-js-sdk interoperability is not claimed (modeled
- * on the same spec; untested against other implementations).
+ *   - key agreement: "curve25519-hkdf-sha256" (the only one current
+ *     Element offers; the legacy plain "curve25519" is still accepted
+ *     for older peers)
+ *   - MAC: "hkdf-hmac-sha256.v2" preferred (HMAC-SHA256 keyed by
+ *     HKDF(SAS secret, info) — vodozemac's calculate_mac), the
+ *     libolm-compat "hkdf-hmac-sha256" kept as a fallback
+ *   - SAS bytes: HKDF(SAS secret) with the pipe-separated info
+ *     "MATRIX_KEY_VERIFICATION_SAS|user|device|pubkey|user|device|
+ *     pubkey|flowId" (initiator's side first — MSC3783)
+ *   - MAC info: the legacy concatenated "MATRIX_KEY_VERIFICATION_MAC"
+ *     form (what the rust stack uses for both MAC generations)
+ *   - commitment: SHA-256(SAS pubkey || canonical JSON of the start
+ *     content), sent in the accept, verified by the initiator
+ *   - flow: request → ready (responder) → start (requester) → accept →
+ *     keys → MACs, on olm-encrypted to-device events
  */
 
 import type { E2eeCrypto } from "./e2ee.ts";
+import { canonicalJson } from "./cross-signing.ts";
 import { QrTransaction, type QrUiState } from "./qr-verify.ts";
 
 /** The spec's 64 SAS emoji, in index order. */
@@ -53,6 +63,7 @@ export function sasBytesToEmoji(bytes: Uint8Array): string[] {
 
 export type SasPhase =
   | "requested" /* request sent/received */
+  | "ready-sent" /* responder answered a request, waiting for their start */
   | "started" /* start/accept exchanged */
   | "keys-exchanged" /* SAS pubkeys exchanged */
   | "show-emoji" /* emoji ready for the user */
@@ -80,10 +91,38 @@ interface OlmSasApi {
   free(): void;
 }
 
-const KEY_AGREEMENT = "curve25519";
+/* The algorithms we support, in preference order (rust stack order). */
+const KEY_AGREEMENT_HKDF = "curve25519-hkdf-sha256";
+const KEY_AGREEMENT_LEGACY = "curve25519";
+const MAC_V2 = "hkdf-hmac-sha256.v2";
+const MAC_MSC3783 = "org.matrix.msc3783.hkdf-hmac-sha256";
+const MAC_V1 = "hkdf-hmac-sha256";
 const HASH = "sha256";
-const MAC_METHOD = "hkdf-hmac-sha256";
 const SAS_METHOD = "m.sas.v1";
+
+const ALL_MAC_METHODS = [MAC_V2, MAC_MSC3783, MAC_V1];
+const ALL_AGREEMENTS = [KEY_AGREEMENT_HKDF, KEY_AGREEMENT_LEGACY];
+const ALL_METHODS = [
+  SAS_METHOD,
+  "m.qr_code.show.v1",
+  "m.qr_code.scan.v1",
+  "m.reciprocate.v1",
+];
+
+function bytesToB64(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/=+$/, "");
+}
+
+function strToBytes(text: string): Uint8Array {
+  return new TextEncoder().encode(text);
+}
+
+async function sha256Bytes(data: Uint8Array): Promise<Uint8Array> {
+  const digest = await crypto.subtle.digest("SHA-256", data as BufferSource);
+  return new Uint8Array(digest);
+}
 
 /**
  * One SAS transaction between this device and one peer device.
@@ -103,12 +142,21 @@ export class SasTransaction {
   emoji: string[] = [];
   error: string | null = null;
 
+  /* negotiated protocol */
+  agreement: string = KEY_AGREEMENT_HKDF;
+  macMethod: string = MAC_V2;
+
   private _olmSas: OlmSasApi | null = null;
   private _gotTheirKey = false;
+  private _theirSasPubkey = "";
   private _macSent = false;
   /** their MAC arrived and verified — completes once ours is sent too */
   private _theirMacVerified = false;
   private _theirEd25519 = "";
+  /** initiator only: the accept's commitment, checked against their key */
+  private _theirCommitment: string | null = null;
+  /** initiator only: the start content we sent (for the commitment check) */
+  private _ourStartContent: Record<string, unknown> | null = null;
 
   onUi: ((state: SasUiState) => void) | null = null;
   /** Called when this transaction verifies the peer device. */
@@ -165,7 +213,7 @@ export class SasTransaction {
     this.onUi?.(this.uiState());
   }
 
-  /* ----------------------------- initiator ----------------------------- */
+  /* --------------------------- request / ready --------------------------- */
 
   /** Initiator: send the initial verification request. */
   async sendRequest(): Promise<void> {
@@ -173,15 +221,28 @@ export class SasTransaction {
     this._emit();
     await this.send("m.key.verification.request", {
       from_device: this.myDeviceId,
-      methods: [
-        SAS_METHOD,
-        "m.qr_code.show.v1",
-        "m.qr_code.scan.v1",
-        "m.reciprocate.v1",
-      ],
+      methods: ALL_METHODS,
       timestamp: Date.now(),
       to: this.peerUserId,
     });
+  }
+
+  /** Responder: accept the request — announce readiness; the REQUESTER
+   *  then starts the actual SAS exchange (the spec flow Element runs). */
+  async sendReady(): Promise<void> {
+    this.phase = "ready-sent";
+    this._emit();
+    await this.send("m.key.verification.ready", {
+      from_device: this.myDeviceId,
+      methods: ALL_METHODS,
+    });
+  }
+
+  /** Initiator: the responder is ready — begin the SAS exchange. */
+  async handleReady(): Promise<void> {
+    if (!this.initiatedByMe) return; /* stray ready — nothing to do */
+    if (this.phase !== "requested") return;
+    await this.sendStart();
   }
 
   /** Either side: cancel the transaction (works from ANY active phase —
@@ -198,49 +259,86 @@ export class SasTransaction {
     this._olmSas = null;
   }
 
-  /** Initiator: respond to the responder's m.key.verification.start. */
+  /* ------------------------------ start/accept ---------------------------- */
+
+  /** Initiator: send the start event with our offered algorithms. */
+  async sendStart(): Promise<void> {
+    this.phase = "requested";
+    /* the EXACT wire content — the accept's commitment hashes it */
+    const content: Record<string, unknown> = {
+      transaction_id: this.transactionId,
+      from_device: this.myDeviceId,
+      method: SAS_METHOD,
+      key_agreement_protocols: ALL_AGREEMENTS,
+      hashes: [HASH],
+      message_authentication_codes: ALL_MAC_METHODS,
+      short_authentication_string: ["decimal", "emoji"],
+    };
+    this._ourStartContent = content;
+    await this.send("m.key.verification.start", content);
+    this._emit();
+  }
+
+  /** Responder: negotiate + accept the initiator's start. */
   async handleStart(content: Record<string, unknown>): Promise<void> {
     const protocols = content.key_agreement_protocols;
     const macs = content.message_authentication_codes;
     const sasFormats = content.short_authentication_string;
-    if (
-      !Array.isArray(protocols) ||
-      !Array.isArray(macs) ||
-      !Array.isArray(sasFormats) ||
-      !protocols.includes(KEY_AGREEMENT) ||
-      !macs.includes(MAC_METHOD) ||
-      !sasFormats.includes("emoji")
-    ) {
+    if (!Array.isArray(protocols) || !Array.isArray(macs) || !Array.isArray(sasFormats)) {
       this._fail("unsupported verification algorithms");
       return;
     }
+    /* prefer the modern hkdf agreement; fall back to legacy curve25519
+       (Element only ever offers the hkdf one) */
+    const agreement = protocols.includes(KEY_AGREEMENT_HKDF)
+      ? KEY_AGREEMENT_HKDF
+      : protocols.includes(KEY_AGREEMENT_LEGACY)
+        ? KEY_AGREEMENT_LEGACY
+        : null;
+    const macMethod = ALL_MAC_METHODS.find((m) => macs.includes(m)) ?? null;
+    if (!agreement || !macMethod || !sasFormats.includes("emoji")) {
+      await this.send("m.key.verification.cancel", {
+        code: "m.unknown_method",
+        reason: "no common verification algorithms",
+      });
+      this._fail("unsupported verification algorithms");
+      return;
+    }
+    this.agreement = agreement;
+    this.macMethod = macMethod;
+    /* commitment: SHA-256(our SAS pubkey || canonical JSON of the start) */
+    const commitment = bytesToB64(
+      await sha256Bytes(
+        new Uint8Array([
+          ...strToBytes(this.olmSas.get_pubkey()),
+          ...strToBytes(canonicalJson(content)),
+        ])
+      )
+    );
     await this.send("m.key.verification.accept", {
-      key_agreement_protocol: KEY_AGREEMENT,
+      key_agreement_protocol: agreement,
       hash: HASH,
-      message_authentication_code: MAC_METHOD,
+      message_authentication_code: macMethod,
       short_authentication_string: ["emoji"],
+      commitment,
     });
     this.phase = "started";
     await this._sendKey();
     this._emit();
   }
 
-  /* ----------------------------- responder ----------------------------- */
-
-  /** Responder: reply to a request with a start event. */
-  async sendStart(): Promise<void> {
-    this.phase = "requested";
-    await this.send("m.key.verification.start", {
-      method: SAS_METHOD,
-      key_agreement_protocols: [KEY_AGREEMENT],
-      hashes: [HASH],
-      message_authentication_codes: [MAC_METHOD],
-      short_authentication_string: ["emoji"],
-    });
-    this._emit();
-  }
-
-  async handleAccept(_content: Record<string, unknown>): Promise<void> {
+  /** Initiator: the responder accepted — record the commitment and
+   *  exchange keys. */
+  async handleAccept(content: Record<string, unknown>): Promise<void> {
+    if (typeof content.commitment === "string") {
+      this._theirCommitment = content.commitment;
+    }
+    if (typeof content.key_agreement_protocol === "string") {
+      this.agreement = content.key_agreement_protocol;
+    }
+    if (typeof content.message_authentication_code === "string") {
+      this.macMethod = content.message_authentication_code;
+    }
     this.phase = "started";
     await this._sendKey();
     this._emit();
@@ -261,35 +359,99 @@ export class SasTransaction {
     }
     if (!this._gotTheirKey) {
       this._gotTheirKey = true;
+      this._theirSasPubkey = key;
       this.olmSas.set_their_key(key);
+      /* initiator: the accept's commitment must match this key + our
+         start (vodozemac checks this — so must we) */
+      if (this.initiatedByMe && this._theirCommitment && this._ourStartContent) {
+        const expected = bytesToB64(
+          await sha256Bytes(
+            new Uint8Array([
+              ...strToBytes(key),
+              ...strToBytes(canonicalJson(this._ourStartContent)),
+            ])
+          )
+        );
+        const norm = (s: string): string => s.replace(/=+$/, "");
+        if (norm(expected) !== norm(this._theirCommitment)) {
+          await this.send("m.key.verification.cancel", {
+            code: "m.key_mismatch",
+            reason: "SAS commitment mismatch",
+          });
+          this._fail("commitment mismatch — the accept was tampered with");
+          return;
+        }
+      }
     }
-    if (this._bothKeysReady()) {
-      this._computeEmoji();
-    }
+    this._computeEmoji();
   }
 
-  private _bothKeysReady(): boolean {
-    /* libolm's set_their_key guards; both sides always send their key, so
-       receiving one key while ours is implicit means we are ready. */
-    return this._gotTheirKey;
-  }
+  /* ----------------------------- SAS display ---------------------------- */
 
   private _computeEmoji(): void {
-    /* Info string per the "curve25519" key agreement: the INITIATOR's
-       user+device come first (matrix-js-sdk format). */
-    const myPart = `${this.myUserId}${this.myDeviceId}`;
-    const theirPart = `${this.peerUserId}${this.peerDeviceId}`;
-    const info =
-      "MATRIX_KEY_VERIFICATION_SAS" +
-      (this.initiatedByMe ? myPart + theirPart : theirPart + myPart) +
-      this.transactionId;
-    const bytes = this.olmSas.generate_bytes(info, 6);
-    this.emoji = sasBytesToEmoji(bytes);
+    if (!this._gotTheirKey) return;
+    const myPubkey = this.olmSas.get_pubkey();
+    if (this.agreement === KEY_AGREEMENT_HKDF) {
+      /* MSC3783: pipe-separated, both sides' SAS pubkeys included, the
+         initiator's ids first (vodozemac extra_info_sas) */
+      const mine = `${this.myUserId}|${this.myDeviceId}|${myPubkey}`;
+      const theirs = `${this.peerUserId}|${this.peerDeviceId}|${this._theirSasPubkey}`;
+      const [first, second] = this.initiatedByMe ? [mine, theirs] : [theirs, mine];
+      const info = `MATRIX_KEY_VERIFICATION_SAS|${first}|${second}|${this.transactionId}`;
+      this.emoji = sasBytesToEmoji(this.olmSas.generate_bytes(info, 6));
+    } else {
+      /* legacy plain curve25519: concatenated ids, initiator first */
+      const mine = `${this.myUserId}${this.myDeviceId}`;
+      const theirs = `${this.peerUserId}${this.peerDeviceId}`;
+      const info =
+        "MATRIX_KEY_VERIFICATION_SAS" +
+        (this.initiatedByMe ? mine + theirs : theirs + mine) +
+        this.transactionId;
+      this.emoji = sasBytesToEmoji(this.olmSas.generate_bytes(info, 6));
+    }
     this.phase = "show-emoji";
     this._emit();
   }
 
   /* ------------------------------ MAC phase ---------------------------- */
+
+  /**
+   * MAC for the negotiated method.
+   *
+   * v2 (vodozemac calculate_mac): HMAC-SHA256(key = HKDF(SAS secret,
+   * info), input) — libolm's generate_bytes IS that HKDF, so we derive
+   * the key with it and HMAC via WebCrypto.
+   *
+   * v1 (libolm compat): olm's own calculate_mac — with the historical
+   * buffer-reuse base64 quirk both libolm and vodozemac replicate.
+   */
+  private async _calculateMac(input: string, info: string): Promise<string> {
+    if (this.macMethod === MAC_V2 || this.macMethod === MAC_MSC3783) {
+      const macKey = this.olmSas.generate_bytes(info, 32);
+      const key = await crypto.subtle.importKey(
+        "raw",
+        macKey as BufferSource,
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+      );
+      const sig = await crypto.subtle.sign("HMAC", key, strToBytes(input) as BufferSource);
+      return bytesToB64(new Uint8Array(sig));
+    }
+    return this.olmSas.calculate_mac(input, info);
+  }
+
+  /** The MAC info: the rust stack keeps the legacy concatenated form. */
+  private _macInfo(firstUser: string, firstDevice: string, secondUser: string, secondDevice: string): string {
+    return (
+      "MATRIX_KEY_VERIFICATION_MAC" +
+      firstUser +
+      firstDevice +
+      secondUser +
+      secondDevice +
+      this.transactionId
+    );
+  }
 
   /**
    * Called when the user confirms the emoji match. Sends our MAC; the
@@ -300,18 +462,12 @@ export class SasTransaction {
     if (this.phase !== "show-emoji" && this.phase !== "mac-sent") return;
     if (!this._macSent) {
       this._macSent = true;
-      const baseInfo =
-        "MATRIX_KEY_VERIFICATION_MAC" +
-        this.myUserId +
-        this.myDeviceId +
-        this.peerUserId +
-        this.peerDeviceId +
-        this.transactionId;
+      const baseInfo = this._macInfo(this.myUserId, this.myDeviceId, this.peerUserId, this.peerDeviceId);
       const deviceKeyId = `ed25519:${this.myDeviceId}`;
       const mac: Record<string, string> = {
-        [deviceKeyId]: this.olmSas.calculate_mac(this.myEd25519, baseInfo + deviceKeyId),
+        [deviceKeyId]: await this._calculateMac(this.myEd25519, baseInfo + deviceKeyId),
       };
-      const keys = this.olmSas.calculate_mac(deviceKeyId, baseInfo + "KEY_IDS");
+      const keys = await this._calculateMac(deviceKeyId, baseInfo + "KEY_IDS");
       await this.send("m.key.verification.mac", { mac, keys });
       this.phase = "mac-sent";
       this._emit();
@@ -330,17 +486,11 @@ export class SasTransaction {
       return;
     }
 
-    const baseInfo =
-      "MATRIX_KEY_VERIFICATION_MAC" +
-      this.peerUserId +
-      this.peerDeviceId +
-      this.myUserId +
-      this.myDeviceId +
-      this.transactionId;
+    const baseInfo = this._macInfo(this.peerUserId, this.peerDeviceId, this.myUserId, this.myDeviceId);
 
     /* key IDs listed in the event must MAC correctly */
     const keyIds = Object.keys(mac).sort();
-    if (keys !== this.olmSas.calculate_mac(keyIds.join(","), baseInfo + "KEY_IDS")) {
+    if (keys !== (await this._calculateMac(keyIds.join(","), baseInfo + "KEY_IDS"))) {
       this._fail("MAC key list mismatch");
       return;
     }
@@ -361,7 +511,8 @@ export class SasTransaction {
       this._fail("device key not published on the server");
       return;
     }
-    if (this.olmSas.calculate_mac(theirEd25519, baseInfo + deviceKeyId) !== theirMac) {
+    const norm = (s: string): string => s.replace(/=+$/, "");
+    if (norm(await this._calculateMac(theirEd25519, baseInfo + deviceKeyId)) !== norm(theirMac)) {
       this._fail("MAC mismatch — the device key was not verified");
       return;
     }
@@ -370,7 +521,11 @@ export class SasTransaction {
        when BOTH sides have exchanged MACs — if we have not sent ours yet
        (the user has not confirmed the emoji), stay open so we still can */
     await this.crypto.markDeviceVerified(this.peerUserId, this.peerDeviceId, theirEd25519);
-    await this.send("m.key.verification.done", {});
+    /* NO done here: our user may not have confirmed yet. Sending done now
+       would complete the peer's request and tear down its flow BEFORE our
+       own MAC arrives — the peer would never mark us verified (observed
+       against matrix-rust-sdk: its request reaches Done on our done event).
+       done goes out in _complete(), once BOTH MACs are exchanged. */
     this._theirMacVerified = true;
     this._theirEd25519 = theirEd25519;
     if (this._macSent) {
@@ -387,6 +542,8 @@ export class SasTransaction {
     this.phase = "verified";
     this._emit();
     this.onVerified?.(this.peerUserId, this.peerDeviceId, this._theirEd25519);
+    /* the spec's done: sent once the verification has actually finished */
+    void this.send("m.key.verification.done", {}).catch(() => {});
     this._olmSas?.free();
     this._olmSas = null;
   }
@@ -560,6 +717,13 @@ export class VerificationManager {
       if (!fromDevice || this._transactions.has(transactionId)) return true;
       const txn = this._makeTxn(transactionId, false, sender, fromDevice);
       this.onIncoming?.(txn);
+      return true;
+    }
+
+    /* ready — the responder accepted; the REQUESTER now starts */
+    if (type === "m.key.verification.ready" || type === "m.verification.ready") {
+      const txn = this._transactions.get(transactionId);
+      if (txn) void txn.handleReady();
       return true;
     }
 

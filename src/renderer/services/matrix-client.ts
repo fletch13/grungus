@@ -1301,6 +1301,21 @@ export class MatrixClient {
             this._maybeHandleRtcKeyToDevice(event);
             continue;
           }
+          /* Element's rust stack sends verification REQUEST/READY/DONE/CANCEL
+             as PLAINTEXT to-device events (only start/accept/key/mac ride
+             olm) — surface those to the verification layer too */
+          if (
+            (event.type.startsWith("m.key.verification.") ||
+              event.type.startsWith("m.verification.")) &&
+            this.crypto
+          ) {
+            this.crypto.handlePlainToDevice(
+              event.sender ?? "",
+              event.type,
+              (event.content ?? {}) as Record<string, unknown>
+            );
+            continue;
+          }
           this.onToDevice?.(event);
         }
         if (this.crypto) {

@@ -163,6 +163,32 @@ for an open protocol.
   left-room ignore set keeps later syncs (which carry the leave event)
   from resurrecting the chat, rooms.leave sections from other devices
   delete locally too, and the open chat view clears when its room goes.
+- **Element-compatible device verification (SAS)** — verifying a device
+  against the Element client now works end-to-end. The SAS stack was
+  rewritten to matrix-rust-sdk/vodozemac's current algorithms: the
+  curve25519-hkdf-sha256 key agreement (the only one modern Element
+  offers; legacy plain curve25519 kept as a fallback), the
+  pipe-separated SAS info string with both sides' pubkeys
+  (MSC3783-style), the hkdf-hmac-sha256.v2 MAC (HMAC-SHA256 keyed by
+  HKDF of the SAS secret — vodozemac's calculate_mac, derived via
+  libolm's generate_bytes), the libolm-compat v1 MAC as a fallback,
+  and the SHA-256 commitment (computed in the accept, verified against
+  the accepter's pubkey by the initiator). The olm PDU now carries
+  the spec's sender/recipient/keys fields — rust rejects payloads
+  without them. Element sends verification request/ready/done/cancel
+  as PLAINTEXT to-device events (only the key/MAC exchange rides
+  olm); the sync layer now routes those to the verification layer.
+  The flow follows the spec: the responder answers with ready, the
+  REQUESTER sends start; the done event goes out only when the
+  transaction truly completes (both MACs) — sending it early completes
+  the peer's request before our MAC arrives and the flow dies
+  unverified (a real bug found against rust). The verify card's
+  Verify button dispatches the accept once; Compare emoji is UI-only.
+  Verified live against a headless real-Element stack
+  (matrix-js-sdk 33 + matrix-sdk-crypto-nodejs): Element requests →
+  Grungus accepts → identical emoji on both sides → both MACs →
+  rust marks the Grungus device locally VERIFIED
+  ({"verified":true,"local":true}), Grungus marks Element's.
 - **Element recovery restore** — the 🔑 Key backup card now accepts the
   recovery passphrase OR the base58 security key (olm format: 0x8B01
   prefix, XOR parity, groups of four) from accounts set up in Element.

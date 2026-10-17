@@ -583,6 +583,22 @@ export class E2eeCrypto {
   }
 
   /**
+   * A PLAINTEXT verification event arrived (Element's rust stack sends
+   * m.key.verification.request/ready/done/cancel unencrypted — only the
+   * key/MAC exchange rides olm). Route it to the payload listeners; the
+   * verification manager filters what it understands.
+   */
+  handlePlainToDevice(sender: string, type: string, content: Record<string, unknown>): void {
+    for (const listener of [...this._payloadListeners]) {
+      try {
+        listener(sender, type, content, undefined);
+      } catch (err) {
+        console.error("[e2ee] payload listener failed:", err);
+      }
+    }
+  }
+
+  /**
    * Send an olm-encrypted to-device message of an arbitrary type to one
    * device (MSC3401 call signaling in encrypted rooms uses this).
    */
@@ -597,7 +613,18 @@ export class E2eeCrypto {
     const session = await this.getOrCreateOlmSession(device, targetUserId);
     if (!session) throw new Error(`no olm session to ${targetUserId}/${targetDeviceId}`);
 
-    const payload = JSON.stringify({ type, content, sender: this.host.userId });
+    /* the olm v1 PDU per the spec: rust parsers (element's stack)
+       REQUIRE sender/recipient/keys fields — libolm only handles the
+       envelope, the plaintext payload is ours to shape */
+    const payload = JSON.stringify({
+      type,
+      content,
+      sender: this.host.userId,
+      sender_device: this.deviceId,
+      keys: { ed25519: this._ed25519 },
+      recipient: targetUserId,
+      recipient_keys: { ed25519: device.ed25519 },
+    });
     const encrypted = session.encrypt(payload);
     const messages: Record<string, Record<string, unknown>> = {
       [targetUserId]: {

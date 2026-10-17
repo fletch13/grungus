@@ -608,11 +608,13 @@ function startShell(): void {
         })();
       }
     };
-    /* the user accepted an incoming request (or re-verifies a card) */
+    /* the user accepted an incoming request (or re-verifies a card) —
+       the responder answers with ready; the REQUESTER then starts (the
+       flow Element's rust stack runs) */
     verifyView.addEventListener("grungus:accept-verify", (event) => {
       const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
       const txn = verification?.transactions.find((t) => t.transactionId === id);
-      if (txn) void txn.sendStart();
+      if (txn) void txn.sendReady();
     });
     verifyView.addEventListener("grungus:decline-verify", (event) => {
       const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
