@@ -95,8 +95,9 @@ test("QR payload: build/parse round-trip", () => {
   for (let i = 0; i < QR_SECRET_BYTES; i++) secret[i] = 0x40 + i;
   const bytes = buildQrPayload({
     transactionId: "gr-qr-txn-123",
-    ed25519B64: fakeKeyB64(1),
-    curve25519B64: fakeKeyB64(2),
+    mode: QR_MODE_DEVICE,
+    firstKeyB64: fakeKeyB64(1),
+    secondKeyB64: fakeKeyB64(2),
     secretBytes: secret,
   });
   const parsed = parseQrPayload(bytes);
@@ -116,8 +117,9 @@ test("QR payload: rejects tampered prefix, version, mode, and trailing bytes", (
   const secret = new Uint8Array(QR_SECRET_BYTES);
   const bytes = buildQrPayload({
     transactionId: "t",
-    ed25519B64: fakeKeyB64(1),
-    curve25519B64: fakeKeyB64(2),
+    mode: QR_MODE_DEVICE,
+    firstKeyB64: fakeKeyB64(1),
+    secondKeyB64: fakeKeyB64(2),
     secretBytes: secret,
   });
   assert.ok(parseQrPayload(bytes));
@@ -131,7 +133,7 @@ test("QR payload: rejects tampered prefix, version, mode, and trailing bytes", (
   assert.equal(parseQrPayload(badVersion), null, "wrong version rejected");
 
   const badMode = new Uint8Array(bytes);
-  badMode[7] = 0x00; /* Element's cross-signing mode — not supported yet */
+  badMode[7] = 0x04; /* unknown mode byte */
   assert.equal(parseQrPayload(badMode), null, "unsupported mode rejected");
 
   const trailing = new Uint8Array(bytes.length + 1);
@@ -148,8 +150,9 @@ test("QR payload: survives the full encode → render → decode camera path", (
   crypto.getRandomValues(secret);
   const bytes = buildQrPayload({
     transactionId: "gr-qr-camera-path-test-0001",
-    ed25519B64: fakeKeyB64(9),
-    curve25519B64: fakeKeyB64(13),
+    mode: QR_MODE_DEVICE,
+    firstKeyB64: fakeKeyB64(9),
+    secondKeyB64: fakeKeyB64(13),
     secretBytes: secret,
   });
 
@@ -221,7 +224,7 @@ test("QR: full shower/scanner handshake, mutual trust marking", async (t) => {
   /* A shows its QR */
   const qrA = a.manager.asQr(txnA.transactionId);
   assert.ok(qrA, "A creates its QR transaction");
-  const payload = qrA.showQrCode();
+  const payload = await qrA.showQrCode();
   assert.ok(payload.length > 0, "QR payload built");
 
   /* B scans A's QR (validated against the server directory) */
@@ -284,7 +287,7 @@ test("QR: tampered secret fails on the shower", async (t) => {
   );
 
   const qrA = a.manager.asQr(txnA.transactionId)!;
-  const payload = qrA.showQrCode();
+  const payload = await qrA.showQrCode();
 
   /* flip a secret byte in the scanned payload (a tampered/fake code) */
   const tampered = new Uint8Array(payload);
@@ -338,8 +341,9 @@ test("QR: a code from a different transaction is rejected by the scanner", async
   const strangerSecret = new Uint8Array(QR_SECRET_BYTES);
   const strangerBytes = buildQrPayload({
     transactionId: "gr-qr-some-other-transaction",
-    ed25519B64: a.crypto.ed25519Key,
-    curve25519B64: a.crypto.curve25519Key,
+    mode: QR_MODE_DEVICE,
+    firstKeyB64: a.crypto.ed25519Key,
+    secondKeyB64: a.crypto.curve25519Key,
     secretBytes: strangerSecret,
   });
 

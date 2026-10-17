@@ -524,7 +524,24 @@ function startShell(): void {
   if (cryptoLayer) {
     const crossSigning = new CrossSigning(cryptoLayer, active);
     verification = new VerificationManager(cryptoLayer);
+    verification.crossSigning = crossSigning;
     cryptoLayer.addPayloadListener((sender, type, content, senderKey) => {
+      /* SSSS secret sharing (spec "Secret sharing"): requests go to the
+         cross-signing service; secrets only flow to verified own devices */
+      if (type === "m.secret.request") {
+        const req = content as { name?: string; device_id?: string; request_id?: string };
+        if (req.name && req.device_id && req.request_id) {
+          void crossSigning.handleSecretRequest(sender, req.device_id, req.request_id, req.name);
+        }
+        return;
+      }
+      if (type === "m.secret.send") {
+        const send = content as { request_id?: string; secret?: string };
+        if (send.request_id && send.secret) {
+          void crossSigning.handleSecretSend(send.request_id, send.secret);
+        }
+        return;
+      }
       verification?.handlePayload(sender, type, content, senderKey);
     });
     /* incoming verification requests PROMPT — never auto-accept; the
@@ -553,6 +570,15 @@ function startShell(): void {
          trusts it too (verify once, trust everywhere) */
       if (peerUserId === active.userId) {
         void crossSigning.signDevice(peerDeviceId).catch(() => {});
+        /* SSSS: if we do NOT hold the private signing keys yet, ask the
+           just-verified device for them (the js-sdk
+           requestKeysDuringVerification flow) — this turns a new
+           device into a full signer */
+        void (async () => {
+          if (!(await crossSigning.canSign())) {
+            await crossSigning.requestCrossSigningKeys(peerUserId, peerDeviceId).catch(() => {});
+          }
+        })();
       }
     };
     /* the user accepted an incoming request (or re-verifies a card) */
@@ -573,9 +599,10 @@ function startShell(): void {
       if (txn) void txn.confirmEmojiMatch();
     });
     /* QR: shower renders its code, scanner opens camera/upload */
+    /* show-qr became async (cross-signing mode selection) */
     verifyView.addEventListener("grungus:show-qr", (event) => {
       const id = (event as CustomEvent<{ transactionId: string }>).detail.transactionId;
-      verification?.asQr(id)?.showQrCode();
+      void verification?.asQr(id)?.showQrCode();
       refreshVerify();
     });
     verifyView.addEventListener("grungus:scan-qr", (event) => {
@@ -599,13 +626,21 @@ function startShell(): void {
     });
     /* cross-signing bootstrap (UIA password prompt on the view) */
     verifyView.addEventListener("grungus:bootstrap-crosssigning", (event) => {
-      const detail = (event as CustomEvent<{ password: string }>).detail;
+      const detail = (event as CustomEvent<{
+        password: string;
+        recoveryPassphrase?: string;
+      }>).detail;
       void (async () => {
         try {
-          const res = await crossSigning.bootstrap(detail.password || undefined);
+          const res = await crossSigning.bootstrap(
+            detail.password || undefined,
+            detail.recoveryPassphrase || undefined
+          );
           verifyView.setBootstrapResult({
             ok: true,
-            message: `✅ Cross-signing ready — master key ${res.masterPub.slice(0, 12)}…`,
+            message:
+              `✅ Cross-signing ready — master key ${res.masterPub.slice(0, 12)}…` +
+              (res.ssssKeyId ? " · secret storage enabled" : ""),
           });
         } catch (err) {
           verifyView.setBootstrapResult({

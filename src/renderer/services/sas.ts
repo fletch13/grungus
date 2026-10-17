@@ -409,6 +409,8 @@ export class SasTransaction {
 export class VerificationManager {
   private readonly _transactions = new Map<string, SasTransaction>();
   private readonly _qrTransactions = new Map<string, QrTransaction>();
+  /** optional — injected by app.ts so QR transactions can use the Element modes */
+  crossSigning: import("./cross-signing.ts").CrossSigning | null = null;
   onUi: ((state: SasUiState) => void) | null = null;
   onQrUi: ((state: QrUiState) => void) | null = null;
   onIncoming: ((txn: SasTransaction) => void) | null = null;
@@ -448,6 +450,7 @@ export class VerificationManager {
       peerUserId: base.peerUserId,
       peerDeviceId: base.peerDeviceId,
       crypto: this._crypto,
+      crossSigning: this.crossSigning,
     });
     txn.onUi = (state) => this.onQrUi?.(state);
     txn.onVerified = (userId, deviceId, ed25519) => {

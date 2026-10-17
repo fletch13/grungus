@@ -114,6 +114,30 @@ for an open protocol.
   place with an "(edited)" marker instead of appending a new entry.
   Redactions remove their targets from the timeline (m.room.redaction,
   power-levels enforced server-side).
+- **SSSS secret storage + secret sharing** — private keys now travel.
+  Bootstrap takes an optional recovery passphrase: it derives a
+  m.secret_storage.v1.aes-hmac-sha2 key (PBKDF2-HMAC-SHA-512 500k
+  iterations, HKDF-SHA256 AES-CTR/HMAC-SHA256 split — js-sdk's exact
+  formats) and stores the three cross-signing seeds as ENCRYPTED
+  secrets at the spec's m.cross_signing.* account data; any device can
+  recover them with the passphrase alone. Verification also propagates
+  the keys LIVE: after an own-device verification, a device without
+  signing keys requests them from the just-verified device
+  (m.secret.request / m.secret.send over olm, only to verified own
+  devices) and becomes a full signer — Element's
+  requestKeysDuringVerification flow.
+- **Element QR interop modes** — the QR payload now uses Element's
+  cross-signing modes when bootstrapped: 0x01 (self, we trust our MSK:
+  firstKey = my MSK, secondKey = peer device key), 0x02 (self, new
+  device: firstKey = my device key, secondKey = my MSK claim — the
+  scanner validates the MSK claim and, as the OLD device, signs the
+  new device with the SSK: the Element self-verification flow), 0x00
+  (cross-user: MSKs both ways, USK signing on completion). Mode 0x03
+  (device-key only) remains as the pre-cross-signing fallback. Public
+  key objects moved to namespaced com.grungus.cross_signing.* account
+  data (the spec's m.cross_signing.* names hold the encrypted seeds,
+  as in Element — a collision my earlier workaround would have
+  caused).
 - **Cross-signing** — the Matrix trust hierarchy: a master key (MSK)
   signs a self-signing key (SSK) and a user-signing key (USK); the SSK
   signs your own device keys. "Set up cross-signing" in the 🛡 overlay

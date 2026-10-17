@@ -39,10 +39,22 @@
 
 import type { E2eeCrypto } from "./e2ee.ts";
 import type { MatrixClient } from "./matrix-client.ts";
+import { SecretStorage } from "./ssss.ts";
 
 export const CS_MASTER = "m.cross_signing.master";
 export const CS_SELF_SIGNING = "m.cross_signing.self_signing";
 export const CS_USER_SIGNING = "m.cross_signing.user_signing";
+
+/**
+ * Public key objects under these namespaced account data types (NOT the
+ * spec's m.cross_signing.* names — those hold the ENCRYPTED PRIVATE
+ * seeds in SSSS, per the spec and Element; the public keys are normally
+ * distributed via /keys/query, which this conduwuit build does not
+ * serve, so Grungus parks public copies here for own devices).
+ */
+export const CS_PUBLIC_MASTER = "com.grungus.cross_signing.master";
+export const CS_PUBLIC_SELF_SIGNING = "com.grungus.cross_signing.self_signing";
+export const CS_PUBLIC_USER_SIGNING = "com.grungus.cross_signing.user_signing";
 
 export interface CrossSigningKey {
   user_id: string;
@@ -116,12 +128,19 @@ export class CrossSigning {
    * Bootstrap cross-signing for this account: generate the three
    * Ed25519 keypairs, sign SSK + USK with the MSK, sign the MSK with
    * the device key, publish everything, and sign our own device with
-   * the SSK. authPassword satisfies the homeserver's UIA (m.login
-   * password) when required — used once, never stored.
+   * the SSK. authPassword satisfies the homeserver's UIA; when a
+   * recoveryPassphrase is given, the private seeds are ALSO stored as
+   * SSSS secrets (spec m.cross_signing.* account data, encrypted with a
+   * new m.secret_storage.v1.aes-hmac-sha2 key) so any device can
+   * recover them with the recovery passphrase.
    */
-  async bootstrap(authPassword?: string): Promise<{
+  async bootstrap(
+    authPassword?: string,
+    recoveryPassphrase?: string
+  ): Promise<{
     masterPub: string;
     uiaRequired: boolean;
+    ssssKeyId: string | null;
   }> {
     const olm = this.crypto.olmModule;
     if (!olm) throw new Error("crypto not initialised");
@@ -163,11 +182,30 @@ export class CrossSigning {
       authPassword
     );
 
-    /* account data copies (own-device distribution on servers that do
-       not serve cross-signing keys via /keys/query) */
-    await this.client.setAccountData(CS_MASTER, keys.master!);
-    await this.client.setAccountData(CS_SELF_SIGNING, keys.self_signing!);
-    await this.client.setAccountData(CS_USER_SIGNING, keys.user_signing!);
+    /* account data copies of the PUBLIC key objects (namespaced — the
+       spec's m.cross_signing.* names hold the encrypted private seeds;
+       own devices fetch public copies from here since this homeserver
+       does not serve cross-signing keys via /keys/query) */
+    await this.client.setAccountData(CS_PUBLIC_MASTER, keys.master!);
+    await this.client.setAccountData(CS_PUBLIC_SELF_SIGNING, keys.self_signing!);
+    await this.client.setAccountData(CS_PUBLIC_USER_SIGNING, keys.user_signing!);
+
+    /* SSSS: store the private seeds encrypted with a new storage key
+       derived from the recovery passphrase (Element-compatible
+       account data at the spec's m.cross_signing.* names) */
+    let ssssKeyId: string | null = null;
+    if (recoveryPassphrase) {
+      const ssss = new SecretStorage(this.client);
+      ssssKeyId = await ssss.createKey(recoveryPassphrase);
+      const b64 = (bytes: Uint8Array): string => {
+        let bin = "";
+        for (const b of bytes) bin += String.fromCharCode(b);
+        return btoa(bin);
+      };
+      await ssss.storeSecret(CS_MASTER, b64(privates.master!));
+      await ssss.storeSecret(CS_SELF_SIGNING, b64(privates.self_signing!));
+      await ssss.storeSecret(CS_USER_SIGNING, b64(privates.user_signing!));
+    }
 
     /* store the private seeds (this device can sign) */
     const b64 = (bytes: Uint8Array): string => {
@@ -186,7 +224,7 @@ export class CrossSigning {
     this._loaded = true;
 
     for (const pk of Object.values(signings)) pk.free();
-    return { masterPub, uiaRequired: false };
+    return { masterPub, uiaRequired: false, ssssKeyId };
   }
 
   /** Sign a message with this device's Ed25519 key (olm account). */
@@ -211,19 +249,154 @@ export class CrossSigning {
   /** Load own cross-signing key objects from account data (sync). */
   async loadKeys(): Promise<void> {
     if (this._loaded) return;
-    const master = this.client.getAccountData(CS_MASTER) as CrossSigningKey | null;
-    const ssk = this.client.getAccountData(CS_SELF_SIGNING) as CrossSigningKey | null;
-    const usk = this.client.getAccountData(CS_USER_SIGNING) as CrossSigningKey | null;
+    const master = this.client.getAccountData(CS_PUBLIC_MASTER) as CrossSigningKey | null;
+    const ssk = this.client.getAccountData(CS_PUBLIC_SELF_SIGNING) as CrossSigningKey | null;
+    const usk = this.client.getAccountData(CS_PUBLIC_USER_SIGNING) as CrossSigningKey | null;
     if (master && ssk && usk) {
       this._keyInfo = { master, self_signing: ssk, user_signing: usk };
       this._loaded = true;
     }
   }
 
+  /**
+   * Recover the private seeds from SSSS with the recovery passphrase
+   * (the spec's m.cross_signing.* encrypted secrets). After this, THIS
+   * device can sign — no other device needed.
+   */
+  async recoverWithPassphrase(passphrase: string): Promise<boolean> {
+    const ssss = new SecretStorage(this.client);
+    const keyId = await ssss.deriveFromPassphrase(passphrase);
+    if (!keyId) return false;
+    const master = await ssss.getSecret(CS_MASTER);
+    const ssk = await ssss.getSecret(CS_SELF_SIGNING);
+    const usk = await ssss.getSecret(CS_USER_SIGNING);
+    if (!master || !ssk || !usk) return false;
+    await this.crypto.store.put("cs:master", master);
+    await this.crypto.store.put("cs:self_signing", ssk);
+    await this.crypto.store.put("cs:user_signing", usk);
+    return true;
+  }
+
+  /* --------------------------- secret sharing -------------------------- */
+
+  /**
+   * NEW device: ask a verified own device for the cross-signing
+   * private seeds (m.secret.request, olm-encrypted). The seeds arrive
+   * via m.secret.send and land in our store — this device can sign.
+   */
+  async requestCrossSigningKeys(
+    peerUserId: string,
+    peerDeviceId: string
+  ): Promise<void> {
+    for (const type of [CS_MASTER, CS_SELF_SIGNING, CS_USER_SIGNING]) {
+      const requestId = `sreq-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+      const keyType = type === CS_MASTER
+        ? "master"
+        : type === CS_SELF_SIGNING
+          ? "self_signing"
+          : "user_signing";
+      this._pendingSecretRequests.set(requestId, keyType);
+      await this.crypto.sendToDeviceEncrypted(
+        peerUserId,
+        peerDeviceId,
+        "m.secret.request",
+        {
+          name: type,
+          device_id: this.crypto.deviceId,
+          request_id: requestId,
+        }
+      );
+    }
+  }
+
+  /** request_id -> key type, for routing incoming m.secret.send. */
+  private readonly _pendingSecretRequests = new Map<string, string>();
+
+  /**
+   * OLD device: an m.secret.request arrived from another device of
+   * ours. Secrets go ONLY to devices we have verified (locally or via
+   * the cross-signing chain) — never to strangers. Returns true when
+   * the request was handled.
+   */
+  async handleSecretRequest(
+    requesterUserId: string,
+    requesterDeviceId: string,
+    requestId: string,
+    secretName: string
+  ): Promise<boolean> {
+    const ownUserId = this.client.userId ?? "";
+    if (requesterUserId !== ownUserId) return false; /* own devices only */
+    if (requesterDeviceId === this.crypto.deviceId) return false;
+    if (![CS_MASTER, CS_SELF_SIGNING, CS_USER_SIGNING].includes(secretName)) return false;
+    const type = secretName === CS_MASTER
+      ? "master"
+      : secretName === CS_SELF_SIGNING
+        ? "self_signing"
+        : "user_signing";
+    const seed = await this._seed(type);
+    if (!seed) return false; /* we do not hold the private keys */
+    const verified = await this.isOwnDeviceTrusted(requesterDeviceId);
+    if (!verified) {
+      console.warn("[grungus] secret request from an unverified own device — refusing");
+      return true;
+    }
+    let bin = "";
+    for (const b of seed) bin += String.fromCharCode(b);
+    await this.crypto.sendToDeviceEncrypted(
+      requesterUserId,
+      requesterDeviceId,
+      "m.secret.send",
+      {
+        request_id: requestId,
+        secret: btoa(bin),
+      }
+    );
+    return true;
+  }
+
+  /**
+   * NEW device: an m.secret.send arrived — store the seed. Returns the
+   * key type when it was one of ours.
+   */
+  async handleSecretSend(requestId: string, secretB64: string): Promise<string | null> {
+    const pending = this._pendingSecretRequests.get(requestId);
+    if (!pending) return null;
+    this._pendingSecretRequests.delete(requestId);
+    await this.crypto.store.put(`cs:${pending}`, secretB64);
+    return pending;
+  }
+
   /** Public master key of this account (null when not bootstrapped). */
   async masterPub(): Promise<string | null> {
     await this.loadKeys();
     return this._keyInfo.master ? pubFromKeyInfo(this._keyInfo.master) : null;
+  }
+
+  /**
+   * Another user's public master key — servers distribute these via
+   * /keys/query (as ed25519-only pseudo-device entries). Returns null
+   * when the server does not serve them (this conduwuit build) or the
+   * user has no cross-signing.
+   */
+  async getRemoteMasterPub(userId: string): Promise<string | null> {
+    if (userId === (this.client.userId ?? "")) return this.masterPub();
+    const raw = await this.crypto.getRawDeviceKeys(userId);
+    /* the MSK pseudo-entry has only an ed25519 key keyed by its own
+       pub — getRawDeviceKeys filters those out, so query directly */
+    const res = await this.client.api<{
+      device_keys?: Record<string, Record<string, { keys?: Record<string, string> } | undefined>>;
+    }>("POST", "/_matrix/client/v3/keys/query", {
+      body: { device_keys: { [userId]: [] } },
+    });
+    const entries = res.device_keys?.[userId] ?? {};
+    for (const [id, entry] of Object.entries(entries)) {
+      const keys = entry?.keys ?? {};
+      const ed = keys[`ed25519:${id}`];
+      /* ed25519-only entry whose key id equals the pub key itself */
+      if (ed && ed === id && !keys[`curve25519:${id}`]) return ed;
+    }
+    void raw;
+    return null;
   }
 
   /** Get the stored private seed for a key type (this device bootstrapped). */
@@ -285,6 +458,18 @@ export class CrossSigning {
     } finally {
       pk.free();
     }
+  }
+
+  /**
+   * Sign another user's master key (given as a pub key string) with our
+   * user-signing key and upload — the cross-user verification step.
+   */
+  async signUserMasterKeyPub(otherUserId: string, otherMasterPub: string): Promise<boolean> {
+    return this.signUserMasterKey(otherUserId, {
+      user_id: otherUserId,
+      usage: ["master"],
+      keys: { ["ed25519:" + otherMasterPub]: otherMasterPub },
+    });
   }
 
   /**

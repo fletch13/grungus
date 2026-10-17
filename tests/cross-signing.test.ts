@@ -97,9 +97,9 @@ test("bootstrap publishes the key hierarchy and signs our own device", async (t)
   assert.ok(res.masterPub.length > 20, "master public key returned");
 
   /* the three key objects are in the account data (server-side) */
-  const acctMaster = hs.accountData.get("csuser1")?.get("m.cross_signing.master");
-  const acctSsk = hs.accountData.get("csuser1")?.get("m.cross_signing.self_signing");
-  const acctUsk = hs.accountData.get("csuser1")?.get("m.cross_signing.user_signing");
+  const acctMaster = hs.accountData.get("csuser1")?.get("com.grungus.cross_signing.master");
+  const acctSsk = hs.accountData.get("csuser1")?.get("com.grungus.cross_signing.self_signing");
+  const acctUsk = hs.accountData.get("csuser1")?.get("com.grungus.cross_signing.user_signing");
   assert.ok(acctMaster, "master key in account data");
   assert.ok(acctSsk, "self-signing key in account data");
   assert.ok(acctUsk, "user-signing key in account data");
@@ -193,7 +193,7 @@ test("trust propagation: verify one device, all trusting devices follow", async 
 
   /* B picks up the account data via sync */
   await waitFor(
-    () => b.client.getAccountData("m.cross_signing.master") !== null,
+    () => b.client.getAccountData("com.grungus.cross_signing.master") !== null,
     5_000,
     "B receives the cross-signing account data"
   );
@@ -251,7 +251,7 @@ test("an unsigned own device is not trusted via the chain", async (t) => {
   t.after(() => x.client.stopSync());
 
   await waitFor(
-    () => d.client.getAccountData("m.cross_signing.master") !== null,
+    () => d.client.getAccountData("com.grungus.cross_signing.master") !== null,
     5_000,
     "D receives the account data"
   );

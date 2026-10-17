@@ -159,12 +159,23 @@ export class VerifyView extends HTMLElement {
     pw.type = "password";
     pw.placeholder = "account password";
     pw.className = "cs-password-input";
+    const rpLabel = el("div", {
+      class: "verify-phase",
+      text: "Choose a recovery passphrase — it encrypts the private keys in secret storage so any device can recover them (never stored, not sent anywhere):",
+    });
+    const rp = document.createElement("input");
+    rp.type = "password";
+    rp.placeholder = "recovery passphrase (optional but recommended)";
+    rp.className = "cs-recovery-input";
     const status = el("div", { class: "verify-phase" });
     const go = el("button", { class: "call-btn", text: "Create keys" }) as HTMLButtonElement;
     go.addEventListener("click", () => {
       go.disabled = true;
       status.textContent = "Publishing cross-signing keys…";
-      this._dispatch("grungus:bootstrap-crosssigning", { password: pw.value });
+      this._dispatch("grungus:bootstrap-crosssigning", {
+        password: pw.value,
+        recoveryPassphrase: rp.value,
+      });
     });
     const cancel = el("button", { class: "call-btn danger", text: "Cancel" });
     cancel.addEventListener("click", () => {
@@ -175,6 +186,8 @@ export class VerifyView extends HTMLElement {
     buttons.appendChild(cancel);
     card.appendChild(pwLabel);
     card.appendChild(pw);
+    card.appendChild(rpLabel);
+    card.appendChild(rp);
     card.appendChild(buttons);
     card.appendChild(status);
     this.appendChild(card);

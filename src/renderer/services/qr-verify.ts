@@ -40,10 +40,17 @@
  */
 
 import type { E2eeCrypto } from "./e2ee.ts";
+import type { CrossSigning } from "./cross-signing.ts";
 
 export const QR_PREFIX = "MATRIX";
 export const QR_VERSION = 0x02;
-/** Grungus extension mode: device-key verification (no cross-signing yet). */
+/** Element mode: verifying ANOTHER user (firstKey = my MSK, secondKey = their MSK). */
+export const QR_MODE_VERIFY_OTHER_USER = 0x00;
+/** Element mode: self-verification, WE TRUST our master key (firstKey = my MSK, secondKey = peer device key). */
+export const QR_MODE_VERIFY_SELF_TRUSTED = 0x01;
+/** Element mode: self-verification, we do NOT trust our master key (firstKey = my device key, secondKey = my MSK). */
+export const QR_MODE_VERIFY_SELF_UNTRUSTED = 0x02;
+/** Grungus legacy mode: device-key verification without cross-signing. */
 export const QR_MODE_DEVICE = 0x03;
 /** Shared secret length in bytes (as in matrix-js-sdk: 11 bytes). */
 export const QR_SECRET_BYTES = 11;
@@ -52,9 +59,9 @@ export interface QrPayload {
   version: number;
   mode: number;
   transactionId: string;
-  /** shower's Ed25519 device key, unpadded base64 */
+  /** first key per mode (unpadded base64): MSK (0x00/0x01) or device ed25519 (0x02/0x03) */
   firstKeyB64: string;
-  /** shower's Curve25519 device key, unpadded base64 */
+  /** second key per mode: their MSK (0x00), peer device key (0x01), my MSK (0x02), my curve25519 (0x03) */
   secondKeyB64: string;
   /** shared secret, unpadded base64 */
   secretB64: string;
@@ -79,20 +86,21 @@ function bytesToUnpaddedB64(bytes: Uint8Array): string {
 /* ------------------------- payload build / parse ----------------------- */
 
 /**
- * Build the binary QR payload. Keys and secret are given as unpadded
- * base64 strings (the format Matrix device keys use on the wire) and
- * are embedded as RAW decoded bytes, mirroring matrix-js-sdk's
- * QRCodeData.generateBuffer.
+ * Build the binary QR payload. Keys are given as unpadded base64
+ * strings and embedded as RAW decoded bytes, mirroring
+ * matrix-js-sdk's QRCodeData.generateBuffer. The mode selects the
+ * key semantics (Element modes 0x00-0x02 or the Grungus 0x03 fallback).
  */
 export function buildQrPayload(options: {
   transactionId: string;
-  ed25519B64: string;
-  curve25519B64: string;
+  mode: number;
+  firstKeyB64: string;
+  secondKeyB64: string;
   secretBytes: Uint8Array;
 }): Uint8Array {
   const txnBytes = new TextEncoder().encode(options.transactionId);
-  const first = b64ToBytes(options.ed25519B64);
-  const second = b64ToBytes(options.curve25519B64);
+  const first = b64ToBytes(options.firstKeyB64);
+  const second = b64ToBytes(options.secondKeyB64);
   const parts: number[] = [];
   const pushByte = (b: number): void => {
     parts.push(b & 0xff);
@@ -103,7 +111,7 @@ export function buildQrPayload(options: {
   };
   for (const ch of QR_PREFIX) pushByte(ch.charCodeAt(0));
   pushByte(QR_VERSION);
-  pushByte(QR_MODE_DEVICE);
+  pushByte(options.mode);
   pushU16(txnBytes.length);
   for (const b of txnBytes) pushByte(b);
   for (const b of first) pushByte(b);
@@ -131,7 +139,14 @@ export function parseQrPayload(bytes: Uint8Array): QrPayload | null {
     const version = readByte();
     if (version !== QR_VERSION) return null;
     const mode = readByte();
-    if (mode !== QR_MODE_DEVICE) return null;
+    if (
+      mode !== QR_MODE_VERIFY_OTHER_USER &&
+      mode !== QR_MODE_VERIFY_SELF_TRUSTED &&
+      mode !== QR_MODE_VERIFY_SELF_UNTRUSTED &&
+      mode !== QR_MODE_DEVICE
+    ) {
+      return null;
+    }
     const len = (readByte() << 8) | readByte();
     const txnBytes = bytes.slice(i, i + len);
     if (txnBytes.length !== len) return null;
@@ -220,6 +235,8 @@ export class QrTransaction {
     peerUserId: string;
     peerDeviceId: string;
     crypto: E2eeCrypto;
+    /** optional — enables the Element cross-signing QR modes */
+    crossSigning?: CrossSigning | null;
   }) {
     this.transactionId = options.transactionId;
     this.initiatedByMe = options.initiatedByMe;
@@ -228,7 +245,12 @@ export class QrTransaction {
     this.peerUserId = options.peerUserId;
     this.peerDeviceId = options.peerDeviceId;
     this.crypto = options.crypto;
+    this._crossSigning = options.crossSigning ?? null;
   }
+
+  private readonly _crossSigning: CrossSigning | null = null;
+  /** the mode this transaction showed/scanned (payload bookkeeping) */
+  private _mode: number = QR_MODE_DEVICE;
 
   uiState(): QrUiState {
     return {
@@ -275,16 +297,62 @@ export class QrTransaction {
 
   /**
    * Generate the QR this device should display. Returns the payload
-   * bytes; the UI renders them with the qrcode library.
+   * bytes; the UI renders them with the qrcode library. With
+   * cross-signing bootstrapped the Element modes are used (0x01/0x02
+   * for self-verification, 0x00 cross-user); without it the Grungus
+   * device-key mode 0x03 (back-compat).
    */
-  showQrCode(): Uint8Array {
+  async showQrCode(): Promise<Uint8Array> {
     const secret = new Uint8Array(QR_SECRET_BYTES);
     crypto.getRandomValues(secret);
     this._secretBytes = secret;
+
+    let mode = QR_MODE_DEVICE;
+    let firstKey = this.crypto.ed25519Key;
+    let secondKey = this.crypto.curve25519Key;
+    const cs = this._crossSigning;
+    if (cs) {
+      const msk = await cs.masterPub();
+      const selfVerify = this.peerUserId === this.myUserId;
+      if (msk) {
+        if (selfVerify) {
+          const canSign = await cs.canSign();
+          if (canSign) {
+            /* we trust our master key (we hold it): mode 0x01 —
+               my MSK + the peer device's key */
+            mode = QR_MODE_VERIFY_SELF_TRUSTED;
+            firstKey = msk;
+            secondKey =
+              (await this.crypto.getDeviceEd25519(this.peerUserId, this.peerDeviceId)) ?? "";
+          } else {
+            /* we do not trust our master key yet: mode 0x02 —
+               our device key + our MSK claim */
+            mode = QR_MODE_VERIFY_SELF_UNTRUSTED;
+            firstKey = this.crypto.ed25519Key;
+            secondKey = msk;
+          }
+        } else {
+          /* cross-user: mode 0x00 — my MSK + their MSK (their MSK is
+             not always fetchable — servers distribute it via
+             /keys/query; fall back to 0x03 when unknown) */
+          const theirMsk = await cs.getRemoteMasterPub(this.peerUserId);
+          if (theirMsk) {
+            mode = QR_MODE_VERIFY_OTHER_USER;
+            firstKey = msk;
+            secondKey = theirMsk;
+          }
+        }
+      }
+    }
+    if (!firstKey || !secondKey) {
+      throw new Error("cannot build QR payload: missing keys");
+    }
+    this._mode = mode;
     this._qrBytes = buildQrPayload({
       transactionId: this.transactionId,
-      ed25519B64: this.crypto.ed25519Key,
-      curve25519B64: this.crypto.curve25519Key,
+      mode,
+      firstKeyB64: firstKey,
+      secondKeyB64: secondKey,
       secretBytes: secret,
     });
     this.phase = "show-qr";
@@ -406,7 +474,14 @@ export class QrTransaction {
   /**
    * Scanner: a QR was decoded (camera frame or uploaded image).
    * Validates the payload against the pending transaction and the
-   * server-published device keys, then sends the reciprocate start.
+   * server-published keys — per MODE:
+   *   0x03 (device):      both keys are the shower's device keys
+   *   0x01 (self,        firstKey = shower's MSK (checked against our
+   *      trusted):        own account data), secondKey = shower's device key
+   *   0x02 (self,        firstKey = shower's device key, secondKey = the
+   *      untrusted):     shower's MSK claim (must match OUR own MSK)
+   *   0x00 (other user): firstKey = their MSK, secondKey = OUR MSK
+   * then sends the reciprocate start.
    */
   async scanQrCode(payloadBytes: Uint8Array): Promise<void> {
     const payload = parseQrPayload(payloadBytes);
@@ -418,26 +493,79 @@ export class QrTransaction {
       this._fail("QR belongs to a different verification");
       return;
     }
-    /* the keys in the QR must match the server-published keys of the
-       peer device (substitution check) */
-    const theirEd25519 = await this.crypto.getDeviceEd25519(
-      this.peerUserId,
-      this.peerDeviceId
-    );
-    if (!theirEd25519 || theirEd25519 !== payload.firstKeyB64) {
-      this._fail("QR device key does not match the server");
+    this._mode = payload.mode;
+    const myMsk = this._crossSigning ? await this._crossSigning.masterPub() : null;
+
+    let showerDeviceEd: string | null = null;
+    let showerCurve: string | null = null;
+    let showerMskClaim: string | null = null;
+
+    if (payload.mode === QR_MODE_DEVICE) {
+      showerDeviceEd =
+        (await this.crypto.getDeviceEd25519(this.peerUserId, this.peerDeviceId)) ?? null;
+      if (!showerDeviceEd || showerDeviceEd !== payload.firstKeyB64) {
+        this._fail("QR device key does not match the server");
+        return;
+      }
+      showerCurve =
+        (await this.crypto.getDeviceCurve25519(this.peerUserId, this.peerDeviceId)) ?? null;
+      if (!showerCurve || showerCurve !== payload.secondKeyB64) {
+        this._fail("QR identity key does not match the server");
+        return;
+      }
+    } else if (payload.mode === QR_MODE_VERIFY_SELF_TRUSTED) {
+      /* shower = the OLD trusted device; we are the new device */
+      const ownMsk = myMsk;
+      if (!ownMsk || ownMsk !== payload.firstKeyB64) {
+        this._fail("QR master key does not match this account's");
+        return;
+      }
+      showerDeviceEd =
+        (await this.crypto.getDeviceEd25519(this.peerUserId, this.peerDeviceId)) ?? null;
+      if (!showerDeviceEd || showerDeviceEd !== payload.secondKeyB64) {
+        this._fail("QR device key does not match the server");
+        return;
+      }
+      showerCurve =
+        (await this.crypto.getDeviceCurve25519(this.peerUserId, this.peerDeviceId)) ?? null;
+      showerMskClaim = payload.firstKeyB64;
+    } else if (payload.mode === QR_MODE_VERIFY_SELF_UNTRUSTED) {
+      /* shower = the NEW device; we are the old trusted one */
+      showerDeviceEd =
+        (await this.crypto.getDeviceEd25519(this.peerUserId, this.peerDeviceId)) ?? null;
+      if (!showerDeviceEd || showerDeviceEd !== payload.firstKeyB64) {
+        this._fail("QR device key does not match the server");
+        return;
+      }
+      showerCurve =
+        (await this.crypto.getDeviceCurve25519(this.peerUserId, this.peerDeviceId)) ?? null;
+      /* the new device claims OUR master key — it must match exactly */
+      if (!myMsk || myMsk !== payload.secondKeyB64) {
+        this._fail("QR claims a different master key for this account");
+        return;
+      }
+      showerMskClaim = payload.secondKeyB64;
+    } else if (payload.mode === QR_MODE_VERIFY_OTHER_USER) {
+      /* cross-user: firstKey = their MSK, secondKey = OUR MSK */
+      if (!myMsk || myMsk !== payload.secondKeyB64) {
+        this._fail("QR master key does not match this account's");
+        return;
+      }
+      showerMskClaim = payload.firstKeyB64;
+      /* their device key is not in the QR — device trust goes through
+         the MSK/SSK chain (server-dependent) */
+      showerDeviceEd =
+        (await this.crypto.getDeviceEd25519(this.peerUserId, this.peerDeviceId)) ?? null;
+      showerCurve =
+        (await this.crypto.getDeviceCurve25519(this.peerUserId, this.peerDeviceId)) ?? null;
+    } else {
+      this._fail("unsupported QR mode");
       return;
     }
-    const theirCurve25519 = await this.crypto.getDeviceCurve25519(
-      this.peerUserId,
-      this.peerDeviceId
-    );
-    if (!theirCurve25519 || theirCurve25519 !== payload.secondKeyB64) {
-      this._fail("QR identity key does not match the server");
-      return;
-    }
-    this._theirEd25519 = theirEd25519;
-    this._showerKeysFromQr = { curve25519: payload.secondKeyB64 };
+
+    this._theirEd25519 = showerDeviceEd ?? "";
+    this._showerKeysFromQr = { curve25519: showerCurve ?? "" };
+    this._showerMskFromQr = showerMskClaim;
     /* the scanner adopts the secret from the QR — both sides MAC with it */
     this._secretBytes = b64ToBytes(payload.secretB64);
 
@@ -454,6 +582,8 @@ export class QrTransaction {
   }
 
   private _showerKeysFromQr: { curve25519: string } | null = null;
+  /** the MSK the QR carried (cross-signing modes) */
+  private _showerMskFromQr: string | null = null;
 
   /* ------------------------------- done -------------------------------- */
 
@@ -471,6 +601,7 @@ export class QrTransaction {
       if (
         senderKey &&
         this._showerKeysFromQr &&
+        this._showerKeysFromQr.curve25519 &&
         senderKey !== this._showerKeysFromQr.curve25519
       ) {
         this._fail("confirmation came from a different device than the QR");
@@ -481,6 +612,21 @@ export class QrTransaction {
         this.peerDeviceId,
         this._theirEd25519
       );
+      /* cross-signing propagation per mode:
+         - 0x02 (we are the OLD trusted device scanning the new one):
+           sign the new device's key with our SSK — every device that
+           trusts our MSK now trusts it (the Element flow)
+         - 0x00 (cross-user): sign their MSK with our USK
+         - 0x01 (we are the new device): our SSK signing is not ours to
+           do — the SHOWER (old device) signs us via its onVerified
+           hook; here we just recorded its device + MSK trust above */
+      if (this._crossSigning && this._mode === QR_MODE_VERIFY_SELF_UNTRUSTED) {
+        await this._crossSigning.signDevice(this.peerDeviceId).catch(() => {});
+      } else if (this._crossSigning && this._mode === QR_MODE_VERIFY_OTHER_USER && this._showerMskFromQr) {
+        await this._crossSigning
+          .signUserMasterKeyPub(this.peerUserId, this._showerMskFromQr)
+          .catch(() => {});
+      }
       await this.send("m.key.verification.done", {});
       this._complete();
       return;
