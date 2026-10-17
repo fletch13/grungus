@@ -30,6 +30,15 @@ import type { MatrixClient, Room, ToDeviceEvent } from "./matrix-client.ts";
 import { mxidLocalpart } from "./matrix-client.ts";
 import type { E2eeCrypto } from "./e2ee.ts";
 import { colorFor, initials } from "../components/ui.ts";
+import {
+  attachReceiverTransform,
+  attachSenderTransform,
+  bytesToB64,
+  b64ToBytes,
+  importAesGcm,
+  MEDIA_KEY_BYTES,
+  randomBytes,
+} from "./media-e2ee.ts";
 
 export interface CallParticipant {
   key: string; /* userId|deviceId */
@@ -66,6 +75,8 @@ interface PeerEntry {
   screenStream: MediaStream;
   screenActive: boolean;
   connectionState: string;
+  /** the peer's media-encryption keys by key id (their sender keys) */
+  remoteKeys: Map<number, CryptoKey>;
 }
 
 const ICE_SERVERS: RTCIceServer[] = [
@@ -90,9 +101,20 @@ export class CallManager {
   private _aloneSince: number | null = null;
   /** the auto-leave timer when everyone else left */
   private _aloneTimer: ReturnType<typeof setTimeout> | null = null;
+  /** true once other members appeared in the call state (auto-leave
+   *  only fires after a real call happened — never while ringing) */
+  private _sawOthersInCall = false;
   private _audioCtx: AudioContext | null = null;
   private _peers = new Map<string, PeerEntry>();
   private _notice: string | null = null;
+  /** E2EE media state — active in encrypted rooms only (keys ride olm) */
+  private _mediaE2ee = false;
+  private _mediaKeyBytes: Uint8Array | null = null;
+  private _mediaKey: CryptoKey | null = null;
+  private _mediaKeyId = 0;
+  /** frame counters for the UI/debug (encrypted/dropped) */
+  private _framesDropped = 0;
+  private _framesEncrypted = 0;
   private _localMuted = false;
   private _localDeviceId = "";
   private _removePayloadListener: (() => void) | null = null;
@@ -112,6 +134,21 @@ export class CallManager {
 
   get active(): boolean {
     return this._roomId !== null;
+  }
+
+  /** True when the call's media frames are end-to-end encrypted. */
+  get e2eeMedia(): boolean {
+    return this._mediaE2ee;
+  }
+
+  /** Encrypted-frame count (debug/live verification). */
+  get framesEncrypted(): number {
+    return this._framesEncrypted;
+  }
+
+  /** Dropped-inbound-frame count (unknown key / bad tag — fail closed). */
+  get framesDropped(): number {
+    return this._framesDropped;
   }
 
   setUiListener(listener: (state: CallUiState) => void): void {
@@ -159,11 +196,24 @@ export class CallManager {
     this._roomId = roomId;
     this._localDeviceId = this.client.deviceId ?? "NODEVICE";
 
+    /* E2EE media: encrypted rooms only — the media keys ride the same
+       olm-encrypted signal channel as the call signaling */
+    const room = this.client.getRoom(roomId);
+    if (room?.isEncrypted && this.client.crypto) {
+      this._mediaE2ee = true;
+      this._mediaKeyBytes = randomBytes(MEDIA_KEY_BYTES);
+      this._mediaKey = await importAesGcm(this._mediaKeyBytes, ["encrypt"]);
+      this._mediaKeyId = 1;
+    }
+
     const media = await this.acquireMedia(opts.video === true);
     this._localStream = media.stream;
     this._notice = media.synthetic
       ? "No microphone/camera available — using a synthetic stream"
       : null;
+    if (this._mediaE2ee) {
+      this._notice = (this._notice ? this._notice + " · " : "") + "🔒 E2EE media";
+    }
 
     /* register signal hooks */
     this.client.onToDevice = (event) => this._onPlainSignal(event);
@@ -200,6 +250,13 @@ export class CallManager {
     }
     this._peers.clear();
 
+    /* E2EE media state: keys only live as long as the call */
+    this._mediaE2ee = false;
+    this._mediaKeyBytes = null;
+    this._mediaKey = null;
+    this._mediaKeyId = 0;
+    this._framesDropped = 0;
+
     if (this._localStream) {
       for (const track of this._localStream.getTracks()) track.stop();
       this._localStream = null;
@@ -217,6 +274,7 @@ export class CallManager {
       this._aloneTimer = null;
     }
     this._aloneSince = null;
+    this._sawOthersInCall = false;
     this._syntheticCanvas = null;
     if (this._audioCtx) {
       void this._audioCtx.close().catch(() => {});
@@ -371,6 +429,16 @@ export class CallManager {
         try {
           const sender = entry.pc.addTrack(track, screenStream);
           this._capScreenSender(sender);
+          /* the share's frames encrypt too */
+          if (this._mediaE2ee) {
+            attachSenderTransform(
+              sender,
+              () => ({ keyId: this._mediaKeyId, key: this._mediaKey! }),
+              () => {
+                this._framesEncrypted++;
+              }
+            );
+          }
         } catch (err) {
           console.error("[call] addTrack(screen) failed:", err);
         }
@@ -557,9 +625,15 @@ export class CallManager {
     }
 
     /* drop peers that left the call */
+    let droppedPeers = false;
     for (const key of [...this._peers.keys()]) {
-      if (!present.has(key)) this._closePeer(key);
+      if (!present.has(key)) {
+        this._closePeer(key);
+        droppedPeers = true;
+      }
     }
+    /* a departed member's key must decrypt nothing going forward */
+    if (droppedPeers) void this._rotateMediaKey();
 
     /* add new peers (own devices are skipped — v1 meshes distinct users) */
     for (const key of present) {
@@ -571,9 +645,12 @@ export class CallManager {
 
     /* everyone else left: a DM call with nobody on the other side is
        over — leave after a short grace so a peer's state blip does
-       not drop the call */
+       not drop the call. Only when we actually SAW others in the call:
+       a caller waiting alone for the callee to pick up must ring
+       indefinitely. */
     const others = [...present].some((key) => key.split("|")[0] !== this.client.userId);
-    if (!others && this._peers.size === 0) {
+    if (others) this._sawOthersInCall = true;
+    if (!others && this._peers.size === 0 && this._sawOthersInCall) {
       if (this._aloneTimer == null) {
         this._aloneTimer = setTimeout(() => {
           this._aloneTimer = null;
@@ -586,6 +663,46 @@ export class CallManager {
       clearTimeout(this._aloneTimer);
       this._aloneTimer = null;
       this._aloneSince = null;
+    }
+  }
+
+  /* --------------------------- E2EE media keys --------------------------- */
+
+  /** Send our current media-encryption key to one peer (olm channel). */
+  private async _sendMediaKey(entry: PeerEntry): Promise<void> {
+    if (!this._mediaE2ee || !this._mediaKeyBytes) return;
+    await this._sendSignal(entry.userId, entry.deviceId, "m.call.media_key", {
+      key_id: this._mediaKeyId,
+      media_key: bytesToB64(this._mediaKeyBytes),
+    });
+  }
+
+  /** A peer's media-encryption key arrived — install it for their
+   *  inbound frames (a later key id supersedes earlier ones). */
+  private async _handleMediaKey(
+    entry: PeerEntry,
+    content: Record<string, unknown>
+  ): Promise<void> {
+    const keyId = typeof content.key_id === "number" ? content.key_id : null;
+    const b64 = typeof content.media_key === "string" ? content.media_key : null;
+    if (keyId === null || !b64) return;
+    const raw = b64ToBytes(b64);
+    if (raw.length !== MEDIA_KEY_BYTES) return;
+    const key = await importAesGcm(raw, ["decrypt"]);
+    entry.remoteKeys.set(keyId, key);
+  }
+
+  /**
+   * Rotate our media key (a peer left — their stale key must decrypt
+   * nothing going forward) and tell the remaining peers the new one.
+   */
+  private async _rotateMediaKey(): Promise<void> {
+    if (!this._mediaE2ee) return;
+    this._mediaKeyBytes = randomBytes(MEDIA_KEY_BYTES);
+    this._mediaKey = await importAesGcm(this._mediaKeyBytes, ["encrypt"]);
+    this._mediaKeyId = (this._mediaKeyId + 1) & 0xff;
+    for (const entry of this._peers.values()) {
+      await this._sendMediaKey(entry);
     }
   }
 
@@ -608,8 +725,14 @@ export class CallManager {
       screenStream: new MediaStream(),
       screenActive: false,
       connectionState: "new",
+      remoteKeys: new Map(),
     };
     this._peers.set(key, entry);
+
+    /* E2EE media: send this peer our media key over the olm channel */
+    if (this._mediaE2ee) {
+      void this._sendMediaKey(entry);
+    }
 
     /* media */
     if (this._localStream) {
@@ -628,7 +751,31 @@ export class CallManager {
         }
       }
     }
+
+    /* E2EE media: encrypt every outbound stream (after the tracks are
+       added — transforms attach per sender) */
+    if (this._mediaE2ee) {
+      for (const sender of pc.getSenders()) {
+        attachSenderTransform(
+          sender,
+          () => ({ keyId: this._mediaKeyId, key: this._mediaKey! }),
+          () => {
+            this._framesEncrypted++;
+          }
+        );
+      }
+    }
     pc.ontrack = (event) => {
+      /* E2EE media: decrypt this stream with the peer's sender keys */
+      if (this._mediaE2ee) {
+        attachReceiverTransform(
+          event.receiver,
+          () => entry.remoteKeys,
+          (reason) => {
+            this._framesDropped++;
+          }
+        );
+      }
       for (const stream of event.streams) {
         for (const track of stream.getTracks()) {
           /* route the screen track to its own stream when we know a share
@@ -749,6 +896,8 @@ export class CallManager {
       void this._handleCandidates(entry, content);
     } else if (type === "m.call.screenshare") {
       this._handleScreenshareSignal(entry, content);
+    } else if (type === "m.call.media_key") {
+      void this._handleMediaKey(entry, content);
     }
   }
 

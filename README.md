@@ -131,6 +131,22 @@ for an open protocol.
   per-room remove buttons and an add-room picker (m.space.child state,
   via the user's homeserver as the routing hint). Rooms can be moved
   in and out live; every member's tree updates via sync.
+- **E2EE media (insertable streams)** — in ENCRYPTED rooms the call's
+  media frames are end-to-end encrypted: a TransformStream between
+  the codec and the packetizer (Chromium's
+  RTCRtpSender.createEncodedStreams) encrypts every encoded frame
+  with AES-GCM (an SFrame-inspired header: key id + per-stream salt +
+  monotonic counter + a 2-byte clear codec prefix; the counter/salt
+  keep GCM nonces unique). The receiver decrypts before the decoder.
+  Each sender has its own 128-bit key, transported to call peers over
+  the olm-encrypted to-device channel (m.call.media_key) — the
+  homeserver never sees a key. Fail-closed: frames with an unknown
+  key id or a bad GCM tag are dropped, never emitted as plaintext.
+  On a peer leaving, the sender rotates (new key, key id + 1) so the
+  departed member's stale key decrypts nothing. Unencrypted rooms
+  keep plain DTLS-SRTP (the key transport requires olm). The LiveKit
+  path is not covered (mesh only). Not SFrame-byte-compatible with
+  Element Call — a Grungus v1 frame format, documented.
 - **Incoming-call ring** — when a call starts in one of your rooms
   (someone publishes call state), a banner with a two-tone WebAudio
   ring offers Join/Dismiss (45s missed-call timeout). Rings only fire
