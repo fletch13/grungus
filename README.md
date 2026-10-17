@@ -163,6 +163,20 @@ for an open protocol.
   left-room ignore set keeps later syncs (which carry the leave event)
   from resurrecting the chat, rooms.leave sections from other devices
   delete locally too, and the open chat view clears when its room goes.
+- **Element↔Grungus E2EE message interop** — Element clients could not
+  decrypt Grungus-sent room messages (UTD on the Element side only).
+  Root cause: the megolm room-key share (`m.room_key` over olm) encrypted
+  a bare `{type, content}` payload — the olm v1 PDU per the spec must
+  carry sender/sender_device/keys/recipient/recipient_keys, and rust
+  (element's crypto) strictly requires them to authenticate the sender;
+  without them the decrypted room key is dropped silently and every
+  message sent afterwards stays undecryptable on Element. The share now
+  builds the full PDU per device (recipient fields are per-device), and
+  the megolm session_key is still captured at the current ratchet index.
+  Live-verified against a headless real-Element rust stack: a fresh
+  Element device joins an encrypted room, Grungus sends, rust logs
+  "Received a new megolm room key" and the message decrypts — while
+  pre-share history correctly stays UTD (normal Matrix semantics).
 - **Element-compatible device verification (SAS)** — verifying a device
   against the Element client now works end-to-end. The SAS stack was
   rewritten to matrix-rust-sdk/vodozemac's current algorithms: the

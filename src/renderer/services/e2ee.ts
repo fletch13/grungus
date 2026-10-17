@@ -847,16 +847,6 @@ export class E2eeCrypto {
     /* session_key must be captured at the CURRENT ratchet index; receivers
        create inbound sessions at that index. */
     const sessionKey = ogs.session_key();
-    const roomKeyPayload = {
-      type: "m.room_key",
-      content: {
-        algorithm: ALGORITHM_MEGOLM,
-        room_id: roomId,
-        session_id: ogs.session_id(),
-        session_key: sessionKey,
-      },
-    };
-    const plaintext = JSON.stringify(roomKeyPayload);
 
     const memberIds = new Set<string>();
     for (const member of room.members.values()) {
@@ -876,7 +866,26 @@ export class E2eeCrypto {
         try {
           const session = await this.getOrCreateOlmSession(device, userId);
           if (!session) continue;
-          const encrypted = session.encrypt(plaintext);
+          /* the olm v1 PDU per the spec — rust (element's stack) requires
+             sender/keys/recipient/recipient_keys in the decrypted payload;
+             a bare {type, content} is rejected and the room key silently
+             dropped, leaving every grungus message UTD on element. Each
+             device gets its own payload: recipient fields are per-device. */
+          const payload = JSON.stringify({
+            type: "m.room_key",
+            content: {
+              algorithm: ALGORITHM_MEGOLM,
+              room_id: roomId,
+              session_id: ogs.session_id(),
+              session_key: sessionKey,
+            },
+            sender: this.host.userId,
+            sender_device: this.deviceId,
+            keys: { ed25519: this._ed25519 },
+            recipient: userId,
+            recipient_keys: { ed25519: device.ed25519 },
+          });
+          const encrypted = session.encrypt(payload);
           messages[userId] = messages[userId] ?? {};
           messages[userId]![device.deviceId] = {
             algorithm: ALGORITHM_OLM,
