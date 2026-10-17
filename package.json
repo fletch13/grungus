@@ -1,7 +1,7 @@
 {
   "name": "grungus",
   "productName": "Grungus",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "private": true,
   "description": "A Discord-style desktop chat client that speaks the Matrix protocol",
   "type": "module",

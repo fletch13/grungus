@@ -189,7 +189,11 @@ login-view {
 app-shell {
   display: grid;
   grid-template-columns: 72px 240px 1fr 240px;
+  /* implicit rows size to CONTENT — a long timeline would grow the row
+     past the viewport (the fullscreen half-screen bug). Clamp it. */
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
+  overflow: hidden;
 }
 
 app-shell.no-members {
@@ -307,6 +311,9 @@ room-list {
 
 .room-scroll {
   flex: 1;
+  min-height: 0; /* flex items default to content height — without this a
+                    long room list stretches the sidebar instead of
+                    scrolling (same fix as the chat timeline) */
   overflow-y: auto;
   padding-bottom: 8px;
 }
@@ -559,6 +566,10 @@ chat-view {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0; /* grid items also refuse to shrink below content
+                    height by default — keep chat-view inside its
+                    track no matter how long the timeline is */
+  overflow: hidden;
   position: relative;
 }
 
@@ -601,6 +612,10 @@ chat-view {
 
 .chat-scroll {
   flex: 1;
+  min-height: 0; /* flex items default to their CONTENT height — without
+                    this a long timeline stretches chat-view past the
+                    viewport (the fullscreen half-screen bug) instead
+                    of scrolling inside */
   overflow-y: auto;
   padding: 8px 0 16px;
   user-select: text;
