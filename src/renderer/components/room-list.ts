@@ -358,6 +358,38 @@ export class RoomList extends HTMLElement {
     if (room.unread > 0) {
       row.appendChild(el("span", { class: "unread-badge", text: String(room.unread) }));
     }
+    /* delete (leave) — hover-revealed, two-click confirm so it can't
+       go off by accident */
+    const del = el("button", {
+      class: "room-delete",
+      title: "Delete chat (leaves the room)",
+      "aria-label": `Delete chat ${room.title}`,
+      text: "🗑",
+    });
+    let armed = false;
+    let armTimer: ReturnType<typeof setTimeout> | null = null;
+    del.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (!armed) {
+        armed = true;
+        del.classList.add("armed");
+        del.textContent = "sure?";
+        armTimer = setTimeout(() => {
+          armed = false;
+          del.classList.remove("armed");
+          del.textContent = "🗑";
+        }, 3_000);
+        return;
+      }
+      if (armTimer) clearTimeout(armTimer);
+      this.dispatchEvent(
+        new CustomEvent("grungus:delete-room", {
+          detail: { roomId: room.id },
+          bubbles: true,
+        })
+      );
+    });
+    row.appendChild(del);
     row.addEventListener("click", () => {
       this.dispatchEvent(
         new CustomEvent("grungus:select-room", {

@@ -157,6 +157,23 @@ for an open protocol.
   org.matrix.msc4143.rtc.member) must be sendable at power level 0 —
   default room power levels gate them at 50 and element clients die
   with MISSING_MATRIX_RTC_TRANSPORT-style auth failures.
+- **Delete chats** — every room row has a hover-revealed 🗑 button
+  (two-click confirm: it turns into "sure?" for 3s) that leaves the
+  room on the server and drops it from the sidebar immediately. A
+  left-room ignore set keeps later syncs (which carry the leave event)
+  from resurrecting the chat, rooms.leave sections from other devices
+  delete locally too, and the open chat view clears when its room goes.
+- **Element recovery restore** — the 🔑 Key backup card now accepts the
+  recovery passphrase OR the base58 security key (olm format: 0x8B01
+  prefix, XOR parity, groups of four) from accounts set up in Element.
+  Modern Element keeps the backup's private key in secret storage, so
+  the restore unlocks SSSS with the passphrase (verified against the
+  published key check), decrypts the m.megolm_backup.v1 secret, and
+  restores with that key; Grungus's own passphrase-derived backups
+  still work as the fallback path. Live-verified against the homeserver
+  with an Element-style setup: a fresh Grungus device restored the
+  history with just the passphrase and the UTD lines turned into
+  messages in place.
 - **Read markers + receipts** — opening a room (or new messages
   arriving while it's open, debounced 1.5s) sends a public m.read
   receipt (POST /rooms/{id}/receipt/m.read/{eventId}) and the

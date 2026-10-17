@@ -58,6 +58,85 @@ export interface SecretStorageKeyDescription {
   [extra: string]: unknown;
 }
 
+/* ------------------- recovery key (olm format, base58) ------------------ */
+
+/** Bitcoin base58 alphabet — what olm/js-sdk recovery keys use. */
+const B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+/** olm's arbitrary prefix so recovery keys can't be confused with others. */
+const RECOVERY_KEY_PREFIX = [0x8b, 0x01];
+const RECOVERY_KEY_SIZE = 32;
+
+function b58Encode(bytes: Uint8Array): string {
+  let num = 0n;
+  for (const b of bytes) num = num * 256n + BigInt(b);
+  let out = "";
+  while (num > 0n) {
+    out = B58_ALPHABET[Number(num % 58n)] + out;
+    num /= 58n;
+  }
+  /* leading zero bytes → leading '1's (base58 convention) */
+  for (const b of bytes) {
+    if (b !== 0) break;
+    out = "1" + out;
+  }
+  return out;
+}
+
+function b58Decode(text: string): Uint8Array | null {
+  let num = 0n;
+  for (const ch of text) {
+    const idx = B58_ALPHABET.indexOf(ch);
+    if (idx === -1) return null;
+    num = num * 58n + BigInt(idx);
+  }
+  const bytes: number[] = [];
+  while (num > 0n) {
+    bytes.unshift(Number(num % 256n));
+    num /= 256n;
+  }
+  /* leading '1's → leading zero bytes */
+  for (const ch of text) {
+    if (ch !== "1") break;
+    bytes.unshift(0);
+  }
+  return new Uint8Array(bytes);
+}
+
+/**
+ * Encode a secret-storage key as a recovery key string — olm's format:
+ * [0x8B 0x01] + key(32) + XOR parity byte, base58, grouped by 4.
+ */
+export function encodeRecoveryKey(key: Uint8Array): string {
+  const buf = new Uint8Array(RECOVERY_KEY_PREFIX.length + key.length + 1);
+  buf.set(RECOVERY_KEY_PREFIX, 0);
+  buf.set(key, RECOVERY_KEY_PREFIX.length);
+  let parity = 0;
+  for (let i = 0; i < buf.length - 1; i++) parity ^= buf[i]!;
+  buf[buf.length - 1] = parity;
+  return b58Encode(buf).match(/.{1,4}/g)?.join(" ") ?? b58Encode(buf);
+}
+
+/**
+ * Decode a recovery key (spaces ignored). Returns the 32-byte
+ * secret-storage key, or null when the string is not a valid recovery
+ * key (wrong length/prefix/parity or non-base58 characters).
+ */
+export function tryDecodeRecoveryKey(input: string): Uint8Array | null {
+  const trimmed = input.replace(/\s+/g, "");
+  const raw = b58Decode(trimmed);
+  if (!raw || raw.length !== RECOVERY_KEY_PREFIX.length + RECOVERY_KEY_SIZE + 1) {
+    return null;
+  }
+  let parity = 0;
+  for (const b of raw) parity ^= b;
+  if (parity !== 0) return null;
+  for (let i = 0; i < RECOVERY_KEY_PREFIX.length; i++) {
+    if (raw[i] !== RECOVERY_KEY_PREFIX[i]) return null;
+  }
+  return raw.slice(RECOVERY_KEY_PREFIX.length, RECOVERY_KEY_PREFIX.length + RECOVERY_KEY_SIZE);
+}
+
+
 /* --------------------------- base64 helpers ---------------------------- */
 
 function bytesToB64(bytes: Uint8Array): string {
@@ -257,6 +336,33 @@ export class SecretStorage {
   }
 
   /**
+   * Derive the key from a recovery KEY (the base58 string Element shows
+   * as "Security key"). Verifies against the published key check when
+   * one exists. Returns the key id on success, null when the key is
+   * wrong/not usable.
+   */
+  async deriveFromRecoveryKey(recoveryKey: string): Promise<string | null> {
+    const key = tryDecodeRecoveryKey(recoveryKey);
+    if (!key) return null;
+    const keyId = await this.defaultKeyId();
+    if (!keyId) return null;
+    const desc = this.client.getAccountData(SSSS_KEY_PREFIX + keyId) as
+      | SecretStorageKeyDescription
+      | null;
+    if (!desc) return null;
+    /* verify against the key check — an invalid key must not unlock */
+    if (desc.iv && desc.mac) {
+      const check = await calculateKeyCheck(key, desc.iv);
+      if (trimTrailingEquals(desc.mac) !== trimTrailingEquals(check.mac)) {
+        return null;
+      }
+    }
+    this._key = key;
+    this._keyId = keyId;
+    return keyId;
+  }
+
+  /**
    * Derive the key from the recovery passphrase and check it against
    * the published key check. Returns the key id on success, null when
    * the passphrase is wrong.
@@ -302,6 +408,12 @@ export class SecretStorage {
     const payload = info?.encrypted?.[this._keyId];
     if (!payload) return null;
     return decryptSecret(payload, this._key, name);
+  }
+
+  /** Test/debug: derive + verify the passphrase and return the raw key bytes. */
+  async debugKeyBytes(passphrase: string): Promise<Uint8Array | null> {
+    const keyId = await this.deriveFromPassphrase(passphrase);
+    return keyId ? this._key : null;
   }
 
   /** Whether a secret is stored (regardless of having the key). */

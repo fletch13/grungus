@@ -17,6 +17,10 @@ interface MockUser {
   password: string;
   userId: string;
   displayname: string;
+  /** room ids the user left (rooms.leave source of truth) */
+  pendingLeaveSync: Set<string>;
+  /** deviceId → room ids already delivered to that device */
+  leaveDelivered: Map<string, Set<string>>;
 }
 
 interface MockEvent {
@@ -138,7 +142,14 @@ export class MockHomeserver {
 
   registerUser(username: string, password: string): string {
     const userId = `@${username}:mock.hs`;
-    this.users.set(username, { username, password, userId, displayname: username });
+    this.users.set(username, {
+      username,
+      password,
+      userId,
+      displayname: username,
+      pendingLeaveSync: new Set(),
+      leaveDelivered: new Map(),
+    });
     return userId;
   }
 
@@ -938,6 +949,7 @@ export class MockHomeserver {
         { membership: "leave" },
         { state_key: user.userId }
       );
+      user.pendingLeaveSync.add(room.id);
       this._send(res, 200, {});
       return;
     }
@@ -1127,6 +1139,13 @@ export class MockHomeserver {
     const deviceQueue = this.toDeviceQueue.get(user.username)?.get(deviceId) ?? [];
     if (deviceQueue.some((entry) => entry.seq > sinceNum)) return true;
     if ((this.accountDataSeq.get(user.username) ?? 0) > sinceNum) return true;
+    /* undelivered leave notifications wake the long-poll */
+    const deliveredLeaves = user.leaveDelivered.get(deviceId);
+    if (
+      [...user.pendingLeaveSync].some((id) => !deliveredLeaves?.has(id))
+    ) {
+      return true;
+    }
     return (
       this._invitedRooms(user).some((room) =>
         room.events.some((event) => event.seq > sinceNum)
@@ -1252,6 +1271,17 @@ export class MockHomeserver {
       join[room.id] = joinEntry;
     }
 
+    /* rooms.leave: rooms the user left (spec shape). Delivered once per
+       DEVICE — every session of the user must learn about the leave. */
+    const leave: Record<string, unknown> = {};
+    const deliveredToDevice = user.leaveDelivered.get(deviceId) ?? new Set<string>();
+    for (const leftRoomId of user.pendingLeaveSync) {
+      if (deliveredToDevice.has(leftRoomId)) continue;
+      leave[leftRoomId] = { timeline: { events: [] } };
+      deliveredToDevice.add(leftRoomId);
+    }
+    user.leaveDelivered.set(deviceId, deliveredToDevice);
+
     /* to-device: deliver THIS device's queued events (initial sync delivers all). */
     const deviceQueue =
       this.toDeviceQueue.get(user.username)?.get(deviceId) ?? [];
@@ -1293,7 +1323,7 @@ export class MockHomeserver {
 
     return {
       next_batch: String(this._seq),
-      rooms: { join, invite },
+      rooms: { join, invite, leave },
       to_device: { events: delivered.map((entry) => entry.event) },
       device_one_time_keys_count: { signed_curve25519: myOtks },
       account_data: { events: accountEvents },

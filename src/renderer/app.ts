@@ -533,9 +533,9 @@ function startShell(): void {
     const detail = (event as CustomEvent<{ passphrase: string }>).detail;
     const cryptoLayerNow = active.crypto;
     if (!cryptoLayerNow) return;
-    backupView.setStatus("Deriving key and fetching the backup…", false);
+    backupView.setStatus("Unlocking recovery and fetching the backup…", false);
     void cryptoLayerNow
-      .restoreKeyBackup(detail.passphrase)
+      .restoreWithRecovery(detail.passphrase)
       .then((count) => {
         backupView.setStatus(`Restored ${count} session${count === 1 ? "" : "s"} — undecryptable messages update in place.`, false);
       })
@@ -807,6 +807,34 @@ function startShell(): void {
 
   roomList.addEventListener("grungus:select-room", (event) => {
     selectRoom((event as CustomEvent<{ roomId: string }>).detail.roomId);
+  });
+
+  roomList.addEventListener("grungus:delete-room", (event) => {
+    const roomId = (event as CustomEvent<{ roomId: string }>).detail.roomId;
+    void active
+      .deleteRoom(roomId)
+      .then(() => {
+        /* clear the selection if the deleted chat was open */
+        if (state.roomId === roomId) {
+          state.roomId = null;
+          chat.setRoom(null, active, active.userId);
+        }
+        refreshSidebar();
+      })
+      .catch((err: unknown) => {
+        chat.setNotice(
+          `Could not delete chat: ${err instanceof Error ? err.message : "network error"}`
+        );
+      });
+  });
+
+  /* a leave that arrived via sync (deleted on another device) */
+  active.on("room-deleted", (roomId) => {
+    if (state.roomId === roomId) {
+      state.roomId = null;
+      chat.setRoom(null, active, active.userId);
+    }
+    refreshSidebar();
   });
 
   roomList.addEventListener("grungus:create-room", (event) => {

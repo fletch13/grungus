@@ -21,6 +21,7 @@
  */
 
 import * as OlmNs from "@matrix-org/olm";
+import { SecretStorage, tryDecodeRecoveryKey } from "./ssss.ts";
 
 /* ------------------------ typed libolm API surface ----------------------- */
 
@@ -154,6 +155,9 @@ export interface CryptoHost {
     id: string;
     members: Map<string, { userId: string; membership: string }>;
   } | null;
+  /** account data by event type (secret storage / recovery restore) */
+  getAccountData(type: string): Record<string, unknown> | null;
+  setAccountData(type: string, content: Record<string, unknown>): Promise<void>;
 }
 
 export interface ApiCallOptions {
@@ -218,6 +222,15 @@ export interface KeyBackupVersion {
   };
   count?: number;
   etag?: string;
+}
+
+/** unpadded/url-safe-tolerant base64 → bytes */
+function b64ToBytes(b64: string): Uint8Array {
+  const normalized = b64.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  const bin = atob(normalized);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
 }
 
 /** PBKDF2-HMAC-SHA-512 → 256-bit curve25519 private key (js-sdk compatible). */
@@ -881,6 +894,23 @@ export class E2eeCrypto {
   }
 
   /** A backup created on this device (private key in memory). */
+  /** Test/debug: list inbound sessions without exposing internals. */
+  debugInboundSessions(): Array<{ senderKey: string; sessionId: string; roomId: string }> {
+    const out: Array<{ senderKey: string; sessionId: string; roomId: string }> = [];
+    for (const [key, entry] of this._inbound) {
+      const [senderKey, sessionId] = key.split("|");
+      out.push({ senderKey: senderKey ?? "", sessionId: sessionId ?? "", roomId: entry.roomId });
+    }
+    return out;
+  }
+
+  /** Test/debug: export an inbound session at its earliest index. */
+  debugExportSession(senderKey: string, sessionId: string): string | null {
+    const entry = this._inbound.get(`${senderKey}|${sessionId}`);
+    if (!entry) return null;
+    return entry.session.export_session(entry.session.first_known_index());
+  }
+
   get hasActiveBackup(): boolean {
     return this._backup !== null;
   }
@@ -1084,6 +1114,54 @@ export class E2eeCrypto {
     return res.version;
   }
 
+  /** SSSS secret holding the backup's private key (element-call-era). */
+  private static readonly MEGOLM_BACKUP_SECRET = "m.megolm_backup.v1";
+
+  /**
+   * Restore with a recovery passphrase OR recovery key (base58 security
+   * key) — the unified entry the restore UI uses. Modern Element clients
+   * keep the backup's private key in secret storage: the passphrase (or
+   * security key) unlocks SSSS, the m.megolm_backup.v1 secret holds the
+   * backup key. Older backups (and Grungus's own) derive the backup key
+   * straight from the passphrase — tried as a fallback.
+   */
+  async restoreWithRecovery(input: string): Promise<number> {
+    /* 1. the SSSS route (element-call-era): passphrase or recovery key
+          → secret-storage key → decrypt the m.megolm_backup.v1 secret */
+    /* SecretStorage wants a MatrixClient; the host carries exactly the
+       account-data surface it uses (getAccountData/setAccountData) */
+    const storage = new SecretStorage(
+      this.host as unknown as import("./matrix-client.ts").MatrixClient
+    );
+    let unlocked = false;
+    const asRecoveryKey = tryDecodeRecoveryKey(input);
+    if (asRecoveryKey) {
+      unlocked = (await storage.deriveFromRecoveryKey(input)) !== null;
+    }
+    if (!unlocked && !asRecoveryKey) {
+      unlocked = (await storage.deriveFromPassphrase(input)) !== null;
+    }
+    if (unlocked) {
+      const secretB64 = await storage.getSecret(E2eeCrypto.MEGOLM_BACKUP_SECRET);
+      if (secretB64) {
+        const privateKey = b64ToBytes(secretB64);
+        let info: KeyBackupVersion | null = null;
+        try {
+          info = await this.getKeyBackupVersion();
+        } catch {
+          info = null;
+        }
+        if (info && info.algorithm === BACKUP_ALGORITHM && info.auth_data?.public_key) {
+          return await this._restoreBackup(info, privateKey);
+        }
+      }
+      /* unlocked SSSS but no backup secret / no backup: fall through to
+         the direct route — Grungus's own backups may coexist with SSSS */
+    }
+    /* 2. the direct route: the passphrase IS the backup-key KDF input */
+    return this.restoreKeyBackup(input);
+  }
+
   /**
    * Restore the server-side backup with a passphrase. Every stored megolm
    * session is decrypted, imported at its chain index, and reported through
@@ -1115,12 +1193,25 @@ export class E2eeCrypto {
       throw new Error("This backup was not created with a passphrase");
     }
     const privateKey = await deriveBackupKey(passphrase, salt, iterations, bits);
+    return await this._restoreBackup(info, privateKey);
+  }
+
+  /**
+   * Restore a backup whose private key we already hold (passphrase-
+   * derived, or unlocked from secret storage). Validates the public key
+   * against the backup's auth_data, then imports every session.
+   */
+  private async _restoreBackup(
+    info: KeyBackupVersion,
+    privateKey: Uint8Array
+  ): Promise<number> {
     const olm = this._olm!;
     const pk = new olm.PkDecryption();
     const publicKey = pk.init_with_private_key(privateKey);
+    const auth = info.auth_data ?? {};
     if (publicKey !== auth.public_key) {
       pk.free();
-      throw new Error("Wrong passphrase — derived key does not match the backup");
+      throw new Error("Wrong recovery key or passphrase — it does not match this backup");
     }
 
     const roomsResponse = await this.host.api<{

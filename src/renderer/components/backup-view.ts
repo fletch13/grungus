@@ -92,13 +92,13 @@ export class BackupView extends HTMLElement {
       const isCreate = this._mode === "create";
       const label = isCreate
         ? "Choose a passphrase (8+ characters) — it protects your backed-up keys and is needed to restore on other devices."
-        : "Enter the passphrase this backup was created with.";
+        : "Enter the recovery passphrase (or paste the security key) this account was set up with — works with keys created in Element too.";
       card.appendChild(el("div", { class: "verify-phase", text: label }));
 
       const pass = el("input", {
         type: "password",
         class: "backup-pass",
-        placeholder: "passphrase",
+        placeholder: isCreate ? "passphrase" : "recovery passphrase or security key",
         autocomplete: "off",
       }) as HTMLInputElement;
       const confirm = el("input", {

@@ -55,6 +55,8 @@ export interface SyncResponse {
   rooms?: {
     join?: Record<string, SyncJoinedRoom>;
     invite?: Record<string, { invite_state?: { events?: MatrixEvent[] } }>;
+    /** rooms we left (from this or another device) — final events + the leave */
+    leave?: Record<string, { timeline?: { events?: MatrixEvent[] } }>;
   };
   to_device?: { events?: ToDeviceEvent[] };
   device_one_time_keys_count?: Record<string, number>;
@@ -252,6 +254,8 @@ interface ClientEvents {
   connection: [ConnectionState];
   error: [unknown];
   "auth-error": [HttpError];
+  /** a room was deleted/left — the UI clears it from selection */
+  "room-deleted": [string];
 }
 
 type Listener<K extends keyof ClientEvents> = (...args: ClientEvents[K]) => void;
@@ -380,6 +384,7 @@ export class MatrixClient {
     connection: new Set(),
     error: new Set(),
     "auth-error": new Set(),
+    "room-deleted": new Set(),
   };
 
   constructor(options: {
@@ -1314,7 +1319,15 @@ export class MatrixClient {
     const joined = data.rooms?.join ?? {};
     const changedRooms: RoomUpdate[] = [];
 
+    /* rooms we LEFT (from this or another device): delete locally. The
+       server keeps sending them in the join/leave sections otherwise. */
+    for (const leftRoomId of Object.keys(data.rooms?.leave ?? {})) {
+      if (this.rooms.has(leftRoomId)) this._dropRoom(leftRoomId);
+      else this._leftRooms.add(leftRoomId);
+    }
+
     for (const [roomId, rd] of Object.entries(joined)) {
+      if (this._leftRooms.has(roomId)) continue; /* deleted here — ignore */
       const room = this._ensureRoom(roomId);
       const newEvents: RoomEvent[] = [];
       let relationChanged = false;
@@ -1910,6 +1923,31 @@ export class MatrixClient {
       `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/leave`,
       { body: {} }
     );
+  }
+
+  /**
+   * Rooms this user has left (here or from another device). Sync entries
+   * for these are ignored — a leave must never resurrect a deleted chat.
+   */
+  private readonly _leftRooms = new Set<string>();
+
+  /**
+   * Delete a chat: leave it on the server and drop it locally. The room
+   * vanishes from the list immediately; the ignore set keeps the next
+   * sync (which carries the leave event) from re-adding it.
+   */
+  async deleteRoom(roomId: string): Promise<void> {
+    await this.leaveRoom(roomId);
+    this._dropRoom(roomId);
+  }
+
+  /** Remove a room locally and notify. */
+  private _dropRoom(roomId: string): void {
+    this._leftRooms.add(roomId);
+    this.rooms.delete(roomId);
+    this.invites.delete(roomId);
+    this.emit("room-deleted", roomId);
+    this.emit("rooms", this.getRooms());
   }
 
   /** Accept a pending invite by joining the room. */

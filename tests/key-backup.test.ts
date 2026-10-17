@@ -101,7 +101,7 @@ test("backup: fresh device restores history with the passphrase, no other device
   /* wrong passphrase must be rejected before any key is imported */
   await assert.rejects(
     () => k2.restoreKeyBackup("wrong passphrase entirely"),
-    (err: unknown) => err instanceof Error && /Wrong passphrase/.test(err.message)
+    (err: unknown) => err instanceof Error && /Wrong recovery key or passphrase|Wrong passphrase/.test(err.message)
   );
 
   /* wrong passphrase did not import anything */
