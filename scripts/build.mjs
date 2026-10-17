@@ -90,5 +90,11 @@ await cp(
   path.join(root, "node_modules/@matrix-org/olm/olm.wasm"),
   path.join(dist, "olm.wasm")
 );
+/* LiveKit's E2EE worker — served same-origin next to the renderer bundle
+   (the LiveKit-path media encryption runs in it). */
+await cp(
+  path.join(root, "node_modules/livekit-client/dist/livekit-client.e2ee.worker.js"),
+  path.join(dist, "livekit-client.e2ee.worker.js")
+);
 
 console.log("grungus: build complete -> dist/");

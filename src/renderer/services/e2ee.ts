@@ -712,7 +712,11 @@ export class E2eeCrypto {
    * Ensure the room's outbound group session exists and its key is shared
    * with every member device, then encrypt one plaintext payload.
    */
-  async encryptRoomMessage(roomId: string, content: Record<string, unknown>): Promise<{
+  async encryptRoomMessage(
+    roomId: string,
+    content: Record<string, unknown>,
+    type = "m.room.message"
+  ): Promise<{
     algorithm: string;
     sender_key: string;
     ciphertext: string;
@@ -730,7 +734,7 @@ export class E2eeCrypto {
     }
 
     const payload = JSON.stringify({
-      type: "m.room.message",
+      type,
       content,
       room_id: roomId,
     });

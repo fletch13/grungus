@@ -45,8 +45,16 @@ function send(res: http.ServerResponse, status: number, body: Record<string, unk
 async function verifyMatrixIdentity(body: Record<string, unknown>): Promise<string> {
   const errors: string[] = [];
 
-  /* try the standard OpenID path first (works when federation is enabled) */
-  const openidToken = typeof body.openid_token === "string" ? body.openid_token : null;
+  /* try the standard OpenID path first (works when federation is enabled).
+     The token may arrive as a bare string (Grungus) or as the full
+     OpenID token object (element-call's /sfu/get convention). */
+  const rawOpenid = body.openid_token;
+  const openidToken =
+    typeof rawOpenid === "string"
+      ? rawOpenid
+      : rawOpenid && typeof rawOpenid === "object"
+        ? String((rawOpenid as { access_token?: unknown }).access_token ?? "")
+        : null;
   if (openidToken) {
     try {
       const res = await fetch(
@@ -109,7 +117,17 @@ const server = http.createServer((req, res) => {
     send(res, 204, {});
     return;
   }
-  if (req.method !== "POST" || req.url !== "/grungus/livekit/join") {
+  if (req.method !== "POST" || !req.url) {
+    send(res, 404, { errcode: "M_NOT_FOUND", error: "unknown endpoint" });
+    return;
+  }
+  /* Grungus's endpoint, plus element-call's legacy lk-jwt-service paths
+     (it appends /sfu/get for publishers and /get_token for subscribers to
+     the livekit_service_url from the foci) */
+  const isJoin = req.url === "/grungus/livekit/join";
+  const isSfuGet = req.url.endsWith("/sfu/get");
+  const isGetToken = req.url.endsWith("/get_token");
+  if (!isJoin && !isSfuGet && !isGetToken) {
     send(res, 404, { errcode: "M_NOT_FOUND", error: "unknown endpoint" });
     return;
   }
@@ -140,8 +158,9 @@ const server = http.createServer((req, res) => {
         }
         const userId = await verifyMatrixIdentity(body);
         const token = mintLiveKitToken(userId, safeRoom);
-        console.log(`[lk-auth] ${userId} → room "${safeRoom}"`);
-        send(res, 200, { token, url: LK_URL, room: safeRoom });
+        console.log(`[lk-auth] ${userId} → room "${safeRoom}" (${isJoin ? "join" : "sfu/get"})`);
+        /* element-call's legacy path reads {url, jwt}; Grungus reads {url, token} */
+        send(res, 200, { token, jwt: token, url: LK_URL, room: safeRoom });
       } catch (err) {
         send(res, 403, { error: err instanceof Error ? err.message : String(err) });
       }

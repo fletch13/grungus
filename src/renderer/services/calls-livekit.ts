@@ -31,6 +31,7 @@ import {
 import type { Room } from "./matrix-client.ts";
 import type { MatrixClient } from "./matrix-client.ts";
 import { mxidLocalpart } from "./matrix-client.ts";
+import { LkE2ee } from "./lk-e2ee.ts";
 
 export interface LkCallState {
   connected: boolean;
@@ -50,6 +51,8 @@ export interface LkCallState {
 export class LkCallManager {
   private readonly client: MatrixClient;
   private _room: LkRoom | null = null;
+  /** LiveKit-path E2EE (encrypted rooms only; keys via Matrix, Element-compatible) */
+  private _e2ee: LkE2ee | null = null;
   private _listener: ((state: LkCallState) => void) | null = null;
   private _notice: string | null = null;
   private _localMuted = false;
@@ -119,19 +122,38 @@ export class LkCallManager {
       scope: "m.room",
       device_id: deviceId,
       expires: 5 * 60_000,
+      /* focus_active in BOTH shapes: the current flattened { type,
+         livekit_service_url } (what element-call's parser requires) and
+         the original { active_focus } for older MSC4143 clients */
       focus_active: {
+        type: "livekit",
+        livekit_service_url: authUrl,
         active_focus: { focus: "livekit", livekit_service_url: authUrl },
         joined_ts: now,
       },
-      foci_preferred: [],
+      /* the transport current MatrixRTC clients (element-call, rust) read:
+         UnstableLivekitTransport = { type: "livekit", livekit_service_url }.
+         `focus` stays for older focus-shape parsers. */
+      foci_preferred: [{ type: "livekit", focus: "livekit", livekit_service_url: authUrl }],
       created_ts: now,
     };
-    const perDeviceKey = `${userId}_${deviceId}_m.call`;
+    /* MSC4143 per-device state key. Room versions before MSC3779 prefix it
+       with "_" — which is also what conduwuit's auth rules accept (the
+       unprefixed form is 403 on old-version rooms). */
+    const perDeviceKey = `_${userId}_${deviceId}_m.call`;
     try {
-      await this.client.sendStateEvent(roomId, "m.call.member", perDeviceKey, sessionContent);
+      /* the UNSTABLE event type: element-call's parser strictly checks
+         org.matrix.msc3401.call.member (our own parser accepts both) */
+      await this.client.sendStateEvent(
+        roomId,
+        "org.matrix.msc3401.call.member",
+        perDeviceKey,
+        sessionContent
+      );
       return;
     } catch {
-      /* server auth rules reject per-device state keys — legacy format */
+      /* server auth rules or power levels reject per-device state keys —
+         legacy per-user format */
     }
     const legacyContent = this._mergeLegacyMembership(roomId, deviceId, authUrl);
     await this.client.sendStateEvent(roomId, "m.call.member", userId, legacyContent);
@@ -157,7 +179,11 @@ export class LkCallManager {
     devices.push({
       device_id: deviceId,
       expires_ts: now + 5 * 60_000,
-      foci_active: [{ focus: "livekit", livekit_service_url: authUrl }],
+      foci_active: [
+        /* both shapes: `type` for the current transport parsers,
+           `focus` for the legacy focus format */
+        { type: "livekit", focus: "livekit", livekit_service_url: authUrl },
+      ],
     });
     return {
       "m.calls": [
@@ -273,10 +299,41 @@ export class LkCallManager {
       this._notice = "No microphone/camera available — using a synthetic stream";
     }
 
-    const lk = new LkRoom({ adaptiveStream: true, dynacast: true });
+    /* LiveKit-path E2EE: encrypted rooms only. Element-compatible —
+       livekit's own e2ee worker + per-participant keys over Matrix
+       (io.element.call.encryption_keys room events), so Grungus and
+       Element Call clients interop inside one encrypted call. */
+    if (matrixRoom?.isEncrypted && this.client.crypto && this.client.userId) {
+      try {
+        this._e2ee = await LkE2ee.create({
+          client: this.client,
+          roomId: roomId ?? "",
+          identity: this.client.userId,
+          deviceId: this.client.deviceId,
+        });
+      } catch (err) {
+        console.warn("[lk-call] E2EE setup failed (call stays plaintext):", err);
+        this._e2ee = null;
+      }
+    }
+
+    const lk = new LkRoom({
+      adaptiveStream: true,
+      dynacast: true,
+      ...(this._e2ee ? { e2ee: this._e2ee.options } : {}),
+    });
     this._wireEvents(lk);
     this._room = lk;
     await lk.connect(data.url, data.token);
+    if (this._e2ee) {
+      /* flip every sender/receiver transform on; the keys we distributed
+         (and keep resending) do the rest */
+      await lk.setE2EEEnabled(true).catch((err: unknown) =>
+        console.warn("[lk-call] setE2EEEnabled failed:", err)
+      );
+      this._e2ee.start();
+      this._notice = (this._notice ? this._notice + " · " : "") + "🔒 E2EE media";
+    }
     for (const track of localTracks) {
       await lk.localParticipant.publishTrack(track, {
         /* keep the camera at a sensible simulcast base */
@@ -305,6 +362,8 @@ export class LkCallManager {
       clearInterval(this._memberHeartbeat);
       this._memberHeartbeat = null;
     }
+    this._e2ee?.stop();
+    this._e2ee = null;
     this._room = null;
     this._roomId = null;
     this._matrixRtc = false;

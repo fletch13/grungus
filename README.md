@@ -131,6 +131,32 @@ for an open protocol.
   per-room remove buttons and an add-room picker (m.space.child state,
   via the user's homeserver as the routing hint). Rooms can be moved
   in and out live; every member's tree updates via sync.
+- **LiveKit-path E2EE media (element-call interop)** — in encrypted
+  rooms the SFU call's frames are end-to-end encrypted through
+  livekit-client's own E2EE worker (the same one Element Call runs),
+  with a per-participant 16-byte key distributed over Matrix in BOTH
+  generations of Element's protocol: megolm-wrapped
+  io.element.call.encryption_keys room events (js-sdk v33-era clients)
+  and olm-encrypted to-device io.element.call.encryption_keys with the
+  current js-sdk's exact content shape (media_key + the deprecated
+  keys/member fields). Receiving handles all three transports (room
+  events, olm to-device, and the rust SDKs' plaintext
+  org.matrix.msc4143.rtc.encryption_key). Keys rotate (growing index)
+  on member leave, resend on join and every 60s. The call membership is
+  published in current MatrixRTC shape: the UNSTABLE
+  org.matrix.msc3401.call.member type with `_user_device_m.call` state
+  keys, focus_active carrying BOTH the flattened {type, livekit_service_url}
+  form (element-call's parser requires it) and the legacy active_focus,
+  plus foci_preferred transports. The token service also serves
+  element-call's legacy /sfu/get and /get_token endpoints.
+  Interop verified live against a locally built element-call: it
+  authenticates through the token service, joins the same encrypted
+  call, sees the Grungus participant, and renders their tile with E2EE
+  active. NOTE for homeserver admins: MatrixRTC state types
+  (m.call.member / org.matrix.msc3401.call.member /
+  org.matrix.msc4143.rtc.member) must be sendable at power level 0 —
+  default room power levels gate them at 50 and element clients die
+  with MISSING_MATRIX_RTC_TRANSPORT-style auth failures.
 - **Read markers + receipts** — opening a room (or new messages
   arriving while it's open, debounced 1.5s) sends a public m.read
   receipt (POST /rooms/{id}/receipt/m.read/{eventId}) and the

@@ -63,9 +63,17 @@ export interface SyncResponse {
 }
 
 export interface ToDeviceEvent {
-  type: string;
   sender: string;
+  type: string;
   content: unknown;
+}
+
+/** A participant's media-encryption keys for a call (Element interop). */
+export interface MediaKeysEvent {
+  roomId: string | null;
+  sender: string;
+  deviceId: string | null;
+  keys: Array<{ index: number; key: string }>;
 }
 
 export interface MemberRecord {
@@ -332,6 +340,14 @@ export class MatrixClient {
    * MSC3401 call signaling in unencrypted rooms. Set by the call layer.
    */
   onToDevice: ((event: ToDeviceEvent) => void) | null = null;
+
+  /**
+   * Media (call) encryption keys received from other participants, either as
+   * Element-style io.element.call.encryption_keys room events (megolm-wrapped
+   * in encrypted rooms) or as to-device org.matrix.msc4143.rtc.encryption_key
+   * messages (Element mobile). Consumed by the LiveKit E2EE layer.
+   */
+  private _mediaKeyListeners = new Set<(keys: MediaKeysEvent) => void>();
 
   private _since: string | null = null;
   private _seen = new Set<string>();
@@ -825,23 +841,36 @@ export class MatrixClient {
       const expires = typeof content.expires === "number" ? content.expires : Infinity;
       const expiresTs = expires === Infinity ? Infinity : createdTs + expires;
       if (expiresTs !== Infinity && expiresTs <= now) continue;
-      const activeFocus = (content.focus_active as
-        | { active_focus?: { focus?: string; livekit_service_url?: string } }
-        | undefined)?.active_focus;
+      /* focus_active ships in two shapes: the original { active_focus:
+         { focus, livekit_service_url } } and the current flattened
+         { type: "livekit", livekit_service_url } (what element-call's
+         parser requires) — read both */
+      const focusActive = content.focus_active as
+        | {
+            active_focus?: { focus?: string; livekit_service_url?: string };
+            type?: string;
+            livekit_service_url?: string;
+          }
+        | undefined;
       const focusUrl =
-        activeFocus?.focus === "livekit" ? (activeFocus.livekit_service_url ?? null) : null;
-      /* the sender: the state key is `${userId}_${deviceId}_m.call`, and
+        focusActive?.active_focus?.focus === "livekit"
+          ? (focusActive.active_focus.livekit_service_url ?? null)
+          : focusActive?.type === "livekit"
+            ? (focusActive.livekit_service_url ?? null)
+            : null;
+      /* the sender: the state key is `[_]${userId}_${deviceId}_m.call`, and
          user ids may themselves contain underscores — match against the
          room's member list first, fall back to a prefix split */
+      const keyBody = stateKey.startsWith("_") ? stateKey.slice(1) : stateKey;
       let sender: string | null = null;
       for (const memberUserId of room.members.keys()) {
-        if (stateKey.startsWith(`${memberUserId}_`)) {
+        if (keyBody.startsWith(`${memberUserId}_`)) {
           sender = memberUserId;
           break;
         }
       }
       if (!sender) {
-        sender = stateKey.includes("_") ? stateKey.slice(0, stateKey.indexOf("_")) : stateKey;
+        sender = keyBody.includes("_") ? keyBody.slice(0, keyBody.indexOf("_")) : keyBody;
       }
       out.push({
         sender,
@@ -1051,6 +1080,12 @@ export class MatrixClient {
     const senderName = this._displayNameFor(room, ev.sender ?? null);
     const content = ev.content ?? {};
 
+    /* Element's media-key events are call machinery, not timeline items */
+    if (ev.type === "io.element.call.encryption_keys") {
+      this._maybeHandleMediaKeyEvent(room.id, ev);
+      return null;
+    }
+
     if (ev.type === "m.room.message" || ev.type === "m.sticker") {
       const isSticker = ev.type === "m.sticker";
       const msgtype = isSticker
@@ -1252,6 +1287,15 @@ export class MatrixClient {
         const toDevice = data.to_device?.events ?? [];
         for (const event of toDevice) {
           if (event.type === "m.room.encrypted") continue; /* handled by crypto */
+          /* Element mobile (matrix-rust-rtc) key transport:
+             org.matrix.msc4143.rtc.encryption_key with a single media_key */
+          if (
+            event.type === "org.matrix.msc4143.rtc.encryption_key" ||
+            event.type === "m.rtc.encryption_key"
+          ) {
+            this._maybeHandleRtcKeyToDevice(event);
+            continue;
+          }
           this.onToDevice?.(event);
         }
         if (this.crypto) {
@@ -1667,6 +1711,129 @@ export class MatrixClient {
       }
       throw err;
     }
+  }
+
+  /* ------------------------- media keys (calls) ------------------------- */
+
+  /**
+   * Subscribe to other participants' media-encryption keys (Element-style
+   * io.element.call.encryption_keys room events + rust to-device
+   * org.matrix.msc4143.rtc.encryption_key). Returns an unsubscribe function.
+   */
+  onMediaKeys(cb: (keys: MediaKeysEvent) => void): () => void {
+    this._mediaKeyListeners.add(cb);
+    return () => {
+      this._mediaKeyListeners.delete(cb);
+    };
+  }
+
+  private _emitMediaKeys(keys: MediaKeysEvent): void {
+    for (const cb of this._mediaKeyListeners) {
+      try {
+        cb(keys);
+      } catch (err) {
+        console.error("[grungus] media-key listener failed:", err);
+      }
+    }
+  }
+
+  /**
+   * Element web/js-sdk transport: a plain room event of type
+   * io.element.call.encryption_keys. In encrypted rooms the event rides
+   * Megolm like any other room event, so the homeserver never sees the key.
+   */
+  private _maybeHandleMediaKeyEvent(roomId: string, ev: MatrixEvent): void {
+    if (ev.type !== "io.element.call.encryption_keys") return;
+    const content = (ev.content ?? {}) as {
+      keys?: unknown;
+      device_id?: unknown;
+      call_id?: unknown;
+    };
+    if (content.call_id !== "") return; /* only room-scoped calls */
+    if (!Array.isArray(content.keys)) return;
+    const keys: Array<{ index: number; key: string }> = [];
+    for (const raw of content.keys) {
+      const entry = raw as { index?: unknown; key?: unknown } | null;
+      if (
+        !entry ||
+        typeof entry.index !== "number" ||
+        typeof entry.key !== "string"
+      ) {
+        continue;
+      }
+      keys.push({ index: entry.index, key: entry.key });
+    }
+    if (keys.length === 0 || !ev.sender) return;
+    this._emitMediaKeys({
+      roomId,
+      sender: ev.sender,
+      deviceId: typeof content.device_id === "string" ? content.device_id : null,
+      keys,
+    });
+  }
+
+  /**
+   * Element mobile (matrix-rust-rtc) key transport: a to-device event of type
+   * org.matrix.msc4143.rtc.encryption_key with content
+   * { room_id, member_id, media_key: { index, key }, format: 0 }.
+   */
+  private _maybeHandleRtcKeyToDevice(ev: ToDeviceEvent): void {
+    const content = (ev.content ?? {}) as {
+      room_id?: unknown;
+      member_id?: unknown;
+      media_key?: { index?: unknown; key?: unknown } | null;
+      format?: unknown;
+    };
+    const mediaKey = content.media_key;
+    if (
+      !ev.sender ||
+      !mediaKey ||
+      typeof mediaKey.index !== "number" ||
+      typeof mediaKey.key !== "string" ||
+      (content.format !== undefined && content.format !== 0)
+    ) {
+      return;
+    }
+    this._emitMediaKeys({
+      roomId: typeof content.room_id === "string" ? content.room_id : null,
+      sender: ev.sender,
+      deviceId: null,
+      keys: [{ index: mediaKey.index, key: mediaKey.key }],
+    });
+  }
+
+  /**
+   * Send a non-message room event (e.g. io.element.call.encryption_keys).
+   * Megolm-encrypted when the room is — the same fail-closed rules as
+   * sendMessage. Returns the server event id.
+   */
+  async sendRoomEvent(
+    roomId: string,
+    type: string,
+    content: Record<string, unknown>
+  ): Promise<string | null> {
+    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
+    const room = this.rooms.get(roomId);
+    const encrypted = room
+      ? room.isEncrypted === true
+      : this._pendingEncryption.get(roomId) === true;
+    if (!room && encrypted === undefined) {
+      throw new Error("Cannot send: room state not loaded yet (still syncing)");
+    }
+    if (encrypted && !this.crypto) {
+      throw new Error("Cannot send: E2EE is unavailable in this encrypted room");
+    }
+    const payload = encrypted
+      ? await this.crypto!.encryptRoomMessage(roomId, content, type)
+      : content;
+    const res = await this.api<{ event_id?: string }>(
+      "PUT",
+      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/${encodeURIComponent(
+        encrypted ? "m.room.encrypted" : type
+      )}/${encodeURIComponent(txnId)}`,
+      { body: payload }
+    );
+    return res?.event_id ?? null;
   }
 
   async createRoom(opts: CreateRoomOptions = {}): Promise<string> {
