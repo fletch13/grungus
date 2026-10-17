@@ -122,15 +122,26 @@ const server = http.createServer((req, res) => {
           string,
           unknown
         >;
-        const room = typeof body.room === "string" ? body.room : null;
-        if (!room || !/^[\w-]{1,120}$/.test(room)) {
+        /* "room" (Grungus) or "room_id" (Element Call's lk-jwt-service
+           convention — the MatrixRTC LiveKit room IS the matrix room) */
+        const room =
+          typeof body.room === "string"
+            ? body.room
+            : typeof body.room_id === "string"
+              ? body.room_id
+              : null;
+        /* Matrix room ids contain characters the strict room check
+           would reject — sanitize for the LiveKit room name while
+           keeping every matrix room distinct */
+        const safeRoom = room?.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 120) ?? null;
+        if (!safeRoom || !/^[\w-]{1,120}$/.test(safeRoom)) {
           send(res, 400, { error: "invalid room name" });
           return;
         }
         const userId = await verifyMatrixIdentity(body);
-        const token = mintLiveKitToken(userId, room);
-        console.log(`[lk-auth] ${userId} → room "${room}"`);
-        send(res, 200, { token, url: LK_URL, room });
+        const token = mintLiveKitToken(userId, safeRoom);
+        console.log(`[lk-auth] ${userId} → room "${safeRoom}"`);
+        send(res, 200, { token, url: LK_URL, room: safeRoom });
       } catch (err) {
         send(res, 403, { error: err instanceof Error ? err.message : String(err) });
       }

@@ -152,6 +152,16 @@ export interface InvitedRoom {
   isSpace: boolean;
 }
 
+export interface RtcMembership {
+  sender: string;
+  deviceId: string;
+  callId: string;
+  /** absolute expiry (ms epoch); Infinity when no expiry is given */
+  expiresTs: number;
+  /** the LiveKit service URL from the membership's focus, when present */
+  focusUrl: string | null;
+}
+
 export interface Room {
   id: string;
   name: string | null;
@@ -165,6 +175,12 @@ export interface Room {
   encryptionAlgorithm: string | null;
   /** m.call.member state: userId -> content (MSC3401 call membership). */
   callMembers: Map<string, Record<string, unknown>>;
+  /**
+   * Parsed MatrixRTC memberships (m.call.member state, both the legacy
+   * per-user and the MSC4143 per-device formats) — non-expired only,
+   * with the LiveKit focus URL when present.
+   */
+  rtcMemberships: RtcMembership[];
   /** com.grungus.livekit state: the room's LiveKit call service, if any. */
   livekitService: {
     url: string;
@@ -738,6 +754,100 @@ export class MatrixClient {
     });
   }
 
+  /* ----------------------------- spaces --------------------------------- */
+
+  /** Add a room to a space (m.space.child state on the space room). */
+  async addToSpace(spaceId: string, childRoomId: string): Promise<void> {
+    /* the via server: our user id's homeserver part */
+    const via = (this.userId ?? "").split(":")[1] ?? "localhost";
+    await this.sendStateEvent(spaceId, "m.space.child", childRoomId, { via: [via] });
+  }
+
+  /** Remove a room from a space (empty m.space.child content). */
+  async removeFromSpace(spaceId: string, childRoomId: string): Promise<void> {
+    await this.sendStateEvent(spaceId, "m.space.child", childRoomId, {});
+  }
+
+  /**
+   * Rebuild the room's parsed MatrixRTC memberships from m.call.member
+   * state — supports BOTH formats current clients use:
+   *   - the MSC4143 per-device session events: state_key =
+   *     `${userId}_${deviceId}_m.call`, content = { application: "m.call",
+   *     call_id, scope, device_id, expires, focus_active: { active_focus,
+   *     joined_ts }, foci_preferred, created_ts } (what Element Call
+   *     publishes today)
+   *   - the legacy per-user events: state_key = userId, content =
+   *     { m.calls: [ { m.call_id, m.devices: [{ device_id, expires_ts,
+   *     foci_active }] } ] } (js-sdk <= v33 / older Element Call)
+   * Expired memberships are dropped.
+   */
+  private _rebuildRtcMemberships(room: Room): void {
+    const now = Date.now();
+    const out: RtcMembership[] = [];
+    for (const [stateKey, content] of room.callMembers) {
+      /* legacy format: per-user with m.calls[] */
+      const calls = content["m.calls"] as
+        | { "m.call_id"?: string; "m.devices"?: unknown[] }[]
+        | undefined;
+      if (Array.isArray(calls)) {
+        for (const call of calls) {
+          const devices = (call["m.devices"] ?? []) as Record<string, unknown>[];
+          for (const device of devices) {
+            const deviceId = typeof device.device_id === "string" ? device.device_id : "";
+            if (!deviceId) continue;
+            const expiresTs =
+              typeof device.expires_ts === "number" ? device.expires_ts : Infinity;
+            const foci = device.foci_active as { focus?: string; livekit_service_url?: string }[] | undefined;
+            const focusUrl = foci?.find((f) => f.focus === "livekit")?.livekit_service_url ?? null;
+            if (expiresTs !== Infinity && expiresTs <= now) continue;
+            out.push({
+              sender: stateKey,
+              deviceId,
+              callId: typeof call["m.call_id"] === "string" ? call["m.call_id"] : "",
+              expiresTs,
+              focusUrl,
+            });
+          }
+        }
+        continue;
+      }
+      /* MSC4143 session format: per-device, flattened fields */
+      const deviceId = typeof content.device_id === "string" ? content.device_id : "";
+      if (!deviceId || content.application !== "m.call") continue;
+      const createdTs =
+        typeof content.created_ts === "number" ? content.created_ts : now;
+      const expires = typeof content.expires === "number" ? content.expires : Infinity;
+      const expiresTs = expires === Infinity ? Infinity : createdTs + expires;
+      if (expiresTs !== Infinity && expiresTs <= now) continue;
+      const activeFocus = (content.focus_active as
+        | { active_focus?: { focus?: string; livekit_service_url?: string } }
+        | undefined)?.active_focus;
+      const focusUrl =
+        activeFocus?.focus === "livekit" ? (activeFocus.livekit_service_url ?? null) : null;
+      /* the sender: the state key is `${userId}_${deviceId}_m.call`, and
+         user ids may themselves contain underscores — match against the
+         room's member list first, fall back to a prefix split */
+      let sender: string | null = null;
+      for (const memberUserId of room.members.keys()) {
+        if (stateKey.startsWith(`${memberUserId}_`)) {
+          sender = memberUserId;
+          break;
+        }
+      }
+      if (!sender) {
+        sender = stateKey.includes("_") ? stateKey.slice(0, stateKey.indexOf("_")) : stateKey;
+      }
+      out.push({
+        sender,
+        deviceId,
+        callId: typeof content.call_id === "string" ? content.call_id : "",
+        expiresTs,
+        focusUrl,
+      });
+    }
+    room.rtcMemberships = out;
+  }
+
   /* --------------------------- sync processing --------------------------- */
 
   private _ensureRoom(roomId: string): Room {
@@ -755,6 +865,7 @@ export class MatrixClient {
         isEncrypted: false,
         encryptionAlgorithm: null,
         callMembers: new Map(),
+        rtcMemberships: [],
         livekitService: null,
         typingUsers: [],
         children: new Set(),
@@ -813,7 +924,8 @@ export class MatrixClient {
           url && lkRoom && authUrl ? { url, room: lkRoom, authUrl } : null;
         break;
       }
-      case "m.call.member": {
+      case "m.call.member":
+      case "org.matrix.msc3401.call.member": {
         if (typeof ev.state_key !== "string") break;
         const calls = content["m.calls"];
         const hasDevices =
@@ -821,11 +933,17 @@ export class MatrixClient {
           (calls as { "m.devices"?: unknown[] }[]).some(
             (call) => Array.isArray(call["m.devices"]) && call["m.devices"]!.length > 0
           );
-        if (hasDevices) {
+        /* MSC4143 session format: flattened per-device content */
+        const isSessionMembership =
+          content.application === "m.call" &&
+          typeof content.device_id === "string" &&
+          content.device_id !== "";
+        if (hasDevices || isSessionMembership) {
           room.callMembers.set(ev.state_key, content);
         } else {
           room.callMembers.delete(ev.state_key);
         }
+        this._rebuildRtcMemberships(room);
         break;
       }
       case "m.room.member": {

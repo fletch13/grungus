@@ -28,6 +28,7 @@ import {
   createLocalTracks,
   type LocalTrack,
 } from "livekit-client";
+import type { Room } from "./matrix-client.ts";
 import type { MatrixClient } from "./matrix-client.ts";
 import { mxidLocalpart } from "./matrix-client.ts";
 
@@ -72,12 +73,143 @@ export class LkCallManager {
   }
 
   /** Join the room's LiveKit call (state event must be present). */
+  /** true when the current call goes through MatrixRTC signaling. */
+  private _matrixRtc = false;
+
+  /**
+   * Discover the LiveKit service for a MatrixRTC call (Element Call
+   * interop). Returns null when the room has no active memberships
+   * with a LiveKit focus. The focus URL points at the MatrixRTC
+   * authorization service (lk-jwt-service — the same pattern as
+   * Grungus's own livekit/auth-service.ts, which returns the SFU url
+   * together with the token); the LiveKit room for a MatrixRTC call is
+   * the MATRIX ROOM ID (every client in the room gets a token scoped
+   * to the same LiveKit room).
+   */
+  private async _discoverMatrixRtcFocus(
+    matrixRoom: Room,
+    roomId: string
+  ): Promise<{ room: string; authUrl: string } | null> {
+    const focusUrl = matrixRoom.rtcMemberships.find((m) => m.focusUrl)?.focusUrl ?? null;
+    if (!focusUrl) return null;
+    return { room: roomId, authUrl: focusUrl };
+  }
+
+  /**
+   * Publish our MatrixRTC membership (Element Call format): an
+   * m.call.member state event per device, state_key =
+   * `${userId}_${deviceId}_m.call` (MSC4143), session content with
+   * focus_active pointing at the auth service. Element Call (and any
+   * MatrixRTC client) then sees us in the call and can join the same
+   * LiveKit room.
+   *
+   * Some servers (this conduwuit build) only authorize the LEGACY
+   * per-user state key — on rejection we fall back to the legacy
+   * m.calls format (which every MatrixRTC client can parse).
+   */
+  private async _publishRtcMembership(roomId: string, authUrl: string): Promise<void> {
+    const userId = this.client.userId ?? "";
+    const deviceId = this.client.deviceId ?? "";
+    const now = Date.now();
+    const sessionContent = {
+      application: "m.call",
+      call_id: "",
+      scope: "m.room",
+      device_id: deviceId,
+      expires: 3_600_000,
+      focus_active: {
+        active_focus: { focus: "livekit", livekit_service_url: authUrl },
+        joined_ts: now,
+      },
+      foci_preferred: [],
+      created_ts: now,
+    };
+    const perDeviceKey = `${userId}_${deviceId}_m.call`;
+    try {
+      await this.client.sendStateEvent(roomId, "m.call.member", perDeviceKey, sessionContent);
+      return;
+    } catch {
+      /* server auth rules reject per-device state keys — legacy format */
+    }
+    const legacyContent = this._mergeLegacyMembership(roomId, deviceId, authUrl);
+    await this.client.sendStateEvent(roomId, "m.call.member", userId, legacyContent);
+  }
+
+  /**
+   * Build the legacy per-user membership content, MERGING our device
+   * into the existing m.calls (the state key is shared between devices
+   * of the same user — a blind overwrite would clobber them).
+   */
+  private _mergeLegacyMembership(
+    roomId: string,
+    deviceId: string,
+    authUrl: string
+  ): Record<string, unknown> {
+    const existing = this.client.getRoom(roomId)?.callMembers.get(this.client.userId ?? "") as
+      | { "m.calls"?: { "m.call_id"?: string; "m.devices"?: Record<string, unknown>[] }[] }
+      | undefined;
+    const now = Date.now();
+    const devices = (existing?.["m.calls"]?.[0]?.["m.devices"] ?? []).filter(
+      (d) => d.device_id !== deviceId
+    );
+    devices.push({
+      device_id: deviceId,
+      expires_ts: now + 3_600_000,
+      foci_active: [{ focus: "livekit", livekit_service_url: authUrl }],
+    });
+    return {
+      "m.calls": [
+        {
+          "m.call_id": existing?.["m.calls"]?.[0]?.["m.call_id"] ?? "",
+          "m.devices": devices,
+        },
+      ],
+    };
+  }
+
+  /** Clear our MatrixRTC membership (empty content = left). Tries the
+   *  per-device state key, then the legacy per-user key. */
+  private async _clearRtcMembership(roomId: string): Promise<void> {
+    const userId = this.client.userId ?? "";
+    const deviceId = this.client.deviceId ?? "";
+    try {
+      await this.client.sendStateEvent(roomId, "m.call.member", `${userId}_${deviceId}_m.call`, {});
+      return;
+    } catch {
+      /* per-device state keys not authorized on this server */
+    }
+    await this.client.sendStateEvent(roomId, "m.call.member", userId, {}).catch(() => {});
+  }
+
   async join(): Promise<void> {
     if (this._room) return;
     const roomId = this._roomId;
     const matrixRoom = roomId ? this.client.getRoom(roomId) : null;
-    const service = matrixRoom?.livekitService;
-    if (!service) throw new Error("No LiveKit service configured for this room");
+
+    /* LiveKit service discovery, in order:
+       1. this room's com.grungus.livekit state (the Grungus deployment)
+       2. an active MatrixRTC membership's focus (Element Call interop —
+          join the call Element Call or any MatrixRTC client started)
+       3. the homeserver's MSC4143 transports endpoint (Synapse's
+          matrix_rtc config; conduwuit does not serve it) */
+    const service = matrixRoom?.livekitService ?? null;
+    let lkRoom = service?.room ?? null;
+    let authUrl = service?.authUrl ?? null;
+    let matrixRtc = false;
+
+    if (!service && matrixRoom) {
+      const focus = await this._discoverMatrixRtcFocus(matrixRoom, roomId ?? "");
+      if (focus) {
+        lkRoom = focus.room;
+        authUrl = focus.authUrl;
+        matrixRtc = true;
+      }
+    }
+    /* the SFU url comes with the token from the auth service */
+    if (!lkRoom || !authUrl) {
+      throw new Error("No LiveKit service configured for this room");
+    }
+    this._matrixRtc = matrixRtc;
 
     /* prove our Matrix identity to the token service — send BOTH the
        scoped OpenID token and (as fallback for services on homeservers
@@ -86,14 +218,15 @@ export class LkCallManager {
     try {
       const openid = await this.client.requestOpenIdToken();
       authBody = {
-        room: service.room,
+        room: lkRoom,
+        room_id: lkRoom,
         openid_token: openid.access_token,
         matrix_token: this.client.accessToken,
       };
     } catch {
-      authBody = { room: service.room, matrix_token: this.client.accessToken };
+      authBody = { room: lkRoom, room_id: lkRoom, matrix_token: this.client.accessToken };
     }
-    const res = await fetch(service.authUrl, {
+    const res = await fetch(authUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(authBody),
@@ -131,13 +264,27 @@ export class LkCallManager {
         name: track.kind === "video" ? "camera" : "mic",
       });
     }
+    /* publish our MatrixRTC membership so Element Call (and any
+       MatrixRTC client) sees us in this call */
+    if (this._matrixRtc) {
+      await this._publishRtcMembership(roomId ?? "", authUrl).catch((err) =>
+        console.warn("[lk-call] MatrixRTC membership publish failed:", err)
+      );
+    }
     this._emit();
   }
 
   async leave(): Promise<void> {
     const room = this._room;
+    const leftRoomId = this._roomId;
+    const wasMatrixRtc = this._matrixRtc;
     this._room = null;
     this._roomId = null;
+    this._matrixRtc = false;
+    /* clear our MatrixRTC membership (Element Call then sees us leave) */
+    if (wasMatrixRtc && leftRoomId) {
+      await this._clearRtcMembership(leftRoomId);
+    }
     try {
       room?.disconnect();
     } catch {

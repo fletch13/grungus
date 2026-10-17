@@ -358,7 +358,8 @@ function startShell(): void {
       active.getSpaces(),
       state.roomId,
       state.spaceId,
-      active
+      active,
+      active.getRooms().filter((room) => !room.isDirect)
     );
   };
 
@@ -424,13 +425,16 @@ function startShell(): void {
 
   const startCall = (roomId: string): void => {
     const room = active.getRoom(roomId);
-    if (room?.livekitService) {
-      /* LiveKit path: publish the service state for others, then join the SFU */
+    /* LiveKit path when the room has a Grungus service state OR an
+       ongoing MatrixRTC call with a LiveKit focus (Element Call interop:
+       join the call another MatrixRTC client started) */
+    const rtcFocus = room?.rtcMemberships.find((m) => m.focusUrl)?.focusUrl ?? null;
+    if (room?.livekitService || rtcFocus) {
       callMode = "livekit";
       lkManager.setRoomId(roomId);
       void lkManager.join().catch((err: unknown) => {
         chat.setNotice(
-          `Could not join the LiveKit call: ${err instanceof Error ? err.message : "unknown error"}`
+          `Could not join the LiveKit call: ${err instanceof Error ? err.message : "network error"}`
         );
         callMode = "mesh";
       });
@@ -439,7 +443,7 @@ function startShell(): void {
     callMode = "mesh";
     void callManager.start(roomId).catch((err: unknown) => {
       chat.setNotice(
-        `Could not start call: ${err instanceof Error ? err.message : "unknown error"}`
+        `Could not start call: ${err instanceof Error ? err.message : "network error"}`
       );
     });
   };
@@ -763,6 +767,32 @@ function startShell(): void {
     void active.createRoom({ name, isPublic: false }).catch((err: unknown) => {
       chat.setNotice(
         `Could not create room: ${err instanceof Error ? err.message : "network error"}`
+      );
+    });
+  });
+
+  /* space management */
+  roomList.addEventListener("grungus:create-space", (event) => {
+    const name = (event as CustomEvent<{ name: string }>).detail.name;
+    void active.createRoom({ name, isPublic: false, isSpace: true }).catch((err: unknown) => {
+      chat.setNotice(
+        `Could not create space: ${err instanceof Error ? err.message : "network error"}`
+      );
+    });
+  });
+  roomList.addEventListener("grungus:add-to-space", (event) => {
+    const detail = (event as CustomEvent<{ spaceId: string; roomId: string }>).detail;
+    void active.addToSpace(detail.spaceId, detail.roomId).catch((err: unknown) => {
+      chat.setNotice(
+        `Could not add to space: ${err instanceof Error ? err.message : "network error"}`
+      );
+    });
+  });
+  roomList.addEventListener("grungus:remove-from-space", (event) => {
+    const detail = (event as CustomEvent<{ spaceId: string; roomId: string }>).detail;
+    void active.removeFromSpace(detail.spaceId, detail.roomId).catch((err: unknown) => {
+      chat.setNotice(
+        `Could not remove from space: ${err instanceof Error ? err.message : "network error"}`
       );
     });
   });

@@ -126,6 +126,28 @@ for an open protocol.
   (m.secret.request / m.secret.send over olm, only to verified own
   devices) and becomes a full signer — Element's
   requestKeysDuringVerification flow.
+- **Space management** — 🗂 in the sidebar creates a space
+  (creation_content.type m.space); selecting one shows its rooms with
+  per-room remove buttons and an add-room picker (m.space.child state,
+  via the user's homeserver as the routing hint). Rooms can be moved
+  in and out live; every member's tree updates via sync.
+- **Element Call interop (MatrixRTC)** — Grungus speaks the MatrixRTC
+  signaling Element Call uses: m.call.member state is parsed in BOTH
+  current formats (the MSC4143 per-device session events Element Call
+  publishes today, and the legacy per-user m.calls format), with
+  expiry filtering and LiveKit focus extraction. Joining a call
+  prefers the room's com.grungus.livekit state, then falls back to an
+  active MatrixRTC membership's focus (the lk-jwt-service pattern —
+  join the call another MatrixRTC client started, with the MATRIX ROOM
+  ID as the LiveKit room so every client lands in the same SFU room).
+  On join, Grungus publishes its own m.call.member membership (per-
+  device state keys on servers that authorize them — Synapse — and
+  the legacy per-user format merged with other devices' entries where
+  they are not, e.g. this conduwuit build) so Element Call sees us.
+  Signaling formats verified against the js-sdk/ruma sources and live
+  against conduwuit; media interop requires both sides on the same
+  LiveKit deployment. Not tested against a running Element Call
+  instance.
 - **Element QR interop modes** — the QR payload now uses Element's
   cross-signing modes when bootstrapped: 0x01 (self, we trust our MSK:
   firstKey = my MSK, secondKey = peer device key), 0x02 (self, new

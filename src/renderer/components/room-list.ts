@@ -27,6 +27,9 @@ export class RoomList extends HTMLElement {
   private _spaceId: string | null = null;
   private _client: MatrixClient | null = null;
   private _showForm = false;
+  private _showSpaceForm = false;
+  /** every joined non-DM room (for the space add-room picker) */
+  private _allRooms: Room[] = [];
   private _user: UserInfo | null = null;
   private _connection: ConnectionState = "connecting";
 
@@ -39,13 +42,15 @@ export class RoomList extends HTMLElement {
     spaces: Room[],
     selectedRoomId: string | null,
     spaceId: string | null,
-    client: MatrixClient | null
+    client: MatrixClient | null,
+    allRooms?: Room[]
   ): void {
     this._rooms = rooms;
     this._spaces = spaces;
     this._selectedRoomId = selectedRoomId;
     this._spaceId = spaceId;
     this._client = client;
+    this._allRooms = allRooms ?? rooms;
     this._render();
   }
 
@@ -85,6 +90,7 @@ export class RoomList extends HTMLElement {
     });
     addBtn.addEventListener("click", () => {
       this._showForm = !this._showForm;
+      this._showSpaceForm = false;
       this._render();
       if (this._showForm) {
         const input = this.querySelector<HTMLInputElement>(".new-room-form input");
@@ -92,7 +98,59 @@ export class RoomList extends HTMLElement {
       }
     });
     head.appendChild(addBtn);
+    /* new-space toggle (space management) */
+    const spaceBtn = el("button", {
+      class: "add-btn",
+      title: "Create a space",
+      "aria-label": "Create a space",
+      text: "🗂",
+    });
+    spaceBtn.addEventListener("click", () => {
+      this._showSpaceForm = !this._showSpaceForm;
+      this._showForm = false;
+      this._render();
+      if (this._showSpaceForm) {
+        const input = this.querySelector<HTMLInputElement>(".new-space-form input");
+        input?.focus();
+      }
+    });
+    head.appendChild(spaceBtn);
     this.appendChild(head);
+
+    /* inline create-space form */
+    if (this._showSpaceForm) {
+      const form = el("div", { class: "new-space-form" });
+      const input = el("input", {
+        type: "text",
+        placeholder: "new-space-name",
+        maxlength: "80",
+        spellcheck: "false",
+      }) as HTMLInputElement;
+      const create = el("button", { text: "Create" });
+      form.appendChild(input);
+      form.appendChild(create);
+      const submitNewSpace = (): void => {
+        const name = input.value.trim();
+        if (!name) return;
+        input.value = "";
+        this._showSpaceForm = false;
+        this.dispatchEvent(
+          new CustomEvent("grungus:create-space", {
+            detail: { name },
+            bubbles: true,
+          })
+        );
+        this._render();
+      };
+      create.addEventListener("click", submitNewSpace);
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          submitNewSpace();
+        }
+      });
+      this.appendChild(form);
+    }
 
     /* inline create-room form */
     if (this._showForm) {
@@ -132,6 +190,70 @@ export class RoomList extends HTMLElement {
 
     /* scrollable room sections */
     const scroll = el("div", { class: "room-scroll" });
+
+    /* space management: add/remove children (when a space is selected) */
+    if (space && this._client) {
+      const mgmt = el("div", { class: "space-manage" });
+      mgmt.appendChild(el("div", { class: "sidebar-section", text: "Space rooms" }));
+
+      /* current children with remove buttons */
+      const children = this._rooms.filter((room) => space.children.has(room.id));
+      for (const child of children) {
+        const row = el("div", { class: "space-child-row" });
+        row.appendChild(el("span", { class: "space-child-name", text: child.title }));
+        const rm = el("button", {
+          class: "space-child-remove",
+          title: `Remove ${child.title} from this space`,
+          text: "✕",
+        });
+        rm.addEventListener("click", () => {
+          this.dispatchEvent(
+            new CustomEvent("grungus:remove-from-space", {
+              detail: { spaceId: space.id, roomId: child.id },
+              bubbles: true,
+            })
+          );
+        });
+        row.appendChild(rm);
+        mgmt.appendChild(row);
+      }
+      if (children.length === 0) {
+        mgmt.appendChild(
+          el("div", { class: "empty-state", text: "No rooms in this space yet." })
+        );
+      }
+
+      /* add-room picker: joined rooms that are not yet children */
+      const candidates = this._allRooms.filter(
+        (room) => !room.isSpace && !room.isDirect && !space.children.has(room.id)
+      );
+      if (candidates.length > 0) {
+        const picker = el("div", { class: "space-add-row" });
+        const select = document.createElement("select");
+        select.className = "space-add-select";
+        for (const cand of candidates) {
+          const opt = document.createElement("option");
+          opt.value = cand.id;
+          opt.textContent = cand.title;
+          select.appendChild(opt);
+        }
+        const add = el("button", { text: "Add", class: "space-add-btn" });
+        add.addEventListener("click", () => {
+          const roomId = select.value;
+          if (!roomId) return;
+          this.dispatchEvent(
+            new CustomEvent("grungus:add-to-space", {
+              detail: { spaceId: space.id, roomId },
+              bubbles: true,
+            })
+          );
+        });
+        picker.appendChild(select);
+        picker.appendChild(add);
+        mgmt.appendChild(picker);
+      }
+      scroll.appendChild(mgmt);
+    }
 
     this._renderInvites(scroll);
 
