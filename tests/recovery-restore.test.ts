@@ -176,7 +176,7 @@ test("an Element-style backup (key in SSSS) restores with the passphrase", async
 });
 
 test("a Grungus-style backup (passphrase-derived) still restores", async (t) => {
-  const { client, cleanup } = await setup();
+  const { hs, client, cleanup } = await setup();
   t.after(cleanup);
 
   const crypto = new E2eeCrypto({ host: client, store: new MemoryCryptoStore() });
@@ -189,6 +189,15 @@ test("a Grungus-style backup (passphrase-derived) still restores", async (t) => 
   await waitFor(
     () => crypto.debugInboundSessions().length > 0,
     "session lands in the client"
+  );
+  /* the auto-backup PUT is async — wait for it server-side, not just
+     client-side (this raced on CI) */
+  await waitFor(
+    () =>
+      Object.values(hs.backedUpKeys.get("ruser") ?? {}).some(
+        (rooms) => Object.keys(rooms).length > 0
+      ),
+    "the session lands IN the backup"
   );
 
   const other = new E2eeCrypto({ host: client, store: new MemoryCryptoStore() });
