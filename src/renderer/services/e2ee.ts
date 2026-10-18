@@ -1286,14 +1286,16 @@ export class E2eeCrypto {
           session_key?: string;
           sender_key?: string;
         };
-        if (
-          data.room_id !== roomId ||
-          data.session_id !== sessionId ||
-          !data.session_key ||
-          !data.sender_key
-        ) {
-          continue;
-        }
+        /*
+         * rust/Element backups do NOT repeat room_id/session_id inside
+         * the encrypted payload — the backup path (rooms/{roomId}/
+         * sessions/{sessionId}) is the source of truth (js-sdk's rust
+         * restore does the same). Grungus's OWN backups embed the ids as
+         * well; when present they must agree with the path.
+         */
+        if (data.room_id !== undefined && data.room_id !== roomId) continue;
+        if (data.session_id !== undefined && data.session_id !== sessionId) continue;
+        if (!data.session_key || !data.sender_key) continue;
         const key = `${data.sender_key}|${sessionId}`;
         if (this._inbound.has(key)) continue;
         const igs = new olm.InboundGroupSession();

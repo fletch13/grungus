@@ -175,6 +175,84 @@ test("an Element-style backup (key in SSSS) restores with the passphrase", async
   assert.equal(importedViaKey, 1, "the base58 recovery key restores too");
 });
 
+test("a rust-style backup entry (no room_id/session_id in the payload) restores", async (t) => {
+  /* The user's bug: Element's rust crypto uploads backup entries whose
+     decrypted payload carries ONLY sender_key + session_key — the room
+     and session ids live in the backup PATH. The restore must take them
+     from the path instead of demanding them in the payload. */
+  const { hs, client, cleanup } = await setup();
+  t.after(cleanup);
+
+  const elementCrypto = new E2eeCrypto({ host: client, store: new MemoryCryptoStore() });
+  await elementCrypto.init();
+  client.crypto = elementCrypto;
+
+  const PASSPHRASE = "rust-payload-passphrase-7";
+  const storage = new SecretStorage(client);
+  await storage.createKey(PASSPHRASE, "rust key");
+
+  const olm = (await import("@matrix-org/olm")).default;
+  await olm.init();
+  const backupPk = new olm.PkDecryption();
+  const backupPrivateKey = crypto.getRandomValues(new Uint8Array(32));
+  const backupPublicKey = backupPk.init_with_private_key(backupPrivateKey);
+  let bin = "";
+  for (const b of backupPrivateKey) bin += String.fromCharCode(b);
+  await storage.storeSecret("m.megolm_backup.v1", btoa(bin));
+
+  const createRes = await client.api<{ version: string }>(
+    "POST",
+    "/_matrix/client/v3/room_keys/version",
+    {
+      body: {
+        algorithm: "m.megolm_backup.v1.curve25519-aes-sha2",
+        auth_data: { public_key: backupPublicKey },
+      },
+    }
+  );
+
+  const roomId = await client.createRoom({ name: "rust-payload", isPublic: true, encrypted: true });
+  await waitFor(() => client.getRoom(roomId)?.isEncrypted === true, "room encrypted");
+  await client.sendMessage(roomId, "rust-payload history");
+  await waitFor(
+    () => elementCrypto.debugInboundSessions().length > 0,
+    "the sender's inbound session lands via sync"
+  );
+  const inbound = [...elementCrypto.debugInboundSessions()][0];
+  assert.ok(inbound, "inbound session present");
+  const exported = elementCrypto.debugExportSession(inbound.senderKey, inbound.sessionId);
+
+  /* rust's shape: NO room_id / session_id inside the payload */
+  const payload = JSON.stringify({
+    session_key: exported,
+    sender_key: inbound.senderKey,
+  });
+  const pkEncryption = new olm.PkEncryption();
+  pkEncryption.set_recipient_key(backupPublicKey);
+  const encrypted = pkEncryption.encrypt(payload);
+  await client.api(
+    "PUT",
+    `/_matrix/client/v3/room_keys/keys/${encodeURIComponent(roomId)}/${encodeURIComponent(inbound.sessionId)}`,
+    {
+      query: { version: createRes.version },
+      body: {
+        first_message_index: 0,
+        forwarded_count: 0,
+        session_data: {
+          ciphertext: encrypted.ciphertext,
+          mac: encrypted.mac,
+          ephemeral: encrypted.ephemeral,
+        },
+      },
+    }
+  );
+
+  const grungusCrypto = new E2eeCrypto({ host: client, store: new MemoryCryptoStore() });
+  await grungusCrypto.init();
+  const imported = await grungusCrypto.restoreWithRecovery(PASSPHRASE);
+  assert.equal(imported, 1, "the rust-style entry restored from the path ids");
+});
+
 test("a Grungus-style backup (passphrase-derived) still restores", async (t) => {
   const { hs, client, cleanup } = await setup();
   t.after(cleanup);

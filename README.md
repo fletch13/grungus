@@ -253,7 +253,17 @@ for an open protocol.
   still work as the fallback path. Live-verified against the homeserver
   with an Element-style setup: a fresh Grungus device restored the
   history with just the passphrase and the UTD lines turned into
-  messages in place.
+  messages. (v0.21.1: entries written by Element's rust crypto —
+  which do NOT repeat room_id/session_id inside the encrypted
+  payload, keeping them only in the backup path — were silently
+  skipped by the restore, so every rust-backed-up session imported
+  0 and Element→Grungus messages stayed UTD even after a successful
+  restore. The restore now takes the room/session ids from the
+  backup path like js-sdk does and only cross-checks the payload
+  fields when the writer included them. Reproduced live with a
+  rust-bootstrapped account: the same recovery key went from
+  "Restored 0 sessions" to "Restored 1 session" and both UTD lines
+  decrypted in place.)
 - **Read markers + receipts** — opening a room (or new messages
   arriving while it's open, debounced 1.5s) sends a public m.read
   receipt (POST /rooms/{id}/receipt/m.read/{eventId}) and the
