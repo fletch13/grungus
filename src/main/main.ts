@@ -250,10 +250,21 @@ function createWindow(): BrowserWindow {
   void win.loadFile(path.join(__dirname, "index.html"));
 
   win.once("ready-to-show", () => {
+    /* open using the full screen — a 1280x800 window on a desktop
+       display looks like the app ignores the monitor */
+    win.maximize();
     win.show();
     if (SMOKE) {
       console.log("[grungus] smoke: window ready");
       setTimeout(() => app.exit(0), 500);
+    }
+  });
+
+  /* F11 toggles true fullscreen (the OS/windowing default is a resized
+     window, not fullscreen) */
+  win.webContents.on("before-input-event", (_e, input) => {
+    if (input.type === "keyDown" && input.key === "F11") {
+      win.setFullScreen(!win.isFullScreen());
     }
   });
 

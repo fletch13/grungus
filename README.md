@@ -163,6 +163,16 @@ for an open protocol.
   left-room ignore set keeps later syncs (which carry the leave event)
   from resurrecting the chat, rooms.leave sections from other devices
   delete locally too, and the open chat view clears when its room goes.
+- **Fullscreen fixes: screenshare stage + maximized window** — shared
+  screens now use the full call view: the presentation tile flexes to
+  fill ALL space the header/footer/participants leave (previously it
+  was capped at 1100px wide with a fixed 16:9 box while the video grid
+  below took flex:1 — so a shared screen rendered on roughly half the
+  call view). While a screen is on stage the participant tiles shrink
+  to a strip (Discord-style stage layout). Measured at 1920x1080: the
+  stage tile is now 1888x782 (71% of the overlay, full width), grid
+  strips to 154px. The Electron window now opens maximized instead of
+  a 1280x800 box, and F11 toggles true fullscreen.
 - **Element↔Grungus E2EE message interop** — Element clients could not
   decrypt Grungus-sent room messages (UTD on the Element side only).
   Root cause: the megolm room-key share (`m.room_key` over olm) encrypted
