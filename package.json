@@ -11,7 +11,9 @@
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "smoke": "npm run build && electron . --smoke",
-    "test": "node --test"
+    "test": "node --test",
+    "dist": "npm run build && electron-builder --linux",
+    "dist:dir": "npm run build && electron-builder --linux dir"
   },
   "repository": {
     "type": "git",
@@ -27,17 +29,18 @@
     "@types/node": "^26.6.5",
     "@types/qrcode": "^1.5.6",
     "electron": "^44.7.2",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
-    "typescript": "^7.0.2"
-  },
-  "dependencies": {
+    "typescript": "^7.0.2",
     "@matrix-org/olm": "^3.2.15",
     "jsonwebtoken": "^9.0.3",
     "jsqr": "^1.4.0",
     "livekit-client": "^2.22.4",
     "qrcode": "^1.5.4"
   },
+  "dependencies": {},
   "allowScripts": {
     "esbuild@0.28.2": true
-  }
+  },
+  "desktopName": "Grungus"
 }

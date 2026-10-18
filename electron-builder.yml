@@ -1,0 +1,40 @@
+appId: com.fletch13.grungus
+productName: Grungus
+copyright: Copyright © 2026 fletch13
+
+directories:
+  output: release
+  buildResources: build
+
+# The whole app is esbuild-bundled into dist/ (main.cjs + preload.cjs +
+# renderer.js + wasm + worker + styles); no node_modules ship.
+files:
+  - "dist/**/*"
+
+asar: true
+# keep native-ish payloads outside the archive: WASM fetch + the LiveKit
+# E2EE worker load them as resources
+asarUnpack:
+  - "**/*.wasm"
+  - "**/livekit-client.e2ee.worker.js"
+
+linux:
+  syncDesktopName: true
+  target:
+    - AppImage
+    - deb
+    - dir
+  category: Network
+  synopsis: Discord-style desktop chat client for the Matrix network
+  description: |
+    Grungus is a Discord-style desktop chat client that speaks the Matrix
+    protocol: Olm/Megolm end-to-end encryption, cross-signing, SSSS key
+    backup, mesh and LiveKit SFU calls, spaces, and Element interop.
+  maintainer: fletch13 <fletch13@users.noreply.github.com>
+  icon: build/icon.png
+
+appImage:
+  artifactName: Grungus-${version}-${arch}.AppImage
+
+deb:
+  artifactName: grungus_${version}_${arch}.deb

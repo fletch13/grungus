@@ -53,3 +53,32 @@ jobs:
 
       - name: Build and boot the app headlessly, then exit
         run: xvfb-run -a npm run smoke
+
+  package:
+    name: Package Linux distributables
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the app bundle
+        run: npm run build
+
+      - name: Package (AppImage, deb, portable dir)
+        run: npx electron-builder --linux --publish never
+
+      - name: Upload distributables
+        uses: actions/upload-artifact@v4
+        with:
+          name: grungus-linux
+          path: |
+            release/*.AppImage
+            release/*.deb
+          if-no-files-found: error
