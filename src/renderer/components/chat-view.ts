@@ -26,6 +26,10 @@ export class ChatView extends HTMLElement {
   private _callJoined = false;
   private _typingSentAt = 0;
   private _typingStopTimer: ReturnType<typeof setTimeout> | null = null;
+  /* user preferences (settings overlay) */
+  private _enterToSend = true;
+  private _sendTyping = true;
+  private _showTimestamps = true;
   /** the DM "Seen" indicator bar (below the timeline) */
   private _seenBar: HTMLElement | null = null;
   private _replyTarget: { eventId: string; sender: string; senderName: string; body: string } | null = null;
@@ -75,7 +79,10 @@ export class ChatView extends HTMLElement {
     wrap.appendChild(this._hint);
 
     this._input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && !event.shiftKey) {
+      const wantsSend = this._enterToSend
+        ? event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.metaKey
+        : event.key === "Enter" && (event.ctrlKey || event.metaKey);
+      if (wantsSend) {
         event.preventDefault();
         this._submit();
         this._typingStop();
@@ -265,6 +272,7 @@ export class ChatView extends HTMLElement {
       client: this._client,
       room: this._room,
       meUserId: this._meUserId,
+      showTimestamps: this._showTimestamps,
     }, {
       onReply: (msg) => this._startReply(msg),
       onReact: (msg, emoji) => {
@@ -384,7 +392,21 @@ export class ChatView extends HTMLElement {
       : "";
   }
 
+  /** Apply user preferences from the settings overlay. */
+  applyPreferences(prefs: {
+    enterToSend: boolean;
+    sendTyping: boolean;
+    showTimestamps: boolean;
+  }): void {
+    const timestampsChanged = this._showTimestamps !== prefs.showTimestamps;
+    this._enterToSend = prefs.enterToSend;
+    this._sendTyping = prefs.sendTyping;
+    this._showTimestamps = prefs.showTimestamps;
+    if (timestampsChanged && this._room) this._renderTimeline();
+  }
+
   private _typingPulse(): void {
+    if (!this._sendTyping) return;
     this.dispatchEvent(new CustomEvent("grungus:typing", { bubbles: true }));
     if (this._typingStopTimer) clearTimeout(this._typingStopTimer);
     this._typingStopTimer = setTimeout(() => this._typingStop(), 12_000);

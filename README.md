@@ -163,6 +163,36 @@ for an open protocol.
   left-room ignore set keeps later syncs (which carry the leave event)
   from resurrecting the chat, rooms.leave sections from other devices
   delete locally too, and the open chat view clears when its room goes.
+- **Settings menu (⚙ next to your name)** — the sidebar's user pill has a
+  cogwheel (Discord-style placement) that opens a full settings overlay
+  with Element's standard sections, all wired to real Matrix APIs:
+  - *My Account* — change display name (PUT /profile), upload an avatar
+    (PUT /profile avatar_url from an mxc via the media upload), change
+    the account password through the UIA m.login.password flow
+    (optionally logging out every other session), and log out.
+  - *Sessions* — every device on the account (GET /devices) with name,
+    id, and last-seen; rename the current device (PUT /devices/{id}),
+    log out any other device (POST /delete_devices, UIA password).
+  - *Appearance* — dark/light theme (whole palette flips through CSS
+    variables), font-size slider (0.8–1.4x applied live), compact
+    message density.
+  - *Preferences* — send typing notifications, send read receipts
+    (m.read + m.fully_read — turning it off stops BOTH wire calls:
+    room selection and the debounced timeline marker), Enter-to-send
+    (off = Ctrl/Cmd+Enter sends), message timestamps, markdown,
+    auto-scroll.
+  - *Notifications* — desktop notifications for messages in unfocused
+    rooms (clicking one jumps to the room) and a notification sound.
+  - *Voice & Video* — microphone / speaker / camera pickers
+    (enumerateDevices), persisted per device id ("" = system default).
+  - *Ignored Users* — the m.ignored_user_list account data, with
+    unignore.
+  - *Advanced* — masked access token with reveal, device id,
+    homeserver, and clear-local-cache-and-reload (crypto stores only;
+    the session stays logged in).
+  - *Help & About* — version, crypto stack summary.
+  Settings persist in localStorage (`grungus-settings`), subscribe
+  everywhere, and load-merge with defaults + font-scale clamping.
 - **Fullscreen fixes: screenshare stage + maximized window** — shared
   screens now use the full call view: the presentation tile flexes to
   fill ALL space the header/footer/participants leave (previously it

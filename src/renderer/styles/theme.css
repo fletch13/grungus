@@ -1520,3 +1520,243 @@ incoming-call.incoming-call-visible {
     display: none;
   }
 }
+
+/* ============================== settings (⚙) ============================== */
+
+/* the cogwheel next to the name in the sidebar footer */
+.settings-cog {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+
+.settings-cog:hover {
+  color: var(--text-bright);
+  background: var(--bg-hover);
+}
+
+/* the overlay itself — same stacking as the call overlay */
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(15, 16, 19, 0.97);
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  overflow: hidden;
+}
+
+.settings-frame {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 8px 16px;
+}
+
+.settings-title {
+  color: var(--text-bright);
+  font-weight: 800;
+  font-size: 20px;
+}
+
+.settings-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 0 32px;
+  min-height: 0;
+}
+
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+.settings-nav-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  text-align: left;
+  font-size: 15px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.settings-nav-btn:hover {
+  color: var(--text-bright);
+  background: var(--bg-hover);
+}
+
+.settings-nav-btn.active {
+  color: var(--text-bright);
+  background: var(--bg-active);
+}
+
+.settings-panel {
+  overflow-y: auto;
+  min-height: 0;
+  padding: 8px 16px 24px 0;
+}
+
+.settings-section {
+  margin: 8px 0 18px;
+}
+
+.settings-section h2 {
+  margin: 0 0 4px;
+  color: var(--text-bright);
+  font-size: 20px;
+}
+
+.settings-subtitle {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.settings-labeled {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--divider);
+}
+
+.settings-label {
+  color: var(--text-bright);
+  font-weight: 700;
+  font-size: 13px;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.settings-col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-input {
+  background: var(--bg-input);
+  border: 1px solid transparent;
+  color: var(--text-bright);
+  padding: 9px 10px;
+  border-radius: 6px;
+  font-size: 14px;
+  outline: none;
+  max-width: 340px;
+}
+
+.settings-input:focus {
+  border-color: var(--accent);
+}
+
+.settings-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.settings-toggle-text {
+  color: var(--text-bright);
+}
+
+.settings-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+.settings-static {
+  color: var(--text);
+  font-size: 14px;
+  word-break: break-all;
+}
+
+.settings-token {
+  font-family: monospace;
+  font-size: 13px;
+  color: var(--text);
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-empty {
+  color: var(--text-muted);
+  padding: 16px 0;
+}
+
+.settings-status {
+  color: var(--ok);
+  padding: 10px 4px 0;
+  font-size: 14px;
+}
+
+.settings-status.error {
+  color: var(--danger);
+}
+
+.device-row {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--divider);
+}
+
+.device-name {
+  color: var(--text-bright);
+  font-weight: 600;
+}
+
+.device-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* light theme — the whole palette flips through the same variables */
+body.theme-light {
+  --bg-rail: #e3e5e8;
+  --bg-sidebar: #f2f3f5;
+  --bg-chat: #ffffff;
+  --bg-input: #ebedef;
+  --bg-hover: #e0e1e4;
+  --bg-active: #d4d7dc;
+  --bg-user: #e9ebee;
+  --text: #2e3338;
+  --text-bright: #060607;
+  --text-muted: #5c5e66;
+  --text-label: #3f4247;
+  --divider: #d6d8dc;
+  background: var(--bg-chat);
+}
+
+/* compact message density */
+body.compact-messages .msg {
+  padding: 2px 16px;
+}
+
+body.compact-messages .msg-grouped .msg-body {
+  margin-top: 0;
+}

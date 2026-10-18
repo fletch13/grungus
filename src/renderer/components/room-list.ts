@@ -428,6 +428,18 @@ export class RoomList extends HTMLElement {
     );
     footer.appendChild(meta);
 
+    /* the ⚙ cogwheel next to the name opens user settings (Discord-style
+       placement: bottom-left user pill) */
+    const cog = el("button", {
+      class: "settings-cog",
+      title: "User settings",
+      text: "⚙",
+    });
+    cog.addEventListener("click", () => {
+      this.dispatchEvent(new CustomEvent("grungus:open-settings", { bubbles: true }));
+    });
+    footer.appendChild(cog);
+
     let dotClass = "conn-dot";
     if (this._connection === "online") dotClass += " online";
     else if (this._connection === "connecting") dotClass += " connecting";

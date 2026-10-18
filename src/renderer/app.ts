@@ -9,6 +9,8 @@ import { el } from "./components/ui.ts";
 import { LoginView, type LoginDetail } from "./components/login-view.ts";
 import type { SpaceRail } from "./components/space-rail.ts";
 import type { RoomList, UserInfo } from "./components/room-list.ts";
+import { SettingsView } from "./components/settings-view.ts";
+import { SettingsStore } from "./services/settings.ts";
 import type { ChatView } from "./components/chat-view.ts";
 import type { MemberList } from "./components/member-list.ts";
 import type { AppShell } from "./components/app-shell.ts";
@@ -380,7 +382,10 @@ function startShell(): void {
     if (markReadTimer) clearTimeout(markReadTimer);
     markReadTimer = setTimeout(() => {
       markReadTimer = null;
-      if (state.roomId === roomId) active.markRoomRead(roomId);
+      /* the settings overlay can turn read receipts off entirely */
+      if (settings.get("sendReadReceipts") && state.roomId === roomId) {
+        active.markRoomRead(roomId);
+      }
     }, 1_500);
   };
   /** per-room "call was ongoing last we looked" — rings only fire on an
@@ -474,6 +479,91 @@ function startShell(): void {
   chat.addEventListener("grungus:start-call", (event) => {
     startCall((event as CustomEvent<{ roomId: string }>).detail.roomId);
   });
+
+  /* ---- settings (⚙ next to the name) ---- */
+  const settings = new SettingsStore();
+  const settingsView = document.createElement("settings-view") as SettingsView;
+  settingsView.hidden = true;
+  root.appendChild(settingsView);
+
+  /** apply appearance settings to the document (theme/font/compact). */
+  const applyAppearance = (): void => {
+    const all = settings.all;
+    document.body.classList.toggle("theme-light", all.theme === "light");
+    document.body.style.fontSize = `${all.fontScale * 15}px`;
+    document.body.classList.toggle("compact-messages", all.compact);
+    chat.applyPreferences({
+      enterToSend: all.enterToSend,
+      sendTyping: all.sendTypingNotifications,
+      showTimestamps: all.showTimestamps,
+    });
+  };
+  applyAppearance();
+  settings.subscribe(() => {
+    applyAppearance();
+    settingsView.update(active, settings, userInfo);
+  });
+
+  let userInfo: UserInfo | null = null;
+  const setUserInfo = (info: UserInfo | null): void => {
+    userInfo = info;
+    settingsView.update(active, settings, userInfo);
+  };
+
+  const openSettings = (panel?: Parameters<SettingsView["show"]>[0]): void => {
+    settingsView.update(active, settings, userInfo);
+    settingsView.show(panel);
+  };
+  root.addEventListener("grungus:open-settings", () => {
+    openSettings();
+  });
+  settingsView.addEventListener("grungus:logout", () => {
+    settingsView.hide();
+    /* reuse the sidebar's logout flow */
+    active
+      .logout()
+      .catch(() => undefined)
+      .finally(() => {
+        client = null;
+        showLogin();
+      });
+  });
+
+  /* notification plumbing: OS notifications for new messages in
+     unfocused rooms, respecting the two settings toggles */
+  const notifyForMessage = (roomId: string, sender: string, body: string): void => {
+    if (document.hasFocus()) return;
+    if (sender === active.userId) return;
+    const all = settings.all;
+    if (!all.desktopNotifications) return;
+    const room = active.getRoom(roomId);
+    const title = room?.name || "Grungus";
+    const senderName = room?.members.get(sender)?.displayname ?? sender;
+    try {
+      const n = new Notification(`${title} — ${senderName}`, { body: body.slice(0, 120) });
+      n.onclick = () => {
+        window.focus();
+        state.roomId = roomId;
+        selectRoom(roomId);
+        n.close();
+      };
+      if (all.notificationSound) {
+        /* short soft beep — no asset files, pure WebAudio */
+        const ctx = new AudioContext();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.frequency.value = 660;
+        gain.gain.setValueAtTime(0.08, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.25);
+        void ctx.close().catch(() => undefined);
+      }
+    } catch {
+      /* notifications unsupported/permission denied — silently skip */
+    }
+  };
 
   /* ---- SAS device verification ---- */
   const verifyView = document.createElement("verify-view");
@@ -773,7 +863,8 @@ function startShell(): void {
     const room = active.getRoom(roomId);
     if (!room) return;
     state.roomId = roomId;
-    active.markRoomRead(roomId);
+    /* settings: read receipts can be turned off */
+    if (settings.get("sendReadReceipts")) active.markRoomRead(roomId);
     chat.setRoom(room, active, active.userId);
     /* the call state may have arrived in the initial sync (before this
        room was ever selected) — refresh the header's Join call state */
@@ -973,9 +1064,23 @@ function startShell(): void {
       chat.setTypingUsers(update.room.typingUsers);
       /* the open room is being read: keep the unread at zero and send
          fresh read markers (debounced — receipts for every message
-         would spam the room) */
+         would spam the room) — unless the user turned receipts off */
       if (update.newEvents.some((e) => e.kind === "message")) {
         scheduleMarkRead(update.room.id);
+      }
+      /* OS notifications for fresh messages that arrive while we are
+         elsewhere (or the window is unfocused) */
+      if (document.hidden || update.room.id !== state.roomId) {
+        for (const ev of update.newEvents) {
+          if (ev.kind !== "message") continue;
+          const sender = "sender" in ev && typeof (ev as { sender?: unknown }).sender === "string"
+            ? (ev as { sender: string }).sender
+            : "";
+          const body = "body" in ev && typeof (ev as { body?: unknown }).body === "string"
+            ? (ev as { body: string }).body
+            : "";
+          if (sender && body) notifyForMessage(update.room.id, sender, body);
+        }
       }
       /* receipts changed (someone read our messages) — re-render the
          Seen indicator */
@@ -1053,11 +1158,13 @@ function startShell(): void {
   void active
     .getProfile(user.userId)
     .then((profile) => {
-      roomList.setUser({
+      const enriched: UserInfo = {
         ...user,
         displayname: profile.displayname ?? null,
         avatarMxc: profile.avatar_url ?? null,
-      });
+      };
+      roomList.setUser(enriched);
+      setUserInfo(enriched);
     })
     .catch(() => {
       /* profile is optional decoration */

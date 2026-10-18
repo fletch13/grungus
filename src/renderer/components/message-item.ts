@@ -14,6 +14,8 @@ export interface MessageItemOptions {
   client: MatrixClient | null;
   room: Room | null;
   meUserId?: string | null;
+  /** user preference: hide the per-message timestamp */
+  showTimestamps?: boolean;
 }
 
 export interface MessageActions {
@@ -92,7 +94,9 @@ export class MessageItemElement extends HTMLElement {
       });
       author.style.color = colorFor(item.sender);
       head.appendChild(author);
-      head.appendChild(el("span", { class: "msg-time", text: formatTime(item.ts) }));
+      if (opts.showTimestamps !== false) {
+        head.appendChild(el("span", { class: "msg-time", text: formatTime(item.ts) }));
+      }
       main.appendChild(head);
     }
 

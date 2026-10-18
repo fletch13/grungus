@@ -717,6 +717,137 @@ export class MatrixClient {
     this.connectionState = "stopped";
   }
 
+  /* ------------------------- account & profile ---------------------------- */
+
+  /**
+   * Set the display name (PUT /profile/{userId}/displayname). Other
+   * devices see the change via the next profile fetch.
+   */
+  async setDisplayName(name: string): Promise<void> {
+    await this.api(
+      "PUT",
+      `${CLIENT_PREFIX}/profile/${encodeURIComponent(this.userId ?? "")}/displayname`,
+      { body: { displayname: name } }
+    );
+  }
+
+  /** Set the avatar (PUT /profile/{userId}/avatar_url) from an mxc URI. */
+  async setAvatarUrl(mxc: string): Promise<void> {
+    await this.api(
+      "PUT",
+      `${CLIENT_PREFIX}/profile/${encodeURIComponent(this.userId ?? "")}/avatar_url`,
+      { body: { avatar_url: mxc } }
+    );
+  }
+
+  /**
+   * Change the account password (POST /account/password). UIA: the
+   * server challenges with m.login.password; the CURRENT password is
+   * used once for the challenge and never stored. When logoutDevices is
+   * true every other session is logged out (Element's wording).
+   */
+  async changePassword(
+    currentPassword: string,
+    newPassword: string,
+    logoutDevices: boolean
+  ): Promise<void> {
+    const base = {
+      new_password: newPassword,
+      logout_devices: logoutDevices,
+    };
+    const authBody = {
+      type: "m.login.password",
+      identifier: { type: "m.id.user", user: this.userId ?? "" },
+      password: currentPassword,
+    };
+    try {
+      await this.api("POST", `${CLIENT_PREFIX}/account/password`, { body: base });
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status !== 401) throw err;
+      const challenge = err.body as { session?: string } | null;
+      await this.api("POST", `${CLIENT_PREFIX}/account/password`, {
+        body: {
+          ...base,
+          auth: {
+            ...authBody,
+            ...(challenge?.session ? { session: challenge.session } : {}),
+          },
+        },
+      });
+    }
+  }
+
+  /** All sessions/devices of the account (GET /devices). */
+  async getDevices(): Promise<
+    { deviceId: string; displayName: string | null; lastSeenTs: number | null; lastSeenIp: string | null }[]
+  > {
+    const res = await this.api<{ devices?: { device_id: string; display_name?: string | null; last_seen_ts?: number; last_seen_ip?: string }[] }>(
+      "GET",
+      `${CLIENT_PREFIX}/devices`
+    );
+    return (res.devices ?? []).map((d) => ({
+      deviceId: d.device_id,
+      displayName: d.display_name ?? null,
+      lastSeenTs: d.last_seen_ts ?? null,
+      lastSeenIp: d.last_seen_ip ?? null,
+    }));
+  }
+
+  /** Rename one of our devices (PUT /devices/{deviceId}). */
+  async setDeviceName(deviceId: string, name: string): Promise<void> {
+    await this.api(
+      "PUT",
+      `${CLIENT_PREFIX}/devices/${encodeURIComponent(deviceId)}`,
+      { body: { display_name: name } }
+    );
+  }
+
+  /**
+   * Log out other devices (POST /delete_devices). UIA with the account
+   * password, same one-shot pattern as changePassword.
+   */
+  async deleteDevices(deviceIds: string[], authPassword: string): Promise<void> {
+    const base = { devices: deviceIds };
+    const authBody = {
+      type: "m.login.password",
+      identifier: { type: "m.id.user", user: this.userId ?? "" },
+      password: authPassword,
+    };
+    try {
+      await this.api("POST", `${CLIENT_PREFIX}/delete_devices`, { body: base });
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status !== 401) throw err;
+      const challenge = err.body as { session?: string } | null;
+      await this.api("POST", `${CLIENT_PREFIX}/delete_devices`, {
+        body: {
+          ...base,
+          auth: {
+            ...authBody,
+            ...(challenge?.session ? { session: challenge.session } : {}),
+          },
+        },
+      });
+    }
+  }
+
+  /** The ignored-users list (m.ignored_user_list account data). */
+  getIgnoredUsers(): string[] {
+    const content = this.getAccountData("m.ignored_user_list");
+    if (!content || typeof content.ignored_users !== "object" || !content.ignored_users) {
+      return [];
+    }
+    return Object.keys(content.ignored_users as Record<string, unknown>);
+  }
+
+  /** Stop ignoring a user (rewrites m.ignored_user_list without them). */
+  async unignoreUser(userId: string): Promise<void> {
+    const remaining: Record<string, unknown> = {};
+    for (const id of this.getIgnoredUsers()) {
+      if (id !== userId) remaining[id] = {};
+    }
+    await this.setAccountData("m.ignored_user_list", { ignored_users: remaining });
+  }
+
   /* ----------------------------- account data ---------------------------- */
 
   /** Latest account data content for a type (from sync), or null. */

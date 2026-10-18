@@ -17,6 +17,8 @@ interface MockUser {
   password: string;
   userId: string;
   displayname: string;
+  /** settings: PUT profile avatar_url */
+  avatarMxc: string | null;
   /** room ids the user left (rooms.leave source of truth) */
   pendingLeaveSync: Set<string>;
   /** deviceId → room ids already delivered to that device */
@@ -60,6 +62,8 @@ interface MockDevice {
   deviceKeys: Record<string, unknown>;
   /** "signed_curve25519/<id>" -> signed key object ({ key, signatures }) */
   oneTimeKeys: Map<string, Record<string, unknown>>;
+  /** settings: PUT /devices/{id} display_name */
+  displayName?: string | null;
 }
 
 interface CreateRoomOptions {
@@ -147,6 +151,7 @@ export class MockHomeserver {
       password,
       userId,
       displayname: username,
+      avatarMxc: null,
       pendingLeaveSync: new Set(),
       leaveDelivered: new Map(),
     });
@@ -501,12 +506,48 @@ export class MockHomeserver {
       const token = "tok_" + crypto.randomBytes(12).toString("hex");
       const deviceId = "MOCK_" + crypto.randomBytes(6).toString("hex");
       this.tokens.set(token, { username: user.username, deviceId });
+      /* login creates a device, like a real homeserver: GET /devices
+         lists every session, not only those that uploaded keys */
+      const loginDevices = this.devices.get(user.username) ?? new Map<string, MockDevice>();
+      if (!loginDevices.has(deviceId)) {
+        loginDevices.set(deviceId, {
+          deviceId,
+          deviceKeys: {},
+          oneTimeKeys: new Map(),
+          displayName: null,
+        });
+      }
+      this.devices.set(user.username, loginDevices);
       this._send(res, 200, {
         access_token: token,
         user_id: user.userId,
         device_id: deviceId,
         home_server: "mock.hs",
       });
+      return;
+    }
+
+    /* GET /profile/{userId} is public per spec (clients fetch profiles
+       before/without auth); everything else below needs a token */
+    if (req.method === "GET" && route.startsWith("profile/")) {
+      const rest = route.slice("profile/".length);
+      const [userId, field] = rest.split("/");
+      for (const candidate of this.users.values()) {
+        if (candidate.userId === userId) {
+          if (field === "displayname") {
+            this._send(res, 200, { displayname: candidate.displayname });
+          } else if (field === "avatar_url") {
+            this._send(res, 200, { avatar_url: candidate.avatarMxc ?? undefined });
+          } else {
+            this._send(res, 200, {
+              displayname: candidate.displayname,
+              ...(candidate.avatarMxc ? { avatar_url: candidate.avatarMxc } : {}),
+            });
+          }
+          return;
+        }
+      }
+      this._err(res, 404, "M_NOT_FOUND", "No profile");
       return;
     }
 
@@ -584,15 +625,117 @@ export class MockHomeserver {
       return;
     }
 
-    if (req.method === "GET" && route.startsWith("profile/")) {
-      const userId = route.slice("profile/".length);
-      for (const candidate of this.users.values()) {
-        if (candidate.userId === userId) {
-          this._send(res, 200, { displayname: candidate.displayname });
-          return;
-        }
+    /* settings: PUT display name / avatar */
+    if (req.method === "PUT" && route.startsWith("profile/")) {
+      const auth = this._authUser(req);
+      if (!auth) {
+        this._err(res, 401, "M_UNKNOWN_TOKEN", "Bad token");
+        return;
       }
-      this._err(res, 404, "M_NOT_FOUND", "No profile");
+      const rest = route.slice("profile/".length);
+      const [userId, field] = rest.split("/");
+      if (userId !== auth.userId) {
+        this._err(res, 403, "M_FORBIDDEN", "Not your profile");
+        return;
+      }
+      if (field === "displayname") {
+        auth.displayname = String(body.displayname ?? "");
+      } else if (field === "avatar_url") {
+        auth.avatarMxc = typeof body.avatar_url === "string" ? body.avatar_url : null;
+      } else {
+        this._err(res, 400, "M_BAD_JSON", "Unknown profile field");
+        return;
+      }
+      this._send(res, 200, {});
+      return;
+    }
+
+    /* settings: list / rename / remove devices */
+    if (req.method === "GET" && route === "devices") {
+      const auth = this._authUser(req);
+      if (!auth) {
+        this._err(res, 401, "M_UNKNOWN_TOKEN", "Bad token");
+        return;
+      }
+      const userDevices = this.devices.get(auth.username) ?? new Map();
+      this._send(res, 200, {
+        devices: [...userDevices.values()].map((d) => ({
+          device_id: d.deviceId,
+          display_name: d.displayName ?? null,
+          last_seen_ts: Date.now(),
+          last_seen_ip: "127.0.0.1",
+        })),
+      });
+      return;
+    }
+
+    if (req.method === "PUT" && route.startsWith("devices/")) {
+      const auth = this._authUser(req);
+      if (!auth) {
+        this._err(res, 401, "M_UNKNOWN_TOKEN", "Bad token");
+        return;
+      }
+      const deviceId = route.slice("devices/".length);
+      const userDevices = this.devices.get(auth.username);
+      const device = userDevices?.get(deviceId);
+      if (!device) {
+        this._err(res, 404, "M_NOT_FOUND", "No such device");
+        return;
+      }
+      device.displayName = String(body.display_name ?? "");
+      this._send(res, 200, {});
+      return;
+    }
+
+    if (req.method === "POST" && route === "delete_devices") {
+      const auth = this._authUser(req);
+      if (!auth) {
+        this._err(res, 401, "M_UNKNOWN_TOKEN", "Bad token");
+        return;
+      }
+      const targets = (body.devices as string[] | undefined) ?? [];
+      /* UIA: the mock challenges once, then accepts the password flow */
+      const authBlock = body.auth as
+        | { type?: string; password?: string; session?: string }
+        | undefined;
+      const passwordOk =
+        authBlock?.type === "m.login.password" && authBlock.password === auth.password;
+      if (!passwordOk) {
+        this._send(res, 401, {
+          flows: [{ stages: ["m.login.password"] }],
+          params: {},
+          session: "mock-uia-session",
+        });
+        return;
+      }
+      const userDevices = this.devices.get(auth.username);
+      for (const id of targets) userDevices?.delete(id);
+      this._send(res, 200, {});
+      return;
+    }
+
+    /* settings: change the account password (UIA like delete_devices) */
+    if (req.method === "POST" && route === "account/password") {
+      const auth = this._authUser(req);
+      if (!auth) {
+        this._err(res, 401, "M_UNKNOWN_TOKEN", "Bad token");
+        return;
+      }
+      const authBlock = body.auth as
+        | { type?: string; password?: string }
+        | undefined;
+      const passwordOk =
+        authBlock?.type === "m.login.password" && authBlock.password === auth.password;
+      if (!passwordOk) {
+        this._send(res, 401, {
+          flows: [{ stages: ["m.login.password"] }],
+          params: {},
+          session: "mock-uia-session",
+        });
+        return;
+      }
+      auth.password = String(body.new_password ?? auth.password);
+      this._send(res, 200, {});
       return;
     }
 
