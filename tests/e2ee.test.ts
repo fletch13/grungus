@@ -14,6 +14,7 @@ import {
   type MessageItem,
 } from "../src/renderer/services/matrix-client.ts";
 import {
+  CryptoIdentityResetError,
   E2eeCrypto,
   MemoryCryptoStore,
 } from "../src/renderer/services/e2ee.ts";
@@ -69,6 +70,34 @@ function messageBodies(client: MatrixClient, roomId: string): string[] {
     .filter((item): item is MessageItem => item.kind === "message")
     .map((item) => item.body);
 }
+
+test("a wiped crypto store under a live session is detected (identity reset)", async (t) => {
+  /*
+   * The user's bug: the crypto store was cleared while the session stayed
+   * logged in. The fresh olm identity reuses the token's device id, the
+   * server keeps the OLD account's identity + one-time keys, and every
+   * self-share fails (OLM.BAD_MESSAGE_KEY_ID) — the sender's own messages
+   * turn UTD. init() must REFUSE (so the app logs out) instead of starting
+   * half-broken.
+   */
+  const hs = new MockHomeserver();
+  await hs.listen();
+  t.after(() => hs.close());
+
+  const client = await makeCryptoUser(hs, "splitbrain", "pw1");
+  const deviceId = client.deviceId!;
+  assert.ok(deviceId, "login assigned a device id");
+
+  /* simulate the store wipe: same client/token/device id, EMPTY store */
+  const fresh = new E2eeCrypto({ host: client, store: new MemoryCryptoStore() });
+  await assert.rejects(
+    () => fresh.init(),
+    (err: unknown) => err instanceof CryptoIdentityResetError,
+    "init must refuse a fresh identity under a device id the server knows"
+  );
+  /* and the client must not have been re-armed with the broken crypto */
+  assert.equal(client.crypto === fresh, false);
+});
 
 test("device keys are uploaded on init", async (t) => {
   const hs = new MockHomeserver();

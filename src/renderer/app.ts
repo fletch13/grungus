@@ -11,6 +11,7 @@ import type { SpaceRail } from "./components/space-rail.ts";
 import type { RoomList, UserInfo } from "./components/room-list.ts";
 import { SettingsView } from "./components/settings-view.ts";
 import { SettingsStore } from "./services/settings.ts";
+import { CryptoIdentityResetError } from "./services/e2ee.ts";
 import type { ChatView } from "./components/chat-view.ts";
 import type { MemberList } from "./components/member-list.ts";
 import type { AppShell } from "./components/app-shell.ts";
@@ -314,6 +315,15 @@ async function attachCrypto(c: MatrixClient): Promise<void> {
     /* a forwarded room key may decrypt tracked UTD events — retry them */
     crypto.onInboundSessionAdded = (roomId) => c.retryUndecrypted(roomId);
   } catch (err) {
+    if (err instanceof CryptoIdentityResetError) {
+      /* the local crypto identity was reset under a live session — the
+         device id is unusable (the server holds the old keys). Only a
+         fresh login fixes it; do not continue half-broken. */
+      console.error("[grungus] device identity reset — logging out:", err);
+      window.alert(err.message);
+      logout();
+      return;
+    }
     console.error("[grungus] E2EE init failed (continuing without):", err);
   }
 }

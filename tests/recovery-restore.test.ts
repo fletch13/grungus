@@ -60,6 +60,7 @@ function waitFor(predicate: () => boolean, label: string, timeoutMs = 8_000): Pr
 async function setup(): Promise<{
   hs: MockHomeserver;
   client: MatrixClient;
+  secondDevice: () => Promise<MatrixClient>;
   cleanup: () => void;
 }> {
   const hs = new MockHomeserver();
@@ -68,15 +69,36 @@ async function setup(): Promise<{
   const client = new MatrixClient({ baseUrl: hs.baseUrl! });
   await client.loginWithPassword({ username: "ruser", password: "pw" });
   client.startSync();
+  /* a fresh DEVICE for the restore side — one client is one crypto
+     identity; reusing a client under a second (empty) crypto store is
+     the split-brain the identity guard rejects */
+  const spawned: MatrixClient[] = [];
+  const secondDevice = async (): Promise<MatrixClient> => {
+    const c = new MatrixClient({ baseUrl: hs.baseUrl! });
+    await c.loginWithPassword({ username: "ruser", password: "pw" });
+    c.startSync();
+    /* the restore reads SSSS account data from the SYNCED map — wait for
+       the first sync to land before handing the client to the test */
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("second device never synced")), 8_000);
+      c.on("ready", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    spawned.push(c);
+    return c;
+  };
   const cleanup = (): void => {
     client.stopSync();
+    for (const c of spawned) c.stopSync();
     hs.close();
   };
-  return { hs, client, cleanup };
+  return { hs, client, secondDevice, cleanup };
 }
 
 test("an Element-style backup (key in SSSS) restores with the passphrase", async (t) => {
-  const { hs, client, cleanup } = await setup();
+  const { hs, client, secondDevice, cleanup } = await setup();
   t.after(cleanup);
 
   /* the ELEMENT side of the setup, built with the same spec functions
@@ -159,13 +181,15 @@ test("an Element-style backup (key in SSSS) restores with the passphrase", async
 
   /* THE USER'S FAILURE CASE: restore in a fresh Grungus device with the
      passphrase. The old code threw "not created with a passphrase". */
-  const grungusCrypto = new E2eeCrypto({ host: client, store: new MemoryCryptoStore() });
+  const restoreClient = await secondDevice();
+  const grungusCrypto = new E2eeCrypto({ host: restoreClient, store: new MemoryCryptoStore() });
   await grungusCrypto.init();
   const imported = await grungusCrypto.restoreWithRecovery(PASSPHRASE);
   assert.equal(imported, 1, "the SSSS-held backup key restored the session");
 
-  /* and the same works with the recovery KEY string */
-  const freshCrypto = new E2eeCrypto({ host: client, store: new MemoryCryptoStore() });
+  /* and the same works with the recovery KEY string (a third device) */
+  const keyClient = await secondDevice();
+  const freshCrypto = new E2eeCrypto({ host: keyClient, store: new MemoryCryptoStore() });
   await freshCrypto.init();
   /* re-derive the SSSS key bytes from the passphrase to build the key
      string the way Element shows it */
@@ -180,7 +204,7 @@ test("a rust-style backup entry (no room_id/session_id in the payload) restores"
      decrypted payload carries ONLY sender_key + session_key — the room
      and session ids live in the backup PATH. The restore must take them
      from the path instead of demanding them in the payload. */
-  const { hs, client, cleanup } = await setup();
+  const { hs, client, secondDevice, cleanup } = await setup();
   t.after(cleanup);
 
   const elementCrypto = new E2eeCrypto({ host: client, store: new MemoryCryptoStore() });
@@ -247,14 +271,15 @@ test("a rust-style backup entry (no room_id/session_id in the payload) restores"
     }
   );
 
-  const grungusCrypto = new E2eeCrypto({ host: client, store: new MemoryCryptoStore() });
+  const restoreClient = await secondDevice();
+  const grungusCrypto = new E2eeCrypto({ host: restoreClient, store: new MemoryCryptoStore() });
   await grungusCrypto.init();
   const imported = await grungusCrypto.restoreWithRecovery(PASSPHRASE);
   assert.equal(imported, 1, "the rust-style entry restored from the path ids");
 });
 
 test("a Grungus-style backup (passphrase-derived) still restores", async (t) => {
-  const { hs, client, cleanup } = await setup();
+  const { hs, client, secondDevice, cleanup } = await setup();
   t.after(cleanup);
 
   const crypto = new E2eeCrypto({ host: client, store: new MemoryCryptoStore() });
@@ -278,7 +303,8 @@ test("a Grungus-style backup (passphrase-derived) still restores", async (t) => 
     "the session lands IN the backup"
   );
 
-  const other = new E2eeCrypto({ host: client, store: new MemoryCryptoStore() });
+  const otherClient = await secondDevice();
+  const other = new E2eeCrypto({ host: otherClient, store: new MemoryCryptoStore() });
   await other.init();
   /* no SSSS on this account — the unified restore falls through to the
      direct passphrase route */

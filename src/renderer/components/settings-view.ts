@@ -558,17 +558,32 @@ export class SettingsView extends HTMLElement {
     panel.appendChild(this._staticRow("Homeserver", client.baseUrl));
 
     const cacheRow = el("div", { class: "settings-row" });
-    const clear = el("button", { class: "call-btn danger", text: "Clear local cache & reload" });
+    const clear = el("button", {
+      class: "call-btn danger",
+      text: "Reset device data & log out",
+    });
     clear.addEventListener("click", () => {
-      /* keep the session token — this clears crypto/state caches only */
+      /*
+       * The device's olm identity and the logged-in session are ONE unit:
+       * wiping the identity while keeping the session leaves a device the
+       * server still maps to the OLD keys (every self-share fails with
+       * OLM.BAD_MESSAGE_KEY_ID and the sender's own messages turn UTD).
+       * So this ALWAYS drops the session too — the next login mints a
+       * fresh device id with a matching identity.
+       */
       for (const key of Object.keys(localStorage)) {
         if (key.startsWith("grungus-crypto:")) localStorage.removeItem(key);
       }
+      localStorage.removeItem("grungus-session");
       location.reload();
     });
     cacheRow.appendChild(clear);
     panel.appendChild(
-      this._labeledRow("Local cache", cacheRow, "Drops stored room keys and device caches; the session stays logged in.")
+      this._labeledRow(
+        "Reset device data",
+        cacheRow,
+        "Clears the device's encryption keys and logs you out. Log back in to get a fresh device (old rooms re-sync; encrypted history returns via key backup or forwarded keys)."
+      )
     );
   }
 

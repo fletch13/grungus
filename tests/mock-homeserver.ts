@@ -805,6 +805,9 @@ export class MockHomeserver {
         if (!userDevices) continue;
         const byDevice: Record<string, unknown> = {};
         for (const device of userDevices.values()) {
+          /* real servers only list devices that uploaded keys — a
+             login-created device without keys is absent from keys/query */
+          if (Object.keys(device.deviceKeys).length === 0) continue;
           byDevice[device.deviceId] = device.deviceKeys;
         }
         deviceKeys[userId] = byDevice;

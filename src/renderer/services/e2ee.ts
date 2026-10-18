@@ -209,6 +209,27 @@ const STORE_DEVICE_ID = "device:id";
 const BACKUP_ALGORITHM = "m.megolm_backup.v1.curve25519-aes-sha2";
 const BACKUP_DEFAULT_ITERATIONS = 500_000;
 
+/**
+ * Thrown when the local crypto store was lost while the session stayed
+ * logged in: the server still holds device keys for our device id, but
+ * we just generated a FRESH olm identity. Uploading cannot fix this —
+ * the server keeps handing out the OLD account's one-time keys, every
+ * self-share dies with OLM.BAD_MESSAGE_KEY_ID, and the sender's own
+ * messages turn UTD (observed live). The only correct recovery is a
+ * fresh login, which mints a new device id.
+ */
+export class CryptoIdentityResetError extends Error {
+  constructor(deviceId: string) {
+    super(
+      `This device's encryption keys no longer match the server ` +
+        `(local crypto data was reset while the session stayed logged in). ` +
+        `Logging out — please log in again to create a fresh device. ` +
+        `[device ${deviceId}]`
+    );
+    this.name = "CryptoIdentityResetError";
+  }
+}
+
 /** Backup version info as stored by the homeserver. */
 export interface KeyBackupVersion {
   version: string;
@@ -360,6 +381,40 @@ export class E2eeCrypto {
       account.unpickle(this._pickleKey, accountPickle);
     } else {
       account.create();
+      /*
+       * SPLIT-BRAIN GUARD: a fresh identity under a device id the server
+       * already knows means the crypto store was wiped while the session
+       * stayed logged in (settings "reset", cleared browser storage…).
+       * The server keeps the OLD account's identity + one-time keys for
+       * that device id, so this fresh account can never receive olm
+       * messages for it (self-shares fail with OLM.BAD_MESSAGE_KEY_ID
+       * and the sender's own messages show UTD). Refuse to continue;
+       * the app logs the user out so the next login mints a fresh
+       * device id. A genuine first login passes: no keys published yet.
+       */
+      if (this.host.userId && this.host.deviceId) {
+        try {
+          const known = await this.host.api<{
+            device_keys?: Record<string, Record<string, unknown>>;
+          }>("POST", "/_matrix/client/v3/keys/query", {
+            body: { device_keys: { [this.host.userId]: [] } },
+          });
+          const published = known.device_keys?.[this.host.userId]?.[this.host.deviceId] as
+            | { keys?: Record<string, unknown> }
+            | undefined;
+          /* only a device that actually PUBLISHED keys counts — servers
+             don't list keyless devices in keys/query, and an empty
+             object must not trip the guard */
+          if (published && published.keys && Object.keys(published.keys).length > 0) {
+            account.free();
+            throw new CryptoIdentityResetError(this.host.deviceId);
+          }
+        } catch (err) {
+          if (err instanceof CryptoIdentityResetError) throw err;
+          /* keys/query unreachable (offline?) — proceed; a later send
+             will surface any mismatch through its own error path */
+        }
+      }
       await this._store.put(STORE_ACCOUNT, account.pickle(this._pickleKey));
     }
     this._account = account;

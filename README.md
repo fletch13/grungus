@@ -264,6 +264,19 @@ for an open protocol.
   rust-bootstrapped account: the same recovery key went from
   "Restored 0 sessions" to "Restored 1 session" and both UTD lines
   decrypted in place.)
+- **Device identity reset guard (v0.21.2)** — a wiped crypto store under
+  a logged-in session used to leave the device SPLIT-BRAINED: the server
+  kept the old olm identity + one-time keys for the device id while the
+  client generated a fresh one, so every self-share failed with
+  OLM.BAD_MESSAGE_KEY_ID and the SENDER'S OWN messages showed as
+  "unable to decrypt" (and olm-based call signaling died). E2EE init now
+  detects a fresh identity under a device id that already published
+  keys (keys/query) and refuses to continue — the app logs the user out
+  so the next login mints a fresh device. The settings "Reset device
+  data" button now ALWAYS drops the session too (an identity and its
+  session are one unit). Reproduced live: the split-brained session was
+  detected and logged out; the fresh login sent a message that rendered
+  for the sender AND decrypted on the rust/Element side.
 - **Read markers + receipts** — opening a room (or new messages
   arriving while it's open, debounced 1.5s) sends a public m.read
   receipt (POST /rooms/{id}/receipt/m.read/{eventId}) and the
