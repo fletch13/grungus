@@ -1,0 +1,40 @@
+/*
+ * Grungus — call media device-selection tests: the getUserMedia
+ * constraints built from the Voice & Video picks (microphone, camera).
+ * Pure logic — the capture itself needs a browser (verified there).
+ *
+ * Run: npm test
+ */
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mediaConstraints } from "../src/renderer/services/call-media.ts";
+
+test("media constraints: defaults capture exactly audio, no video", () => {
+  assert.deepEqual(mediaConstraints(false, { audioInput: "", videoInput: "" }), {
+    audio: true,
+    video: false,
+  });
+});
+
+test("media constraints: a microphone pick constrains the audio device", () => {
+  const c = mediaConstraints(false, { audioInput: "mic-1", videoInput: "" });
+  assert.deepEqual(c.audio, { deviceId: { ideal: "mic-1" } });
+  assert.equal(c.video, false);
+});
+
+test("media constraints: a camera pick constrains the video device (ideal, not exact)", () => {
+  const c = mediaConstraints(true, { audioInput: "", videoInput: "cam-2" });
+  assert.equal(c.audio, true);
+  assert.deepEqual(c.video, { deviceId: { ideal: "cam-2" } });
+});
+
+test("media constraints: video without a pick stays on the system default", () => {
+  const c = mediaConstraints(true, { audioInput: "", videoInput: "" });
+  assert.deepEqual(c, { audio: true, video: true });
+});
+
+test("media constraints: both picks combine", () => {
+  const c = mediaConstraints(true, { audioInput: "mic-1", videoInput: "cam-2" });
+  assert.deepEqual(c.audio, { deviceId: { ideal: "mic-1" } });
+  assert.deepEqual(c.video, { deviceId: { ideal: "cam-2" } });
+});

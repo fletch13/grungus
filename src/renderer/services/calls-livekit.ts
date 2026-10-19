@@ -32,6 +32,7 @@ import type { Room } from "./matrix-client.ts";
 import type { MatrixClient } from "./matrix-client.ts";
 import { mxidLocalpart } from "./matrix-client.ts";
 import { LkE2ee } from "./lk-e2ee.ts";
+import { SettingsStore } from "./settings.ts";
 
 export interface LkCallState {
   connected: boolean;
@@ -317,12 +318,19 @@ export class LkCallManager {
       throw new Error(lastError || `token service refused (${resStatus})`);
     }
 
-    /* publish local media first (synthetic fallback on headless hosts) */
+    /* publish local media first (synthetic fallback on headless hosts);
+       the Voice & Video picks constrain mic and camera ("" = default) */
+    const prefs = new SettingsStore();
+    const audioInput = prefs.get("audioInput");
+    const videoInput = prefs.get("videoInput");
     let localTracks;
     try {
       localTracks = await createLocalTracks({
-        audio: true,
-        video: { resolution: VideoPresets.h720.resolution },
+        audio: audioInput ? { deviceId: { ideal: audioInput } } : true,
+        video: {
+          ...(videoInput ? { deviceId: { ideal: videoInput } } : {}),
+          resolution: VideoPresets.h720.resolution,
+        },
       });
     } catch (err) {
       console.warn("[lk-call] capture failed, using synthetic media:", err);
@@ -356,6 +364,14 @@ export class LkCallManager {
     this._wireEvents(lk);
     this._room = lk;
     await lk.connect(data.url, data.token);
+    /* the Voice & Video speaker pick routes all incoming audio ("" =
+       system default; unsupported platforms just keep the default) */
+    const speaker = new SettingsStore().get("audioOutput");
+    if (speaker) {
+      await lk.switchActiveDevice("audiooutput", speaker).catch((err: unknown) =>
+        console.warn("[lk-call] speaker switch failed:", err)
+      );
+    }
     if (this._e2ee) {
       /* flip every sender/receiver transform on; the keys we distributed
          (and keep resending) do the rest */
@@ -432,6 +448,14 @@ export class LkCallManager {
       ?.mediaStreamTrack;
     if (raw) raw.enabled = !muted;
     this._emit();
+  }
+
+  /** Route incoming audio to a different speaker mid-call ("" = default). */
+  setAudioOutput(sinkId: string): void {
+    if (!sinkId || !this._room) return;
+    void this._room
+      .switchActiveDevice("audiooutput", sinkId)
+      .catch((err: unknown) => console.warn("[lk-call] speaker switch failed:", err));
   }
 
   /** Screen share through the SFU (synthetic fallback on headless hosts). */

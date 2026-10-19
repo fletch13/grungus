@@ -625,9 +625,16 @@ function startShell(): void {
     });
   };
   applyAppearance();
+  /* the persisted speaker pick applies to calls started before any
+     settings change */
+  callView.applyAudioOutput(settings.get("audioOutput"));
   settings.subscribe(() => {
     applyAppearance();
     settingsView.update(active, settings, userInfo);
+    /* Voice & Video: a new speaker pick applies to the live call too */
+    const speaker = settings.get("audioOutput");
+    callView.applyAudioOutput(speaker);
+    lkManager.setAudioOutput(speaker);
   });
 
   let userInfo: UserInfo | null = null;

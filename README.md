@@ -209,7 +209,13 @@ for an open protocol.
   - *Notifications* — desktop notifications for messages in unfocused
     rooms (clicking one jumps to the room) and a notification sound.
   - *Voice & Video* — microphone / speaker / camera pickers
-    (enumerateDevices), persisted per device id ("" = system default).
+    (enumerateDevices), persisted per device id ("" = system default),
+    and WIRED INTO THE CALLS: the microphone and camera picks constrain
+    capture on every path (mesh, 1:1, LiveKit — `ideal`, so an
+    unplugged device falls back to the system default instead of
+    failing the call), and the speaker pick routes every call tile's
+    audio (setSinkId on the mesh/1:1 paths, switchActiveDevice on the
+    SFU path) — changing it mid-call switches the live call too.
   - *Ignored Users* — the m.ignored_user_list account data, with
     unignore.
   - *Advanced* — masked access token with reveal, device id,

@@ -24,6 +24,8 @@ export class CallView extends HTMLElement {
   private _manager: CallController | null = null;
   /** key -> video element, reused across renders to avoid flicker. */
   private _videos = new Map<string, HTMLVideoElement>();
+  /** the preferred speaker ("" = system default), from Voice & Video */
+  private _audioOutput = "";
 
   connectedCallback(): void {
     this._render();
@@ -33,6 +35,26 @@ export class CallView extends HTMLElement {
     this._state = state;
     this._manager = manager;
     this._render();
+  }
+
+  /**
+   * Route every tile's audio to the given speaker ("" = system
+   * default). Applied to new tiles as they appear; the app calls this
+   * again when the Voice & Video pick changes mid-call.
+   */
+  applyAudioOutput(sinkId: string): void {
+    this._audioOutput = sinkId;
+    for (const video of this._videos.values()) this._applyAudioOutput(video);
+  }
+
+  private _applyAudioOutput(video: HTMLVideoElement): void {
+    const sink = this._audioOutput;
+    if (!sink) return;
+    const el = video as HTMLVideoElement & { setSinkId?: (id: string) => Promise<void> };
+    if (typeof el.setSinkId !== "function") return;
+    /* a device unplugged mid-call rejects — the tile keeps playing on
+       the default output */
+    void el.setSinkId(sink).catch(() => {});
   }
 
   private _render(): void {
@@ -155,6 +177,7 @@ export class CallView extends HTMLElement {
       video.autoplay = true;
       video.playsInline = true;
       this._videos.set(key, video);
+      this._applyAudioOutput(video);
     }
     if (stream && video.srcObject !== stream) {
       video.srcObject = stream;

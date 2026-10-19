@@ -8,11 +8,34 @@
  * verifiable on hosts with no capture devices (headless, CI).
  */
 import { colorFor } from "../color.ts";
+import { SettingsStore } from "./settings.ts";
 
 export interface AcquiredMedia {
   stream: MediaStream;
   /** true when the stream is synthetic (no capture devices existed) */
   synthetic: boolean;
+}
+
+/**
+ * getUserMedia constraints honoring the persisted device picks
+ * ("" = system default). `ideal` (not `exact`) so an unplugged device
+ * falls back to the system default instead of failing the call.
+ * Pure — unit-tested.
+ */
+export function mediaConstraints(
+  video: boolean,
+  devices: { audioInput: string; videoInput: string }
+): MediaStreamConstraints {
+  return {
+    audio: devices.audioInput
+      ? { deviceId: { ideal: devices.audioInput } }
+      : true,
+    video: video
+      ? devices.videoInput
+        ? { deviceId: { ideal: devices.videoInput } }
+        : true
+      : false,
+  };
 }
 
 export class CallMedia {
@@ -28,10 +51,14 @@ export class CallMedia {
   async acquire(video: boolean): Promise<AcquiredMedia> {
     try {
       if (typeof navigator !== "undefined" && navigator.mediaDevices?.getUserMedia) {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video,
-        });
+        /* the settings' Voice & Video picks: microphone and camera */
+        const prefs = new SettingsStore();
+        const stream = await navigator.mediaDevices.getUserMedia(
+          mediaConstraints(video, {
+            audioInput: prefs.get("audioInput"),
+            videoInput: prefs.get("videoInput"),
+          })
+        );
         return { stream, synthetic: false };
       }
     } catch (err) {
