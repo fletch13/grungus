@@ -200,6 +200,14 @@ app-shell.no-members {
   grid-template-columns: 72px 240px 1fr;
 }
 
+/* the member pane must leave the grid when hidden: as a stray grid
+   item it wraps to an implicit second row and steals its content
+   height from the main row, so every pane stops short of the window
+   bottom by exactly the member list's height */
+app-shell.no-members member-list {
+  display: none;
+}
+
 /* space rail */
 
 space-rail {

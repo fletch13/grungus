@@ -9,3 +9,4 @@ npm-debug.log*
 !.env.example
 release/
 .git-commit-msg.tmp
+.idea
