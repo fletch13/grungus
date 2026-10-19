@@ -20,6 +20,7 @@ import { E2eeCrypto, type CryptoStore } from "./services/e2ee.ts";
 import { CallManager, type CallUiState } from "./services/calls.ts";
 import { IncomingCall } from "./components/incoming-call.ts";
 import { LkCallManager, type LkCallState } from "./services/calls-livekit.ts";
+import { P2PCallManager } from "./services/calls-p2p.ts";
 import { VerificationManager, type SasUiState } from "./services/sas.ts";
 import { CrossSigning } from "./services/cross-signing.ts";
 
@@ -452,13 +453,33 @@ function startShell(): void {
   /* ---- calls (MSC3401 mesh, or LiveKit SFU when configured) ---- */
   const callManager = new CallManager(active);
   const lkManager = new LkCallManager(active);
+  /* 1:1 DM calls speak the legacy room-event protocol every Element
+     client understands (m.call.invite/answer/…); groups keep the mesh */
+  const p2pManager = new P2PCallManager(active);
   const callView = document.createElement("call-view");
   root.appendChild(callView);
   /* the incoming-call ring banner (someone started a call in one of
      our rooms) */
   const incomingCall = document.createElement("incoming-call");
   root.appendChild(incomingCall);
-  let callMode: "mesh" | "livekit" = "mesh";
+  let callMode: "mesh" | "livekit" | "p2p" = "mesh";
+  /* route raw m.call.* room events (legacy 1:1 protocol) to the manager */
+  active.onCallEvent = (roomId, ev) => p2pManager.onCallEvent(roomId, ev);
+  /* a ringing legacy invite drives the same banner as mesh/LiveKit calls */
+  p2pManager.setIncomingListener((roomId, roomTitle) => {
+    if (
+      !callManager.active &&
+      !lkManager.connected &&
+      !p2pManager.active &&
+      incomingCall.ringingRoomId === null
+    ) {
+      incomingCall.show(roomId, roomTitle);
+    }
+  });
+  /* …and the caller hanging up before we answered cancels the ring */
+  p2pManager.setRingCancelListener((roomId) => {
+    if (incomingCall.ringingRoomId === roomId) incomingCall.dismiss();
+  });
   /** debounced read-marker sender for the open room */
   let markReadTimer: ReturnType<typeof setTimeout> | null = null;
   const scheduleMarkRead = (roomId: string): void => {
@@ -533,6 +554,14 @@ function startShell(): void {
       refreshCallHeader();
     }
   });
+  p2pManager.setUiListener((callState: CallUiState) => {
+    currentCallRoomId = callState.active ? callState.roomId : null;
+    if (callState.active) incomingCall.dismiss();
+    if (callMode === "p2p") {
+      callView.update(callState, p2pManager);
+      refreshCallHeader();
+    }
+  });
 
   const startCall = (roomId: string): void => {
     const room = active.getRoom(roomId);
@@ -552,6 +581,20 @@ function startShell(): void {
       return;
     }
     callMode = "mesh";
+    /* 1:1 rooms speak the legacy room-event protocol (m.call.invite) —
+       the one every Element client answers in DMs; the mesh stays for
+       group rooms */
+    const isDirectRoom =
+      room?.isDirect || (room?.joinedMemberCount ?? 0) <= 2;
+    if (isDirectRoom) {
+      callMode = "p2p";
+      void p2pManager.start(roomId).catch((err: unknown) => {
+        chat.setNotice(
+          `Could not start call: ${err instanceof Error ? err.message : "network error"}`
+        );
+      });
+      return;
+    }
     void callManager.start(roomId).catch((err: unknown) => {
       chat.setNotice(
         `Could not start call: ${err instanceof Error ? err.message : "network error"}`
@@ -1128,7 +1171,14 @@ function startShell(): void {
     ) {
       incomingCall.show(update.room.id, update.room.title);
     }
-    if (!ongoing && incomingCall.ringingRoomId === update.room.id) {
+    if (
+      !ongoing &&
+      incomingCall.ringingRoomId === update.room.id &&
+      /* a ringing legacy 1:1 invite has no m.call.member state — the
+         mesh-oriented ongoing check must not kill its ring (the p2p
+         layer dismisses the banner itself on answer/cancel) */
+      p2pManager.pendingIncomingRoomId !== update.room.id
+    ) {
       incomingCall.dismiss();
     }
     if (update.room.id === state.roomId) {
@@ -1178,6 +1228,17 @@ function startShell(): void {
   incomingCall.addEventListener("grungus:join-incoming", (event) => {
     const roomId = (event as CustomEvent<{ roomId: string }>).detail.roomId;
     selectRoom(roomId);
+    /* a ringing legacy 1:1 invite is ANSWERED, not started — startCall
+       would send a fresh invite of our own */
+    if (p2pManager.pendingIncomingRoomId === roomId) {
+      callMode = "p2p";
+      void p2pManager.answer(roomId).catch((err: unknown) => {
+        chat.setNotice(
+          `Could not answer the call: ${err instanceof Error ? err.message : "network error"}`
+        );
+      });
+      return;
+    }
     startCall(roomId);
   });
 

@@ -22,14 +22,16 @@
  * Element Call.
  *
  * v1 limits (documented in the README): full mesh only (no SFU — an SFU
- * is the real fix for large-room screenshare bandwidth), no Element Call
- * interoperability (modeled on it, not verified against it).
+ * is the real fix for large-room screenshare bandwidth). 1:1 DM calls
+ * use the legacy room-event protocol (calls-p2p.ts) for Element interop;
+ * this mesh serves group rooms.
  */
 
 import type { MatrixClient, Room, ToDeviceEvent } from "./matrix-client.ts";
 import { mxidLocalpart } from "./matrix-client.ts";
 import type { E2eeCrypto } from "./e2ee.ts";
 import { colorFor, initials } from "../components/ui.ts";
+import { CallMedia } from "./call-media.ts";
 import {
   attachReceiverTransform,
   attachSenderTransform,
@@ -93,8 +95,8 @@ export class CallManager {
   private _uiListener: ((state: CallUiState) => void) | null = null;
   private _roomId: string | null = null;
   private _localStream: MediaStream | null = null;
-  private _syntheticCanvas: HTMLCanvasElement | null = null;
-  private _syntheticTimer: ReturnType<typeof setInterval> | null = null;
+  /** media acquisition (real capture, synthetic fallback on headless hosts) */
+  private _media: CallMedia;
   /** call-state heartbeat (keeps expires_ts fresh while connected) */
   private _memberHeartbeat: ReturnType<typeof setInterval> | null = null;
   /** when we first noticed being alone in the call (auto-leave grace) */
@@ -104,7 +106,6 @@ export class CallManager {
   /** true once other members appeared in the call state (auto-leave
    *  only fires after a real call happened — never while ringing) */
   private _sawOthersInCall = false;
-  private _audioCtx: AudioContext | null = null;
   private _peers = new Map<string, PeerEntry>();
   private _notice: string | null = null;
   /** E2EE media state — active in encrypted rooms only (keys ride olm) */
@@ -126,6 +127,7 @@ export class CallManager {
 
   constructor(client: MatrixClient) {
     this.client = client;
+    this._media = new CallMedia(client.userId ?? "?");
   }
 
   get roomId(): string | null {
@@ -206,7 +208,7 @@ export class CallManager {
       this._mediaKeyId = 1;
     }
 
-    const media = await this.acquireMedia(opts.video === true);
+    const media = await this._media.acquire(opts.video === true);
     this._localStream = media.stream;
     this._notice = media.synthetic
       ? "No microphone/camera available — using a synthetic stream"
@@ -261,10 +263,7 @@ export class CallManager {
       for (const track of this._localStream.getTracks()) track.stop();
       this._localStream = null;
     }
-    if (this._syntheticTimer) {
-      clearInterval(this._syntheticTimer);
-      this._syntheticTimer = null;
-    }
+    this._media.stop();
     if (this._memberHeartbeat) {
       clearInterval(this._memberHeartbeat);
       this._memberHeartbeat = null;
@@ -275,11 +274,6 @@ export class CallManager {
     }
     this._aloneSince = null;
     this._sawOthersInCall = false;
-    this._syntheticCanvas = null;
-    if (this._audioCtx) {
-      void this._audioCtx.close().catch(() => {});
-      this._audioCtx = null;
-    }
     this._stopScreenTracks();
     this._roomId = null;
     this._notice = null;
@@ -305,74 +299,9 @@ export class CallManager {
 
   /* -------------------------------- media -------------------------------- */
 
-  private async acquireMedia(
-    video: boolean
-  ): Promise<{ stream: MediaStream; synthetic: boolean }> {
-    try {
-      if (typeof navigator !== "undefined" && navigator.mediaDevices?.getUserMedia) {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video,
-        });
-        return { stream, synthetic: false };
-      }
-    } catch (err) {
-      console.warn("[call] getUserMedia failed, falling back to synthetic:", err);
-    }
-    return { stream: this._syntheticStream(), synthetic: true };
-  }
-
-  /**
-   * A synthetic media stream: an animated canvas (known color per user,
-   * moving bar so frames keep flowing) plus a quiet oscillator audio
-   * track. Used when no capture devices exist — it produces REAL RTP
-   * media, so the full WebRTC path stays verifiable.
-   */
-  private _syntheticStream(): MediaStream {
-    const canvas = document.createElement("canvas");
-    canvas.width = 320;
-    canvas.height = 240;
-    this._syntheticCanvas = canvas;
-
-    const ctx = canvas.getContext("2d")!;
-    const base = colorFor(this.client.userId ?? "?");
-    let tick = 0;
-    const draw = (): void => {
-      tick = (tick + 1) % 320;
-      ctx.fillStyle = base;
-      ctx.fillRect(0, 0, 320, 240);
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(tick, 100, 20, 40);
-    };
-    draw();
-    this._syntheticTimer = setInterval(draw, 100);
-
-    const stream = canvas.captureStream(15) as MediaStream;
-
-    /* quiet 440Hz tone so an audio track exists */
-    const AudioCtor =
-      (window as unknown as { AudioContext?: typeof AudioContext }).AudioContext ??
-      AudioContext;
-    this._audioCtx = new AudioCtor();
-    const dest = this._audioCtx.createMediaStreamDestination();
-    const osc = this._audioCtx.createOscillator();
-    const gain = this._audioCtx.createGain();
-    gain.gain.value = 0.02;
-    osc.frequency.value = 440;
-    osc.connect(gain);
-    gain.connect(dest);
-    osc.start();
-    for (const track of dest.stream.getAudioTracks()) stream.addTrack(track);
-
-    return stream;
-  }
-
   /** Sample the synthetic canvas color (used by e2e verification). */
   syntheticColorCss(): string | null {
-    if (!this._syntheticCanvas) return null;
-    const ctx = this._syntheticCanvas.getContext("2d")!;
-    const data = ctx.getImageData(0, 0, 1, 1).data;
-    return `rgb(${data[0]}, ${data[1]}, ${data[2]})`;
+    return this._media.syntheticColorCss();
   }
 
   setMuted(muted: boolean): void {

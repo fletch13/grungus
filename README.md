@@ -93,6 +93,23 @@ for an open protocol.
   synthetic streams on headless hosts. Rooms without a LiveKit state
   event use the mesh unchanged. `livekit/auth-service.ts` is the
   deployable token service (single-file Node, jsonwebtoken).
+- **1:1 calls with Element interop (MSC2746)** — direct-message calls
+  speak the legacy room-event protocol every Element client answers in
+  DMs: m.call.invite / answer / select_answer / candidates / hangup as
+  ordinary room events, megolm-encrypted in encrypted rooms exactly
+  like Element's own call events. Calling a DM from Grungus rings
+  Element; an Element DM call rings Grungus's banner and Join answers
+  it. Full MSC2746 semantics: party_id is the device id, the caller
+  picks the first answerer (select_answer releases the losing
+  devices), invites carry a 60s lifetime (stale ones never ring), and
+  the caller's hangup cancels the ring. Media is plain DTLS-SRTP — the
+  insertable-streams E2EE layer is mesh-only (Element cannot decrypt
+  Grungus's v1 frame format) — and screenshare stays on the
+  mesh/LiveKit paths (the legacy protocol has no renegotiation event).
+  Group rooms keep the MSC3401 mesh; LiveKit-focused calls (Element
+  Call) still join through the SFU, now probing the token endpoints
+  Element's lk-jwt-service serves (/session/get_token, /sfu/get,
+  /get_token) before the bare focus URL.
 - **Discord-style layout** — space rail (servers), room/channel list,
   chat with grouped messages and day dividers, member list, composer.
 - **Spaces as servers** — Matrix Spaces appear in the left rail like
@@ -664,10 +681,10 @@ the same client from Node — handy for debugging and demos.
 ## Roadmap
 
 - **Calls hardening** — in-app screen/source picker, Element Call
-  interoperability (the signaling is modeled on MSC3401 and LiveKit
-  but interop is untested), and insertable-streams E2EE media on top
-  of DTLS-SRTP. (Screenshare shipped; the LiveKit SFU shipped — see
-  above.)
+  interoperability for GROUP rooms (1:1 DM calls interoperate with
+  Element through the legacy room-event protocol — see above), and
+  insertable-streams E2EE media on top of DTLS-SRTP. (Screenshare
+  shipped; the LiveKit SFU shipped — see above.)
 - **E2EE hardening** — QR device verification, cross-signing.
   (SAS verification, key forwarding to own/verified devices, rotation
   on membership change, and server-side key backup shipped — see above;

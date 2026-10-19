@@ -363,6 +363,13 @@ export class MatrixClient {
    * MSC3401 call signaling in unencrypted rooms. Set by the call layer.
    */
   onToDevice: ((event: ToDeviceEvent) => void) | null = null;
+  /**
+   * Hook for raw m.call.* ROOM events (the legacy 1:1 call protocol —
+   * m.call.invite/answer/select_answer/candidates/hangup). Decrypted
+   * first in encrypted rooms, exactly like Element's call events. Set by
+   * the call layer.
+   */
+  onCallEvent: ((roomId: string, ev: MatrixEvent) => void) | null = null;
 
   /**
    * Media (call) encryption keys received from other participants, either as
@@ -1299,6 +1306,17 @@ export class MatrixClient {
     return mxidLocalpart(sender);
   }
 
+  /** Route raw m.call.* room events to the call layer's hook. */
+  private _maybeCallEvent(roomId: string, ev: MatrixEvent): void {
+    if (this.onCallEvent) {
+      try {
+        this.onCallEvent(roomId, ev);
+      } catch (err) {
+        console.error("[grungus] call event handler failed:", err);
+      }
+    }
+  }
+
   private _toTimelineItem(room: Room, ev: MatrixEvent): TimelineItem | null {
     if (!ev || !ev.type) return null;
     const ts = ev.origin_server_ts ?? Date.now();
@@ -1311,6 +1329,12 @@ export class MatrixClient {
       return null;
     }
 
+    /* legacy 1:1 call protocol events (m.call.invite & co) — handed to
+       the call layer, never rendered */
+    if (ev.type.startsWith("m.call.")) {
+      this._maybeCallEvent(room.id, ev);
+      return null;
+    }
     if (ev.type === "m.room.message" || ev.type === "m.sticker") {
       const isSticker = ev.type === "m.sticker";
       const msgtype = isSticker

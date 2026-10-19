@@ -272,18 +272,49 @@ export class LkCallManager {
     } catch {
       authBody = { room: lkRoom, room_id: lkRoom, matrix_token: this.client.accessToken };
     }
-    const res = await fetch(authUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(authBody),
-    });
-    const data = (await res.json().catch(() => ({}))) as {
-      token?: string;
-      url?: string;
-      error?: string;
-    };
-    if (!res.ok || !data.token || !data.url) {
-      throw new Error(data.error ?? `token service refused (${res.status})`);
+    /* A MatrixRTC focus (Element Call) points at the SERVICE ROOT — the
+       token endpoint lives at a known sub-path. Grungus's own
+       com.grungus.livekit auth_url IS the endpoint already. Try the
+       focus sub-paths first, then the bare URL. */
+    const endpoints = matrixRtc
+      ? [
+          `${authUrl.replace(/\/$/, "")}/session/get_token`,
+          `${authUrl.replace(/\/$/, "")}/sfu/get`,
+          `${authUrl.replace(/\/$/, "")}/get_token`,
+          authUrl,
+        ]
+      : [authUrl];
+    let data: { token?: string; jwt?: string; url?: string; error?: string } = {};
+    let resStatus = 0;
+    let lastError = "token service unreachable";
+    for (const endpoint of endpoints) {
+      try {
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(authBody),
+        });
+        resStatus = res.status;
+        data = (await res.json().catch(() => ({}))) as {
+          token?: string;
+          jwt?: string;
+          url?: string;
+          error?: string;
+        };
+        /* element-call's legacy /sfu/get answers {url, jwt} */
+        const token = data.token ?? data.jwt;
+        if (res.ok && token && data.url) {
+          data.token = token;
+          lastError = "";
+          break;
+        }
+        lastError = data.error ?? `token service refused (${res.status})`;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : "network error";
+      }
+    }
+    if (!data.token || !data.url) {
+      throw new Error(lastError || `token service refused (${resStatus})`);
     }
 
     /* publish local media first (synthetic fallback on headless hosts) */
