@@ -1,3 +1,7 @@
+import { applyBackground } from "./services/background.ts";
+import { selectCallBackend } from "./services/matrix-call-service.ts";
+import { isVideoRoom } from "./services/room-kind.ts";
+import "./components/room-browser.ts";
 /*
  * Grungus — renderer bootstrap (TypeScript).
  *
@@ -5,7 +9,10 @@
  * Components stay dumb; this file is the only place that touches both the
  * MatrixClient and the component tree.
  */
-import { resetSessionBackup } from "./services/session-recovery.ts";
+import { configuredKlipyApiKey } from "./services/gif-config.ts";
+import "./components/new-dm-view.ts";
+import { klipyMediaUrl, formatGifMessage } from "./services/klipy.ts";
+import { resetSessionBackup, recoverSession } from "./services/session-recovery.ts";
 import { el } from "./components/ui.ts";
 import { LoginView, type LoginDetail, type RegisterDetail } from "./components/login-view.ts";
 import type { SpaceRail } from "./components/space-rail.ts";
@@ -460,6 +467,7 @@ function startShell(promptRecovery = false): void {
   const p2pManager = new P2PCallManager(active);
   const callView = document.createElement("call-view");
   root.appendChild(callView);
+  callView.setClient(active);
   /* the incoming-call ring banner (someone started a call in one of
      our rooms) */
   const incomingCall = document.createElement("incoming-call");
@@ -503,10 +511,11 @@ function startShell(promptRecovery = false): void {
   const refreshCallHeader = (): void => {
     if (state.roomId) {
       const room = active.getRoom(state.roomId);
-      const ongoing =
-        callMode === "livekit" ? lkManager.connected : callManager.active;
+      const ongoing = currentCallRoomId === room?.id && (
+        callMode === "livekit" ? lkManager.connected : callMode === "p2p" ? p2pManager.active : callManager.active
+      );
       chat.setCallState(
-        CallManager.callOngoing(room, active.userId),
+        CallManager.callOngoing(room, active.userId) || !!room?.rtcMemberships.some(member => member.focusUrl),
         ongoing
       );
     }
@@ -521,14 +530,14 @@ function startShell(promptRecovery = false): void {
     }
   });
   lkManager.setListener((lkState) => {
-    currentCallRoomId = lkState.connected ? state.roomId : null;
+    currentCallRoomId = lkState.connected ? lkManager.roomId : null;
     if (lkState.connected) incomingCall.dismiss();
     if (callMode === "livekit") {
       /* adapt the SFU state to the overlay's shape */
       callView.update(
         {
           active: lkState.connected,
-          roomId: state.roomId,
+          roomId: lkManager.roomId,
           participants: lkState.participants.map((p) => ({
             key: p.identity,
             userId: p.identity,
@@ -538,9 +547,11 @@ function startShell(promptRecovery = false): void {
             screenStream: p.screenStream,
             sharing: p.sharing,
             connectionState: "connected",
+            speaking: p.speaking,
           })),
           notice: lkState.notice,
           localMuted: lkState.localMuted,
+          localSpeaking: lkState.localSpeaking,
           localSharing: lkState.localSharing,
           localKey: active.userId,
         },
@@ -550,7 +561,11 @@ function startShell(promptRecovery = false): void {
           hangUp: () => void lkManager.leave(),
           startScreenshare: () => void lkManager.setSharing(true),
           stopScreenshare: () => void lkManager.setSharing(false),
-          localStream: null,
+          localStream: lkManager.localStream,
+          localCameraEnabled: lkManager.localCameraEnabled,
+          setCameraEnabled: enabled => lkManager.setCameraEnabled(enabled),
+          switchAudioInput: id => lkManager.switchAudioInput(id),
+          switchAudioOutput: id => lkManager.switchAudioOutput(id),
         }
       );
       refreshCallHeader();
@@ -565,48 +580,35 @@ function startShell(promptRecovery = false): void {
     }
   });
 
+  let callConnecting = false;
+  const finishCallConnection = (): void => { callConnecting = false; chat.setCallConnecting(false); };
   const startCall = (roomId: string, opts: { video?: boolean } = {}): void => {
+    if (callConnecting) return;
+    if (currentCallRoomId) { chat.setNotice("Leave your current call before opening another.", true); return; }
     const room = active.getRoom(roomId);
-    /* LiveKit path when the room has a Grungus service state OR an
-       ongoing MatrixRTC call with a LiveKit focus (Element Call interop:
-       join the call another MatrixRTC client started) */
-    const rtcFocus = room?.rtcMemberships.find((m) => m.focusUrl)?.focusUrl ?? null;
-    if (room?.livekitService || rtcFocus) {
-      callMode = "livekit";
-      lkManager.setRoomId(roomId);
-      void lkManager.join().catch((err: unknown) => {
-        chat.setNotice(
-          `Could not join the LiveKit call: ${err instanceof Error ? err.message : "network error"}`
-        );
-        callMode = "mesh";
-      });
-      return;
-    }
-    callMode = "mesh";
-    /* 1:1 rooms speak the legacy room-event protocol (m.call.invite) —
-       the one every Element client answers in DMs; the mesh stays for
-       group rooms */
-    const isDirectRoom =
-      room?.isDirect || (room?.joinedMemberCount ?? 0) <= 2;
-    if (isDirectRoom) {
-      callMode = "p2p";
-      void p2pManager.start(roomId, { video: opts.video === true }).catch((err: unknown) => {
-        chat.setNotice(
-          `Could not start call: ${err instanceof Error ? err.message : "network error"}`
-        );
-      });
-      return;
-    }
-    void callManager.start(roomId, { video: opts.video === true }).catch((err: unknown) => {
-      chat.setNotice(
-        `Could not start call: ${err instanceof Error ? err.message : "network error"}`
-      );
-    });
+    if (!room) { chat.setNotice("This room is not available yet.", true); return; }
+    callConnecting = true; chat.setCallConnecting(true); chat.setNotice("");
+    void (async () => {
+      const backend = await selectCallBackend(active, room);
+      callMode = backend.kind;
+      if (backend.kind === "livekit") {
+        lkManager.setRoomId(roomId);
+        await lkManager.join(backend.service);
+      } else if (backend.kind === "p2p") await p2pManager.start(roomId, { video: opts.video === true });
+      else await callManager.start(roomId, { video: opts.video === true });
+    })().catch((error: unknown) => {
+      chat.setNotice(`Could not connect to the room call: ${error instanceof Error ? error.message : "network error"}`, true);
+    }).finally(finishCallConnection);
   };
 
   chat.addEventListener("grungus:start-call", (event) => {
     const detail = (event as CustomEvent<{ roomId: string; video?: boolean }>).detail;
-    startCall(detail.roomId, { video: detail.video === true });
+    if (!isVideoRoom(active.getRoom(detail.roomId))) startCall(detail.roomId, { video: detail.video === true });
+  });
+
+  chat.addEventListener("grungus:join-room-call", event => {
+    const { roomId } = (event as CustomEvent<{ roomId: string }>).detail;
+    startCall(roomId, { video: false });
   });
 
   /* ---- settings (⚙ next to the name) ---- */
@@ -619,9 +621,11 @@ function startShell(promptRecovery = false): void {
   const applyAppearance = (): void => {
     const all = settings.all;
     document.body.classList.toggle("theme-light", all.theme === "light");
+    applyBackground(all.backgroundImage);
     document.body.style.fontSize = `${all.fontScale * 15}px`;
     document.body.style.setProperty("--ui-font-scale", String(all.fontScale));
     document.body.classList.toggle("compact-messages", all.compact);
+    chat.setKlipyApiKey(configuredKlipyApiKey(all.klipyApiKey));
     chat.applyPreferences({
       enterToSend: all.enterToSend,
       sendTyping: all.sendTypingNotifications,
@@ -632,12 +636,18 @@ function startShell(promptRecovery = false): void {
   /* the persisted speaker pick applies to calls started before any
      settings change */
   callView.applyAudioOutput(settings.get("audioOutput"));
+  callView.setAudioInput(settings.get("audioInput"));
+  callView.addEventListener("grungus:call-device", event => {
+    const { kind, deviceId } = (event as CustomEvent<{ kind: "audioInput" | "audioOutput"; deviceId: string }>).detail;
+    settings.set(kind, deviceId);
+  });
   settings.subscribe(() => {
     applyAppearance();
     settingsView.update(active, settings, userInfo);
     /* Voice & Video: a new speaker pick applies to the live call too */
     const speaker = settings.get("audioOutput");
     callView.applyAudioOutput(speaker);
+    callView.setAudioInput(settings.get("audioInput"));
     lkManager.setAudioOutput(speaker);
   });
 
@@ -656,14 +666,7 @@ function startShell(promptRecovery = false): void {
   });
   settingsView.addEventListener("grungus:logout", () => {
     settingsView.hide();
-    /* reuse the sidebar's logout flow */
-    active
-      .logout()
-      .catch(() => undefined)
-      .finally(() => {
-        client = null;
-        showLogin();
-      });
+    logout();
   });
 
   /* notification plumbing: OS notifications for new messages in
@@ -761,10 +764,9 @@ function startShell(promptRecovery = false): void {
     const cryptoLayerNow = active.crypto;
     if (!cryptoLayerNow) return;
     backupView.setStatus("Unlocking recovery and fetching the backup…", false);
-    void cryptoLayerNow
-      .restoreWithRecovery(detail.passphrase)
-      .then((count) => {
-        backupView.setStatus(`Restored ${count} session${count === 1 ? "" : "s"} — undecryptable messages update in place.`, false);
+    void recoverSession(active, detail.passphrase)
+      .then(({ verified, restored, backupError }) => {
+        backupView.setStatus(`${verified ? "This device is verified. " : "History recovery did not verify this device; verify with another device. "}${restored === null ? `History recovery failed: ${backupError}` : `Restored ${restored} sessions — undecryptable messages update in place.`}`, restored === null);
       })
       .catch((err: unknown) => {
         backupView.setStatus(
@@ -796,7 +798,16 @@ function startShell(promptRecovery = false): void {
   });
   recoveryView.addEventListener("session-restore", (event) => {
     recoveryView.setStatus("Recovering encrypted history…", true);
-    void active.crypto!.restoreWithRecovery((event as CustomEvent<string>).detail).then(() => recoveryView.hide()).catch((error: unknown) => {
+    void recoverSession(active, (event as CustomEvent<string>).detail).then(({ verified, restored, backupError }) => {
+      if (verified) {
+        recoveryView.hide();
+        chat.setNotice(backupError
+          ? `Device verified, but history recovery failed: ${backupError}`
+          : `This device is verified. Restored ${restored ?? 0} encrypted sessions.`);
+      } else {
+        recoveryView.setStatus(`Restored ${restored ?? 0} sessions. This backup has no recoverable cross-signing identity. Verify with another device to finish verifying this session.`);
+      }
+    }).catch((error: unknown) => {
       recoveryView.setStatus(error instanceof Error ? error.message : "Recovery failed.");
     });
   });
@@ -816,6 +827,14 @@ function startShell(promptRecovery = false): void {
   const cryptoLayer = active.crypto;
   if (cryptoLayer) {
     const crossSigning = new CrossSigning(cryptoLayer, active);
+    const retryPendingKeys = (): void => {
+      cryptoLayer.retryRoomKeyRequests();
+      for (const room of active.rooms.values()) active.retryUndecrypted(room.id);
+    };
+    /* Repair signatures lost by older versions without asking for recovery again. */
+    void crossSigning.canSign().then(async canSign => {
+      if (canSign && await crossSigning.signDevice(cryptoLayer.deviceId)) retryPendingKeys();
+    }).catch(error => chat.setNotice(`Could not verify this device: ${error instanceof Error ? error.message : "unknown error"}`));
     verification = new VerificationManager(cryptoLayer);
     verification.crossSigning = crossSigning;
     cryptoLayer.addPayloadListener((sender, type, content, senderKey) => {
@@ -831,7 +850,9 @@ function startShell(promptRecovery = false): void {
       if (type === "m.secret.send") {
         const send = content as { request_id?: string; secret?: string };
         if (send.request_id && send.secret) {
-          void crossSigning.handleSecretSend(send.request_id, send.secret);
+          void crossSigning.handleSecretSend(send.request_id, send.secret).then(async type => {
+            if (type === "self_signing" && await crossSigning.signDevice(cryptoLayer.deviceId)) retryPendingKeys();
+          }).catch(error => chat.setNotice(`Could not verify this device: ${error instanceof Error ? error.message : "unknown error"}`));
         }
         return;
       }
@@ -990,6 +1011,14 @@ function startShell(promptRecovery = false): void {
     void active.setTyping(roomId, false).catch(() => {});
   });
 
+  chat.addEventListener("grungus:send-gif", event => {
+    const { roomId, url } = (event as CustomEvent<{ roomId: string; url: string }>).detail;
+    if (!klipyMediaUrl(url)) return;
+    void active.sendMessage(roomId, formatGifMessage(url)).catch(error => {
+      chat.setNotice(`Could not send GIF: ${error instanceof Error ? error.message : "unknown error"}`);
+    });
+  });
+
   chat.addEventListener("grungus:send-media", (event) => {
     const detail = (event as CustomEvent<{ roomId: string; file: File }>).detail;
     void (async () => {
@@ -1039,7 +1068,7 @@ function startShell(promptRecovery = false): void {
     /* the call state may have arrived in the initial sync (before this
        room was ever selected) — refresh the header's Join call state */
     chat.setCallState(
-      CallManager.callOngoing(room, active.userId),
+      CallManager.callOngoing(room, active.userId) || !!room?.rtcMemberships.some(member => member.focusUrl),
       callManager.active && callMode === "mesh"
         ? true
         : callMode === "livekit" && lkManager.connected
@@ -1101,12 +1130,37 @@ function startShell(promptRecovery = false): void {
   });
 
   roomList.addEventListener("grungus:create-room", (event) => {
-    const name = (event as CustomEvent<{ name: string }>).detail.name;
-    void active.createRoom({ name, isPublic: false }).catch((err: unknown) => {
+    const { name, isVideo, spaceId } = (event as CustomEvent<{ name: string; isVideo?: boolean; spaceId?: string | null }>).detail;
+    void active.createRoom({ name, isPublic: false, isVideo }).then(async roomId => {
+      if (spaceId) await active.addToSpace(spaceId, roomId);
+    }).catch((err: unknown) => {
       chat.setNotice(
         `Could not create room: ${err instanceof Error ? err.message : "network error"}`
       );
     });
+  });
+
+  const newDmView = document.createElement("new-dm-view");
+  newDmView.hidden = true;
+  root.appendChild(newDmView);
+  let pendingDirectRoom: string | null = null;
+  let pendingBrowseSpace: { roomId: string; spaceId: string | null } | null = null;
+  const roomBrowser = document.createElement("room-browser");
+  roomBrowser.hidden = true;
+  root.appendChild(roomBrowser);
+  roomList.addEventListener("grungus:explore-rooms", () => roomBrowser.show(active, currentSpace()));
+  roomBrowser.addEventListener("grungus:room-joined", event => {
+    const { roomId, spaceId } = (event as CustomEvent<{ roomId: string; spaceId: string | null }>).detail;
+    state.spaceId = spaceId;
+    if (active.getRoom(roomId)) selectRoom(roomId);
+    else pendingBrowseSpace = { roomId, spaceId };
+  });
+  roomList.addEventListener("grungus:new-dm", () => newDmView.show(active));
+  newDmView.addEventListener("grungus:dm-created", event => {
+    const { roomId } = (event as CustomEvent<{ roomId: string }>).detail;
+    state.spaceId = null;
+    if (active.getRoom(roomId)) selectRoom(roomId);
+    else pendingDirectRoom = roomId;
   });
 
   /* space management */
@@ -1196,6 +1250,16 @@ function startShell(promptRecovery = false): void {
 
   active.on("room", (update) => {
     if (!client) return;
+    if (pendingBrowseSpace?.roomId === update.room.id) {
+      state.spaceId = pendingBrowseSpace.spaceId;
+      pendingBrowseSpace = null;
+      selectRoom(update.room.id);
+    }
+    if (pendingDirectRoom === update.room.id) {
+      pendingDirectRoom = null;
+      state.spaceId = null;
+      selectRoom(update.room.id);
+    }
     callManager.onRoomUpdate(update.room);
     /* incoming-call ring: edge-detect "a call started in this room"
        (mesh m.call.member state or a MatrixRTC membership with a
@@ -1209,6 +1273,7 @@ function startShell(promptRecovery = false): void {
     callWasOngoing.set(update.room.id, ongoing);
     if (
       ongoing &&
+      !isVideoRoom(update.room) &&
       prev === false &&
       update.room.id !== currentCallRoomId &&
       incomingCall.ringingRoomId === null
@@ -1235,8 +1300,8 @@ function startShell(promptRecovery = false): void {
       }
       members.update(update.room, client, client.userId);
       chat.setCallState(
-        CallManager.callOngoing(update.room, active.userId),
-        callManager.active
+        ongoing,
+        currentCallRoomId === update.room.id && (callMode === "livekit" ? lkManager.connected : callMode === "p2p" ? p2pManager.active : callManager.active)
       );
       chat.setTypingUsers(update.room.typingUsers);
       /* the open room is being read: keep the unread at zero and send
@@ -1318,6 +1383,11 @@ function startShell(promptRecovery = false): void {
       });
   });
 
+  active.on("presence", () => {
+    refreshSidebar();
+    members.update(state.roomId ? active.getRoom(state.roomId) : null, active, active.userId);
+  });
+
   active.on("connection", (connState) => {
     roomList.setConnection(connState);
   });
@@ -1390,6 +1460,9 @@ async function boot(): Promise<void> {
       localStorage.setItem("grungus-settings-migrated", "1");
     } catch { /* Preserve the old preferences so migration can be retried on next launch. */ }
   }
+  const appearance = new SettingsStore();
+  document.body.classList.toggle("theme-light", appearance.get("theme") === "light");
+  applyBackground(appearance.get("backgroundImage"));
   const bootParams = new URLSearchParams(location.search);
   if (bootParams.get("sso") === "1" && bootParams.get("loginToken")) {
     void completeSsoReturn(bootParams);

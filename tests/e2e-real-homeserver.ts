@@ -26,6 +26,8 @@ import {
   E2eeCrypto,
   MemoryCryptoStore,
 } from "../src/renderer/services/e2ee.ts";
+import { CrossSigning } from "../src/renderer/services/cross-signing.ts";
+import { SecretStorage, encodeRecoveryKey } from "../src/renderer/services/ssss.ts";
 import { VerificationManager } from "../src/renderer/services/sas.ts";
 
 const HOME = process.env.GRUNGUS_E2E_HOMESERVER ?? "";
@@ -547,6 +549,13 @@ async function main(): Promise<void> {
 
   const backupVersion = await cryptoBK.createKeyBackup(PASSPHRASE);
   log("key backup: version created on the homeserver ✓");
+  const backupSigning = new CrossSigning(cryptoBK, bk);
+  await backupSigning.bootstrap(BK_PASS, PASSPHRASE);
+  const secretStorage = new SecretStorage(bk);
+  const secretKey = await secretStorage.debugKeyBytes(PASSPHRASE);
+  assert.ok(secretKey, "cross-signing secret storage key available");
+  const securityKey = encodeRecoveryKey(secretKey);
+
   await new Promise((r) => setTimeout(r, 2_500)); /* sweep PUTs are fire-and-forget */
 
   /* a second device of the SAME fresh account, first device offline —
@@ -558,6 +567,12 @@ async function main(): Promise<void> {
   await cryptoBK2.init();
   bk2.crypto = cryptoBK2;
   cryptoBK2.onInboundSessionAdded = (roomId) => bk2.retryUndecrypted(roomId);
+  const recoveredSigning = new CrossSigning(cryptoBK2, bk2);
+  assert.equal(await recoveredSigning.recoverWithRecovery(securityKey), true, "security key self-verifies the new device before initial sync");
+  const sskPub = Object.values((await bk2.api<{ self_signing_keys: Record<string, { keys: Record<string, string> }> }>("POST", "/_matrix/client/v3/keys/query", { body: { device_keys: { [bk2.userId!]: [] } } })).self_signing_keys[bk2.userId!]!.keys)[0]!;
+  const signedDevice = (await cryptoBK2.getRawDeviceKeys(bk2.userId!))[bk2.deviceId!];
+  assert.ok(signedDevice?.signatures?.[bk2.userId!]?.[`ed25519:${sskPub}`], "server accepted recovered identity's device signature");
+  log("cross-signing: security key recovery self-signed the fresh device before sync ✓");
   bk2.startSync();
   await waitFor(() => bk2.getRoom(bkRoom) !== null, "second backup-device syncs the room");
   const restored = await cryptoBK2.restoreKeyBackup(PASSPHRASE);
@@ -575,6 +590,20 @@ async function main(): Promise<void> {
   log(
     `key backup: second device restored ${restored} session(s) from version ${backupVersion} and decrypted history (no other device online) ✓`
   );
+  let directory = await b.searchUsers(USER1);
+  const directoryDeadline = Date.now() + WAIT_MS;
+  while (!directory.results.some(user => user.user_id === a.userId) && Date.now() < directoryDeadline) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    directory = await b.searchUsers(USER1);
+  }
+  assert.ok(directory.results.some(user => user.user_id === a.userId), "homeserver directory indexes the user sharing a room with the requester");
+  const directRoom = await bk2.startDirectMessage(a.userId!);
+  await waitFor(() => bk2.getRoom(directRoom)?.isDirect === true && a.getInvites().some(invite => invite.id === directRoom), "new DM is classified and its invite arrives");
+  await bk2.sendMessage(directRoom, "direct-message-before-acceptance");
+  await a.acceptInvite(directRoom);
+  await waitFor(() => a.getRoom(directRoom)?.timeline.some(item => item.kind === "message" && item.body === "direct-message-before-acceptance") === true, "invited DM partner decrypts greeting after joining");
+  assert.equal(await bk2.startDirectMessage(a.userId!), directRoom, "starting DM again reuses existing room");
+  log("direct messages: directory search, encrypted invite, pre-join greeting, and room reuse ✓");
   bk2.stopSync();
 
   log("ALL E2E CHECKS PASSED against", HOME);

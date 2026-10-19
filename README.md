@@ -67,9 +67,7 @@ for an open protocol.
   SDP offers/answers and ICE candidates flow over olm-encrypted
   (encrypted rooms) or plaintext to-device messages, media rides
   WebRTC DTLS-SRTP with one peer connection per member device. Mute,
-  hang up, per-peer connection state. When no capture devices exist,
-  a synthetic canvas/oscillator stream keeps calls working (with a
-  visible notice) — handy on headless hosts.
+  hang up, per-peer connection state. Microphone capture uses real devices only; permission or device failures are reported.
 - **Screen sharing** — "Share screen" in the call overlay captures the
   display (getDisplayMedia; in Electron a picker lists screens and windows, with system audio
   off until explicitly selected on supported platforms) and adds it to every peer connection with mid-call
@@ -78,9 +76,7 @@ for an open protocol.
   Mesh bandwidth discipline: content-hinted screen encoding (~1.5 Mbps
   cap, 10 fps — screens tolerate low fps, text stays sharp), one share
   at a time. m.call.screenshare start/stop rides the same encrypted
-  signaling (a Grungus extension, Element interop untested). Hosts
-  without display capture fall back to a synthetic screen so the whole
-  pipeline stays verifiable.
+  signaling (a Grungus extension, Element interop untested). Hosts without display capture cannot share a screen.
 - **Calls through a LiveKit SFU (optional)** — rooms with a
   `com.grungus.livekit` state event ({url, room, auth_url}) route calls
   through a LiveKit server instead of the mesh: the bandwidth ceiling
@@ -89,8 +85,7 @@ for an open protocol.
   lk-jwt-service pattern): the client proves its Matrix identity to a
   token service (OpenID token, with whoami fallback for homeservers
   with federation disabled) and receives a short-lived LiveKit access
-  token; the API secret never touches the client. Media falls back to
-  synthetic streams on headless hosts. Rooms without a LiveKit state
+  token; the API secret never touches the client. Media uses real devices only and the camera starts off. Rooms without a LiveKit state
   event use the mesh unchanged. `livekit/auth-service.ts` is the
   deployable token service (single-file Node, jsonwebtoken).
 - **1:1 calls with Element interop (MSC2746)** — direct-message calls
@@ -755,7 +750,7 @@ the same client from Node — handy for debugging and demos.
   verification persistence is per-device-store only.)
 - Space management UI, message
   editing/reactions, reply chains.
-- Server-side read markers, presence, notifications
+- Server-side read markers and notification delivery improvements
   (Electron + Push Gateway).
 
 ## License
@@ -847,7 +842,8 @@ separate job, alongside the mock integration tests and strict typechecking
 After a new login (password, token, or SSO), Grungus prompts you to verify
 with another signed-in device or restore history using your recovery
 passphrase/security key. Device verification uses the existing emoji/QR flow;
-recovery restores keys but does not itself mark a device cross-signed. You can
+recovery also unlocks cross-signing secrets and signs this device with the
+existing account identity when those secrets are available. You can
 skip and return through the sidebar's verification and key-backup actions.
 Existing saved sessions resume without repeating the prompt.
 
@@ -861,3 +857,169 @@ password login support; SSO-only accounts must recover through another device
 or their homeserver's account recovery process. Reset does not replace your
 cross-signing identity or erase keys held locally on your devices. History
 whose only keys were in the deleted backup can no longer be recovered.
+
+### Emoji picker
+
+Use the smiley button beside the message field to select an emoji. The picker
+works offline, with categories and English/German keyword search. Selection
+inserts at the cursor or replaces selected text, including while editing or
+replying. Escape or clicking outside closes the picker. Emoji searches stay
+on your device.
+
+The picker now includes the full bundled Emojibase Unicode catalog (about 4,000
+entries), including skin tones, flags, and combined emoji sequences. It renders
+using the system's native emoji fonts; support for the newest symbols depends
+on the fonts installed on the device. Categories, English/German search, and
+**More emojis** make the full list available offline.
+
+On a message, choose **Choose a reaction** (☺+) to open the same full picker.
+Selecting an emoji adds that reaction to the selected message. The quick reaction
+buttons remain available. Escape or clicking outside closes the picker.
+
+
+### KLIPY GIF picker
+
+For a private build for you and your friends, create `.env.local` in the repository
+root and add the KLIPY client API key you obtained from the
+[KLIPY Partner Panel](https://partner.klipy.com/):
+
+```dotenv
+VITE_KLIPY_API_KEY=your_klipy_api_key
+```
+
+Then run `npm run build` or package the app as usual. Vite includes your key in
+the renderer, so friends using that build can search GIFs without entering a key.
+Restart `npm run dev` after changing this file during development. `.env.local`
+is ignored by Git; [.env.example](.env.example) contains the configuration template.
+This is a client API key: recipients can inspect it in the application bundle.
+
+**Settings → Preferences** also supports an optional personal KLIPY key. A
+personal key takes precedence over the bundled one; clearing it returns to the
+shared application key. Without either key the picker shows a setup hint.
+Existing GIPHY keys are not reused.
+
+The **GIF** button beside the message field opens trending GIFs and a searchable,
+paginated KLIPY picker. Search errors, invalid keys, rate limits, and empty
+results are shown in the picker. Closing it or changing rooms cancels requests.
+Searches and previews connect directly to KLIPY without Matrix credentials or
+message text. The provider's `high` content filter is requested.
+
+Selecting a GIF sends `/gif <original media URL>` as a normal message, encrypted
+in encrypted rooms. You can also type the command manually, for example:
+
+```text
+/gif https://static.klipy.com/ii/4e7bea9f7a3371424e6c16ebc93252fe/0e/38/pDi70ntRCEC9vvhtwC.gif
+```
+
+Grungus embeds the GIF directly in the chat, with a link and retry on load
+failure. Plain links and unsupported `/gif` URLs remain ordinary text. Other
+Matrix clients receive the command as text. Media is not copied to the Matrix
+server, following [KLIPY's direct-delivery requirements](https://docs.klipy.com/integration-requirements).
+The picker displays **Powered by KLIPY** and preserves returned media URLs.
+Live search requires a working KLIPY key; automated checks use mocked responses
+matching the [native GIF API](https://docs.klipy.com/gifs-api).
+
+### Direct-message avatars
+
+The conversation sidebar shows the other person's profile image for a 1:1 DM,
+including named rooms marked as direct messages in Matrix account data. It uses
+the room-member avatar first, then the person's global profile image if needed.
+Group rooms keep their room image. Initials remain the fallback without a photo.
+
+### Logging out sessions
+
+In **Settings → Sessions**, select **Log out** beside another device and enter
+your account password in the inline form, then choose **Confirm logout**.
+Cancel leaves the session active; authentication errors are shown in Settings.
+**Settings → My Account → Log out** signs out this device and clears its saved
+login, using the same logout flow as the sidebar.
+
+### Element encryption interoperability
+
+Recovery through the login prompt or **Key backup → Restore history** now
+recovers both the existing cross-signing identity and message history. Element
+security keys and recovery passphrases are supported. Public identity keys are
+loaded from standard `/keys/query` responses, and private seeds are checked
+against that identity before the current device is signed. History-only backups
+without signing secrets are explicitly reported as insufficient to verify a
+session. Verification can succeed even when there is no history backup.
+
+If you previously restored history while Element still reported your Grungus
+device as unverified, restart the updated app. When valid signing seeds are
+already stored, Grungus repairs its device signature automatically. Otherwise,
+use **Key backup → Restore history** once with the recovery key for the account
+logged into Grungus. Successful identity recovery reports **This device is
+verified**. There is no need to reset the backup or account identity. The other account's independent identity
+may still need normal contact verification in Element.
+
+Incoming encrypted events support modern clients that omit the deprecated
+`sender_key`/`device_id` fields. Events remain tracked while their room key is
+missing, and a late normal room-key delivery triggers decryption again. Sessions
+and decrypted payloads are checked against the room before displaying messages.
+
+
+Key replenishment uploads only one-time keys and never replaces a device's
+cross-signatures. Restarting an existing device also preserves those signatures.
+Received Megolm keys and established Olm sessions are saved as pickles through
+the existing crypto vault, scoped to the account/device, so they survive restarts
+without another recovery-key entry. A later key share cannot replace an earlier
+session with one that decrypts less history. Successfully recovering a signing
+identity retries previously blocked room-key requests.
+
+`tests/element-crypto.test.ts` uses `@matrix-org/matrix-sdk-crypto-wasm` as a
+**test-only** dependency: Element's Rust engine sends encrypted messages to
+Grungus, decrypts replies, and checks owner cross-signing after recovery, key
+replenishment, and restart. It also delivers a new room key through an existing
+Olm session after Grungus restarts. This supplements the mock-server and real
+Synapse checks; it does not automate the user's installed Element application.
+
+
+### Starting direct messages
+
+Use the **New direct message** speech-bubble button at the top of the conversation
+sidebar. Search by display name or Matrix ID in your homeserver's user directory,
+then select a result. Alternatively, enter a full ID such as `@friend:example.org`
+and choose **Start chat**; this also works when directory search is unavailable.
+The homeserver controls which users its directory exposes, including whether
+remote users appear.
+
+Grungus opens an existing one-to-one conversation where possible. Otherwise it
+creates a private encrypted room, invites the selected person, and records it in
+Matrix `m.direct` account data without replacing other DM mappings. The new chat
+appears in **Direct Messages** while the invite is pending and opens as soon as
+it syncs. The invited DM partner receives keys for messages sent before invite
+acceptance, so the first greeting remains readable after they join. Search errors are shown in the dialog; closing it cancels pending search.
+
+
+### Presence dots
+
+The room member list and the DM sidebar display a status dot on each person's
+avatar: green for Matrix `online`, gray for `offline` or `unavailable` (away).
+Hover or use the accessibility label to distinguish offline, away, and unknown
+status. Updates arrive through `/sync` presence events and refresh immediately,
+without requiring a message or membership change.
+
+Presence visibility depends on the homeserver. When it does not supply presence
+(for example because presence is disabled), the dot is gray and labeled
+**Presence unavailable**, rather than claiming that the person is offline.
+Room/group icons do not receive person-presence dots.
+
+### Discovering rooms
+
+Use **Explore rooms** (the search icon in the room sidebar header) to browse your homeserver’s published room directory. Search names or topics, load additional results, and select **Join** to enter a public room or **Open** for an existing room. Each entry shows its topic and member count. Private and unlisted rooms are not discoverable; listed rooms with restricted access are labeled accordingly. The homeserver controls directory visibility and admission.
+
+When a space is selected, **Browse rooms in this space** opens its visible child rooms, including rooms you have not joined. Results come from the space hierarchy rather than the public homeserver directory. Search filters loaded rooms; **Load more rooms** fetches additional children. Space-restricted rooms offer a join attempt subject to server access checks. Joining keeps the selected space open. Nested spaces themselves are excluded from this room list.
+
+Chats show **End-to-end encrypted** or **Not encrypted** in the header, with a persistent status below the message composer that also remains visible on small screens. The status follows the room’s encryption setting for both DMs and group rooms, applies to new messages, and does not imply that participants’ devices are verified or that older history was encrypted.
+
+Within spaces, the sidebar separates **Text rooms** and **Video rooms**, with hash and camera icons. The room creation form offers both types and adds new rooms to the selected space. Video rooms (`org.matrix.msc3417.call` and `io.element.video`) offer **Join call** when a call is active and **Start call** when empty. Both enter audio-only; camera capture is an explicit option in the call screen. They never initiate legacy one-to-one calls or ring space members when someone joins. Video rooms use their configured LiveKit service or discover the MatrixRTC backend through the homeserver’s transports endpoint or client well-known configuration. If none is available, Grungus reports the missing backend instead of opening a separate call. Existing Element sessions use the oldest active member’s advertised backend. Leaving disconnects only the participant; the room remains available to join again.
+
+The call screen includes microphone and speaker selectors that apply during a call and save successful selections to Voice & Video settings. **System default** resets the device choice; **Refresh devices** reloads available devices, which also refresh automatically when devices are connected or removed. Switching microphones preserves mute state and retains the previous microphone if capture or track replacement fails. The call layout provides participant counts, audio-only avatars, larger video tiles, screen presentations, and accessible mute/share/leave controls.
+
+Element call notifications and membership changes appear as call activity cards in the timeline; loading history never replays call signaling. Call connection shows **Connecting…** and prevents repeated clicks. Errors remain visible below the composer. MatrixRTC authorization uses the full temporary OpenID proof and device identity expected by Element’s token service; the regular Matrix session token is reserved for explicitly configured trusted Grungus services.
+
+Remote camera feeds automatically take the centre of the call screen, with participant tiles in a scrollable column on the right. When several cameras are on, the video button on a participant tile selects the featured feed; screen sharing takes priority. Profile pictures identify participants in both camera-off tiles and tile labels, using room membership avatars with a profile lookup fallback. When the last remote camera stops, the participant grid returns. On narrow screens the participant column becomes a horizontal strip below the main video.
+
+Speaking participants receive a green tile outline and a **Speaking** badge, including both the featured video and the participant column. LiveKit uses its active-speaker events; direct and mesh calls analyse microphone/received voice audio locally, with a short hold between syllables. Muting clears the local indicator. Voice analysis does not capture additional media, send audio elsewhere, or connect the microphone to the speakers, and is released when the call ends.
+
+In **Settings → Appearance → Background picture**, choose a local picture to enable a translucent interface. The picture fills the window with a slight blur, while panels retain clear borders in dark and light themes. The image is resized and saved only on this device, including across restarts; it is never uploaded to the homeserver. **Remove background** restores the solid interface. PNG, JPEG, WebP, GIF, and AVIF files up to 20 MB are accepted; animated images use a still frame.

@@ -319,3 +319,46 @@ test("edits, replies, and reactions use the encrypted sender and fail closed wit
   await assert.rejects(() => a.sendReaction(roomId, original!, "👍"), /E2EE is unavailable/);
   assert.equal(hs.rooms.get(roomId)!.events.length, count);
 });
+
+test("Element-shaped Megolm messages without sender_key decrypt when a late room key arrives", async t => {
+  const hs = new MockHomeserver();
+  await hs.listen(); t.after(() => hs.close());
+  const a = await makeCryptoUser(hs, "modern_sender", "pw");
+  const b = await makeCryptoUser(hs, "modern_receiver", "pw");
+  a.startSync(); b.startSync();
+  t.after(() => { a.stopSync(); b.stopSync(); });
+  const roomId = await a.createRoom({ name: "Modern crypto", isPublic: true, encrypted: true });
+  await b.joinRoom(roomId);
+  await waitFor(() => !!a.getRoom(roomId)?.members.has(b.userId!) && b.getRoom(roomId)?.isEncrypted === true);
+  const keyEvents: Parameters<E2eeCrypto["onToDeviceEvents"]>[0] = [];
+  const originalReceive = b.crypto!.onToDeviceEvents.bind(b.crypto!);
+  b.crypto!.onToDeviceEvents = events => { keyEvents.push(...events); };
+  b.crypto!.onInboundSessionAdded = id => b.retryUndecrypted(id);
+  const encrypted = await a.crypto!.encryptRoomMessage(roomId, { msgtype: "m.text", body: "from modern Element" });
+  const { sender_key: ignoredSender, device_id: ignoredDevice, ...modern } = encrypted;
+  await a.api("PUT", `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.encrypted/modern-test`, { body: modern });
+  await waitFor(() => !!b.getRoom(roomId)?.timeline.some(item => item.kind === "system" && item.text.includes("Unable to decrypt")) && keyEvents.length > 0);
+  b.crypto!.onToDeviceEvents = originalReceive;
+  originalReceive(keyEvents);
+  await waitFor(() => messageBodies(b, roomId).includes("from modern Element"));
+  assert.equal(b.crypto!.decryptRoomEvent({ type: "m.room.encrypted", sender: a.userId!, content: modern }, "!different:mock.hs"), null, "Keys must remain bound to their room");
+});
+
+
+test("late room-key re-sharing never overwrites earlier decryption history", async t => {
+  const hs = new MockHomeserver(); await hs.listen(); t.after(() => hs.close());
+  const a = await makeCryptoUser(hs, "early_sender", "pw");
+  const b = await makeCryptoUser(hs, "early_receiver", "pw");
+  a.startSync(); b.startSync(); t.after(() => { a.stopSync(); b.stopSync(); });
+  const roomId = await a.createRoom({ name: "Late keys", encrypted: true, isPublic: true });
+  await b.joinRoom(roomId);
+  await waitFor(() => a.getRoom(roomId)?.members.has(b.userId!) === true && b.getRoom(roomId)?.isEncrypted === true);
+  const first = await a.crypto!.encryptRoomMessage(roomId, { msgtype: "m.text", body: "Earliest history" });
+  await waitFor(() => b.crypto!.debugInboundSessions().some(session => session.sessionId === first.session_id));
+  assert.equal(b.crypto!.decryptRoomEvent({ type: "m.room.encrypted", sender: a.userId!, content: first }, roomId)?.content.body, "Earliest history");
+  a.crypto!.onDeviceListChange([b.userId!]);
+  const late = await a.crypto!.encryptRoomMessage(roomId, { msgtype: "m.text", body: "Later history" });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(b.crypto!.decryptRoomEvent({ type: "m.room.encrypted", sender: a.userId!, content: late }, roomId)?.content.body, "Later history");
+  assert.equal(b.crypto!.decryptRoomEvent({ type: "m.room.encrypted", sender: a.userId!, content: first }, roomId)?.content.body, "Earliest history", "Later keys must not discard recovered/earlier history");
+});

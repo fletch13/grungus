@@ -1,3 +1,4 @@
+import { prepareBackground } from "../services/background.ts";
 /*
  * Grungus — <settings-view>: the user settings overlay.
  *
@@ -16,6 +17,7 @@
  *   Advanced       — access token reveal, device id, homeserver, cache
  *   Help & About   — version + stack
  */
+import { sharedKlipyApiKey } from "../services/gif-config.ts";
 import { el } from "./ui.ts";
 import type { MatrixClient } from "../services/matrix-client.ts";
 import type { SettingsStore, GrungusSettings } from "../services/settings.ts";
@@ -46,8 +48,10 @@ export class SettingsView extends HTMLElement {
   private _status = "";
   private _statusError = false;
   private _devices: DeviceRow[] = [];
+  private _deviceLogoutBusy = false;
   private _ignored: string[] = [];
   private _token = "";
+  private _backgroundBusy = false;
   private _avatarMxc: string | null = null;
   private _displayName = "";
 
@@ -343,16 +347,39 @@ export class SettingsView extends HTMLElement {
         row.appendChild(rename);
       } else {
         const kick = el("button", { class: "call-btn danger", text: "Log out" });
+        (kick as HTMLButtonElement).disabled = this._deviceLogoutBusy;
         kick.addEventListener("click", () => {
-          const pw = window.prompt("Account password (to log out the device)", "");
-          if (!pw) return;
-          void client
-            .deleteDevices([device.deviceId], pw)
-            .then(() => this._loadPanelData())
-            .then(() => this._setStatus("Device logged out."))
-            .catch((err: unknown) =>
-              this._setStatus(`Failed: ${err instanceof Error ? err.message : "error"}`, true)
-            );
+          if (row.querySelector("form") || this._deviceLogoutBusy) return;
+          const form = el("form", { class: "device-logout-form", "aria-label": `Log out ${device.displayName ?? device.deviceId}` });
+          const label = el("label", { text: "Account password" });
+          const password = el("input", {
+            class: "settings-input", type: "password", autocomplete: "current-password",
+            required: true, "aria-label": "Account password",
+          }) as HTMLInputElement;
+          label.append(password);
+          const confirm = el("button", { type: "submit", class: "call-btn danger", text: "Confirm logout" });
+          const cancel = el("button", { type: "button", class: "call-btn", text: "Cancel" });
+          cancel.addEventListener("click", () => { password.value = ""; form.remove(); kick.focus(); });
+          form.append(label, confirm, cancel);
+          form.addEventListener("submit", event => {
+            event.preventDefault();
+            if (this._deviceLogoutBusy || !password.value) return;
+            this._deviceLogoutBusy = true;
+            const value = password.value;
+            password.value = "";
+            form.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach(control => { control.disabled = true; });
+            void client.deleteDevices([device.deviceId], value).then(async () => {
+              this._devices = this._devices.filter(entry => entry.deviceId !== device.deviceId);
+              await this._loadPanelData();
+              this._deviceLogoutBusy = false;
+              this._setStatus("Device logged out.");
+            }).catch((err: unknown) => {
+              this._deviceLogoutBusy = false;
+              this._setStatus(`Logout failed: ${err instanceof Error ? err.message : "error"}`, true);
+            });
+          });
+          row.append(form);
+          password.focus();
         });
         row.appendChild(kick);
       }
@@ -378,6 +405,35 @@ export class SettingsView extends HTMLElement {
       themeRow.appendChild(radio);
     }
     panel.appendChild(this._labeledRow("Theme", themeRow));
+    const background = el("div", { class: "settings-col background-settings" });
+    const image = settings.get("backgroundImage");
+    if (image) background.append(el("img", { class: "background-preview", src: image, alt: "Your custom background" }));
+    const file = el("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif,image/avif", class: "hidden-file-input", "aria-label": "Background picture", disabled: this._backgroundBusy }) as HTMLInputElement;
+    const choose = el("button", { type: "button", class: "call-btn", text: this._backgroundBusy ? "Saving picture…" : image ? "Change background picture" : "Choose background picture", disabled: this._backgroundBusy });
+    choose.addEventListener("click", () => file.click());
+    file.addEventListener("change", () => {
+      const selected = file.files?.[0];
+      if (!selected || this._backgroundBusy) return;
+      this._backgroundBusy = true; this._render();
+      void prepareBackground(selected).then(value => {
+        settings.set("backgroundImage", value);
+        this._status = "Background saved on this device."; this._statusError = false;
+      }).catch(error => {
+        this._status = `Could not save background: ${error instanceof Error ? error.message : "unknown error"}`; this._statusError = true;
+      }).finally(() => { this._backgroundBusy = false; this._render(); });
+    });
+    const controls = el("div", { class: "settings-row" }, choose, file);
+    if (image) {
+      const remove = el("button", { type: "button", class: "call-btn", text: "Remove background", disabled: this._backgroundBusy });
+      remove.addEventListener("click", () => {
+        try { settings.set("backgroundImage", ""); this._setStatus("Background removed."); }
+        catch { this._setStatus("Could not remove the saved background. Please try again.", true); }
+      });
+      controls.append(remove);
+    }
+    background.append(controls, el("p", { class: "settings-hint", text: "Choose a picture to enable translucent panels with clear outlines and a lightly blurred background. Saved only on this device; never uploaded. Images up to 20 MB are resized automatically." }));
+    panel.append(this._labeledRow("Background picture", background));
+
 
     /* font size */
     const fontRow = el("div", { class: "settings-row" });
@@ -403,6 +459,15 @@ export class SettingsView extends HTMLElement {
   private _renderPreferences(panel: HTMLElement): void {
     const settings = this._settings!;
     panel.appendChild(this._section("Preferences"));
+    const gifs = el("form", { class: "settings-row" });
+    const keyLabel = el("label", { for: "klipy-api-key", text: "Personal KLIPY API key (optional override)" });
+    const key = el("input", { id: "klipy-api-key", class: "settings-input", type: "password", autocomplete: "off", placeholder: sharedKlipyApiKey ? "Using the shared application key" : "Your KLIPY API key" }) as HTMLInputElement;
+    key.value = settings.get("klipyApiKey");
+    gifs.append(keyLabel, key, el("button", { type: "submit", class: "call-btn", text: "Save GIF settings" }));
+    gifs.append(el("p", { class: "settings-hint", text: sharedKlipyApiKey ? "A shared KLIPY key is included in this build. Leave this field empty to use it. A personal override is saved on this device." : "Enter your own KLIPY key, or configure a shared key when building the app. Searches connect directly to KLIPY. Get a key at partner.klipy.com." }));
+    gifs.addEventListener("submit", event => { event.preventDefault(); settings.set("klipyApiKey", key.value.trim()); });
+    panel.append(gifs);
+
 
     panel.appendChild(
       this._toggle(

@@ -12,3 +12,22 @@ export async function resetSessionBackup(client: MatrixClient, password: string)
     if (confirmation.accessToken) await confirmation.logout();
   }
 }
+
+/** Recover the account identity as well as message history; never create a replacement identity. */
+export async function recoverSession(client: MatrixClient, recovery: string): Promise<{ verified: boolean; restored: number | null; backupError?: string }> {
+  if (!client.crypto) throw new Error("Encryption is unavailable");
+  const { CrossSigning } = await import("./cross-signing.ts");
+  const signing = new CrossSigning(client.crypto, client);
+  const verified = await signing.recoverWithRecovery(recovery);
+  if (verified) {
+    client.crypto.retryRoomKeyRequests();
+    for (const room of client.rooms.values()) client.retryUndecrypted(room.id);
+  }
+  try {
+    const restored = await client.crypto.restoreWithRecovery(recovery);
+    return { verified, restored };
+  } catch (error) {
+    if (!verified) throw error;
+    return { verified, restored: null, backupError: error instanceof Error ? error.message : "Could not restore history" };
+  }
+}

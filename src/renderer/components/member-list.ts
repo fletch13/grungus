@@ -10,6 +10,7 @@ export class MemberList extends HTMLElement {
 
   update(room: Room | null, client: MatrixClient | null, meUserId: string | null): void {
     if (!room) {
+      this._sig = "";
       this.textContent = "";
       this.appendChild(el("div", { class: "empty-state", text: "—" }));
       return;
@@ -31,7 +32,7 @@ export class MemberList extends HTMLElement {
       members
         .map(
           (member) =>
-            `${member.userId}:${member.displayname ?? ""}:${member.avatarMxc ?? ""}`
+            `${member.userId}:${member.displayname ?? ""}:${member.avatarMxc ?? ""}:${client?.getPresence?.(member.userId) ?? "unknown"}`
         )
         .join(",");
     if (sig === this._sig) return;
@@ -49,6 +50,7 @@ export class MemberList extends HTMLElement {
         name: member.displayname ?? member.userId,
         userId: member.userId,
         size: 32,
+        presence: client?.getPresence?.(member.userId) ?? null,
         load: client ? client.avatarSrc(member.avatarMxc, 32) : null,
       });
       row.appendChild(av);

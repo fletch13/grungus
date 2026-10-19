@@ -99,6 +99,7 @@ export interface GAvatarOptions {
   load?: Promise<string | null> | null;
   size?: number;
   square?: boolean;
+  presence?: "online" | "offline" | "unavailable" | null;
 }
 
 /**
@@ -150,6 +151,10 @@ export class GAvatar extends HTMLElement {
       av.appendChild(img);
     }
 
+    if (o.presence !== undefined) {
+      const label = o.presence === "online" ? "Online" : o.presence === "offline" ? "Offline" : o.presence === "unavailable" ? "Away" : "Presence unavailable";
+      this.appendChild(el("span", { class: `avatar-presence ${o.presence === "online" ? "online" : "offline"}`, role: "img", "aria-label": label, title: label }));
+    }
     this.appendChild(av);
   }
 }

@@ -26,10 +26,8 @@
  *     that do not distribute cross-signing keys via /keys/query
  *     (conduwuit), own devices fetch them from sync account data
  *
- * Private key distribution to other own devices (SSSS secret storage
- * / key requests) is NOT implemented yet — the bootstrapping device
- * keeps the private seeds in its crypto store; other own devices can
- * verify trust chains but cannot sign until SSSS ships.
+ * Private signing seeds can be recovered from SSSS using a recovery key
+ * or passphrase, or requested from an already verified own device.
  *
  * Element interop: the key objects and signatures use the spec's
  * canonical JSON + Ed25519 (verified accepted by conduwuit's server-
@@ -39,7 +37,7 @@
 
 import type { E2eeCrypto } from "./e2ee.ts";
 import type { MatrixClient } from "./matrix-client.ts";
-import { SecretStorage } from "./ssss.ts";
+import { SecretStorage, tryDecodeRecoveryKey } from "./ssss.ts";
 
 export const CS_MASTER = "m.cross_signing.master";
 export const CS_SELF_SIGNING = "m.cross_signing.self_signing";
@@ -178,7 +176,7 @@ export class CrossSigning {
 
     /* publish the keys (UIA-aware) */
     await this.client.uploadDeviceSigningKeys(
-      { master: keys.master, self_signing: keys.self_signing, user_signing: keys.user_signing },
+      { master_key: keys.master, self_signing_key: keys.self_signing, user_signing_key: keys.user_signing },
       authPassword
     );
 
@@ -246,12 +244,19 @@ export class CrossSigning {
     return this._keyInfo.master !== undefined;
   }
 
-  /** Load own cross-signing key objects from account data (sync). */
+  /** Load standard server cross-signing keys, with legacy Grungus account-data fallback. */
   async loadKeys(): Promise<void> {
     if (this._loaded) return;
-    const master = this.client.getAccountData(CS_PUBLIC_MASTER) as CrossSigningKey | null;
-    const ssk = this.client.getAccountData(CS_PUBLIC_SELF_SIGNING) as CrossSigningKey | null;
-    const usk = this.client.getAccountData(CS_PUBLIC_USER_SIGNING) as CrossSigningKey | null;
+    const userId = this.client.userId;
+    if (!userId) return;
+    const response = await this.client.api<{
+      master_keys?: Record<string, CrossSigningKey>;
+      self_signing_keys?: Record<string, CrossSigningKey>;
+      user_signing_keys?: Record<string, CrossSigningKey>;
+    }>("POST", "/_matrix/client/v3/keys/query", { body: { device_keys: { [userId]: [] } } });
+    const master = response.master_keys?.[userId] ?? this.client.getAccountData(CS_PUBLIC_MASTER) as CrossSigningKey | null;
+    const ssk = response.self_signing_keys?.[userId] ?? this.client.getAccountData(CS_PUBLIC_SELF_SIGNING) as CrossSigningKey | null;
+    const usk = response.user_signing_keys?.[userId] ?? this.client.getAccountData(CS_PUBLIC_USER_SIGNING) as CrossSigningKey | null;
     if (master && ssk && usk) {
       this._keyInfo = { master, self_signing: ssk, user_signing: usk };
       this._loaded = true;
@@ -264,16 +269,35 @@ export class CrossSigning {
    * device can sign — no other device needed.
    */
   async recoverWithPassphrase(passphrase: string): Promise<boolean> {
+    return this.recoverWithRecovery(passphrase);
+  }
+
+  /** Unlock SSSS, validate the private seeds against server keys, and self-sign this device. */
+  async recoverWithRecovery(input: string): Promise<boolean> {
     const ssss = new SecretStorage(this.client);
-    const keyId = await ssss.deriveFromPassphrase(passphrase);
+    const keyId = tryDecodeRecoveryKey(input)
+      ? await ssss.deriveFromRecoveryKey(input)
+      : await ssss.deriveFromPassphrase(input);
     if (!keyId) return false;
-    const master = await ssss.getSecret(CS_MASTER);
-    const ssk = await ssss.getSecret(CS_SELF_SIGNING);
-    const usk = await ssss.getSecret(CS_USER_SIGNING);
-    if (!master || !ssk || !usk) return false;
-    await this.crypto.store.put("cs:master", master);
-    await this.crypto.store.put("cs:self_signing", ssk);
-    await this.crypto.store.put("cs:user_signing", usk);
+    const secrets = await Promise.all([CS_MASTER, CS_SELF_SIGNING, CS_USER_SIGNING].map(name => ssss.getSecret(name)));
+    if (secrets.some(secret => !secret)) return false;
+    this._loaded = false;
+    await this.loadKeys();
+    const olm = this.crypto.olmModule;
+    if (!olm) throw new Error("Crypto is not initialized");
+    const types = ["master", "self_signing", "user_signing"];
+    for (const [index, type] of types.entries()) {
+      const info = this._keyInfo[type];
+      const seed = Uint8Array.from(atob(secrets[index]!), char => char.charCodeAt(0));
+      const pk: PkSigningApi = new olm.PkSigning();
+      try {
+        if (!info || info.user_id !== this.client.userId || !info.usage.includes(type) || pk.init_with_seed(seed) !== pubFromKeyInfo(info)) {
+          throw new Error("Recovered cross-signing keys do not match this account's current identity");
+        }
+      } finally { pk.free(); seed.fill(0); }
+    }
+    for (const [index, type] of types.entries()) await this.crypto.store.put(`cs:${type}`, secrets[index]!);
+    if (!(await this.signDevice(this.crypto.deviceId))) throw new Error("Could not cross-sign this device");
     return true;
   }
 
@@ -384,10 +408,12 @@ export class CrossSigning {
     /* the MSK pseudo-entry has only an ed25519 key keyed by its own
        pub — getRawDeviceKeys filters those out, so query directly */
     const res = await this.client.api<{
+      master_keys?: Record<string, CrossSigningKey>;
       device_keys?: Record<string, Record<string, { keys?: Record<string, string> } | undefined>>;
     }>("POST", "/_matrix/client/v3/keys/query", {
       body: { device_keys: { [userId]: [] } },
     });
+    if (res.master_keys?.[userId]) return pubFromKeyInfo(res.master_keys[userId]);
     const entries = res.device_keys?.[userId] ?? {};
     for (const [id, entry] of Object.entries(entries)) {
       const keys = entry?.keys ?? {};
@@ -444,7 +470,7 @@ export class CrossSigning {
     if (!olm) return false;
     const pk: PkSigningApi = new olm.PkSigning();
     try {
-      pk.init_with_seed(seed);
+      if (pk.init_with_seed(seed) !== sskPub) throw new Error("Stored signing key does not match the current account identity; recover this session again");
       const sig = pk.sign(canonicalJson(deviceObj));
       deviceObj.signatures = {
         [userId]: {

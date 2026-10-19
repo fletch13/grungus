@@ -149,6 +149,9 @@ export class MockHomeserver {
     });
   }
 
+  readonly presence = new Map<string, { state: string; seq: number }>();
+  setPresence(userId: string, state: string): void { this.presence.set(userId, { state, seq: ++this._seq }); }
+
   registerUser(username: string, password: string): string {
     const userId = `@${username}:mock.hs`;
     this.users.set(username, {
@@ -818,6 +821,15 @@ export class MockHomeserver {
       return;
     }
 
+    if (req.method === "POST" && route === "user_directory/search") {
+      const term = String(body.search_term ?? "").toLowerCase();
+      const matches = [...this.users.values()].filter(candidate =>
+        candidate.userId.toLowerCase().includes(term) || candidate.displayname.toLowerCase().includes(term));
+      const limit = Number(body.limit) || 10;
+      this._send(res, 200, { results: matches.slice(0, limit).map(candidate => ({ user_id: candidate.userId, display_name: candidate.displayname, avatar_url: candidate.avatarMxc ?? undefined })), limited: matches.length > limit });
+      return;
+    }
+
     if (req.method === "POST" && route === "createRoom") {
       const creation = (body.creation_content ?? {}) as { type?: string };
       const room = this._createRoomInternal(user, {
@@ -839,6 +851,9 @@ export class MockHomeserver {
           { state_key: stateInit.state_key ?? "" }
         );
       }
+      for (const peer of (body.invite as string[] | undefined) ?? []) {
+        this._appendEvent(room, "m.room.member", user.userId, { membership: "invite", ...(body.is_direct ? { is_direct: true } : {}) }, { state_key: peer });
+      }
       this._send(res, 200, { room_id: room.id });
       return;
     }
@@ -847,7 +862,7 @@ export class MockHomeserver {
 
     if (req.method === "POST" && route === "keys/upload") {
       const deviceKeys = (body.device_keys as Record<string, unknown>) ?? {};
-      const deviceId = String(deviceKeys.device_id ?? "");
+      const deviceId = String(deviceKeys.device_id ?? this._authContext(req)?.deviceId ?? "");
       if (!deviceId) {
         this._err(res, 400, "M_BAD_JSON", "device_id required");
         return;
@@ -859,7 +874,7 @@ export class MockHomeserver {
           deviceKeys: {},
           oneTimeKeys: new Map(),
         };
-      device.deviceKeys = deviceKeys;
+      if (body.device_keys) device.deviceKeys = deviceKeys;
       const otkMap =
         (body.one_time_keys as Record<string, Record<string, unknown>> | undefined) ?? {};
       for (const [keyId, keyObject] of Object.entries(otkMap)) {
@@ -867,10 +882,7 @@ export class MockHomeserver {
       }
       userDevices.set(deviceId, device);
       this.devices.set(user.username, userDevices);
-      const total = [...userDevices.values()].reduce(
-        (n, d) => n + d.oneTimeKeys.size,
-        0
-      );
+      const total = device.oneTimeKeys.size;
       this._send(res, 200, { one_time_key_counts: { signed_curve25519: total } });
       return;
     }
@@ -891,7 +903,16 @@ export class MockHomeserver {
         }
         deviceKeys[userId] = byDevice;
       }
-      this._send(res, 200, { device_keys: deviceKeys });
+      const master_keys: Record<string, unknown> = {};
+      const self_signing_keys: Record<string, unknown> = {};
+      const user_signing_keys: Record<string, unknown> = {};
+      for (const userId of Object.keys(requested)) {
+        const keys = this.crossSigning.get(this._usernameForUserId(userId) ?? "");
+        if (keys?.master) master_keys[userId] = keys.master;
+        if (keys?.self_signing) self_signing_keys[userId] = keys.self_signing;
+        if (keys?.user_signing && userId === user.userId) user_signing_keys[userId] = keys.user_signing;
+      }
+      this._send(res, 200, { device_keys: deviceKeys, master_keys, self_signing_keys, user_signing_keys });
       return;
     }
 
@@ -901,8 +922,9 @@ export class MockHomeserver {
     if (req.method === "POST" && route === "keys/device_signing/upload") {
       const existing = this.crossSigning.get(user.username) ?? {};
       for (const type of ["master", "self_signing", "user_signing"]) {
-        if (body[type] && typeof body[type] === "object") {
-          existing[type] = body[type] as Record<string, unknown>;
+        const key = body[`${type}_key`];
+        if (key && typeof key === "object") {
+          existing[type] = key as Record<string, unknown>;
         }
       }
       this.crossSigning.set(user.username, existing);
@@ -1376,6 +1398,7 @@ export class MockHomeserver {
     deviceId: string,
     sinceNum: number
   ): boolean {
+    if ([...this.presence.values()].some(entry => entry.seq > sinceNum)) return true;
     const deviceQueue = this.toDeviceQueue.get(user.username)?.get(deviceId) ?? [];
     if (deviceQueue.some((entry) => entry.seq > sinceNum)) return true;
     if ((this.accountDataSeq.get(user.username) ?? 0) > sinceNum) return true;
@@ -1567,6 +1590,7 @@ export class MockHomeserver {
 
     return {
       next_batch: String(this._seq),
+      presence: { events: [...this.presence.entries()].filter(([, entry]) => entry.seq > (sinceNum ?? 0)).map(([sender, entry]) => ({ type: "m.presence", sender, content: { presence: entry.state } })) },
       rooms: { join, invite, leave },
       to_device: { events: delivered.map((entry) => entry.event) },
       device_one_time_keys_count: { signed_curve25519: myOtks },

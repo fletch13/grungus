@@ -154,6 +154,8 @@ export interface CryptoHost {
   api<T>(method: string, path: string, opts?: ApiCallOptions): Promise<T>;
   getRoom(roomId: string): {
     id: string;
+    isDirect?: boolean;
+    directUserId?: string | null;
     members: Map<string, { userId: string; membership: string }>;
   } | null;
   /** account data by event type (secret storage / recovery restore) */
@@ -311,6 +313,25 @@ export class E2eeCrypto {
   private readonly _pickleKey: string;
   private _olm: OlmApi | null = null;
   private _account: OlmAccountApi | null = null;
+  private _deviceKeysUploaded = false;
+  private _pendingPersistence: Promise<void> = Promise.resolve();
+  private _stateKey(): string { return `sessions:${this.host.userId}:${this._deviceId}`; }
+
+  /** Serialize snapshots so concurrent sync/recovery writes cannot roll keys back. */
+  private _persistSessions(): Promise<void> {
+    if (!this._account) return Promise.resolve();
+    const value = JSON.stringify({
+      identity: this._curve25519,
+      account: this._account.pickle(this._pickleKey),
+      olm: [...this._olmSessions].map(([sender, sessions]) => [sender, sessions.map(session => session.pickle(this._pickleKey))]),
+      inbound: [...this._inbound].map(([key, entry]) => [key, entry.roomId, entry.session.pickle(this._pickleKey)]),
+    });
+    this._pendingPersistence = this._pendingPersistence.catch(() => {}).then(() => this._store.put(this._stateKey(), value));
+    void this._pendingPersistence.catch(error => console.error("[e2ee] failed to persist received keys:", error));
+    return this._pendingPersistence;
+  }
+  async flush(): Promise<void> { await this._pendingPersistence; }
+
   private _deviceId: string;
   private _curve25519 = "";
   private _ed25519 = "";
@@ -376,7 +397,9 @@ export class E2eeCrypto {
       await this._store.put(STORE_DEVICE_ID, this._deviceId);
     }
 
-    const accountPickle = await this._store.get(STORE_ACCOUNT);
+    const savedState = await this._store.get(this._stateKey());
+    const state = savedState ? JSON.parse(savedState) as { identity: string; account: string; olm: [string, string[]][]; inbound: [string, string, string][] } : null;
+    const accountPickle = state?.account ?? await this._store.get(STORE_ACCOUNT);
     const account = new this._olm.Account();
     if (accountPickle) {
       account.unpickle(this._pickleKey, accountPickle);
@@ -427,7 +450,28 @@ export class E2eeCrypto {
     this._curve25519 = keys.curve25519;
     this._ed25519 = keys.ed25519;
 
-    /* restore persisted outbound sessions (pickles only; unpickle lazily) */
+    if (state && state.identity === this._curve25519) {
+      for (const [sender, pickles] of state.olm) {
+        this._olmSessions.set(sender, pickles.map(pickle => {
+          const session = new this._olm!.Session(); session.unpickle(this._pickleKey, pickle); return session;
+        }));
+      }
+      for (const [key, roomId, pickle] of state.inbound) {
+        const session = new this._olm.InboundGroupSession(); session.unpickle(this._pickleKey, pickle);
+        this._inbound.set(key, { roomId, session });
+      }
+    }
+    await this._store.put(STORE_DEVICE_ID, this._deviceId);
+    /* A key top-up must not replace the published device's cross-signatures. */
+    if (accountPickle) {
+      const published = (await this.getRawDeviceKeys(this.host.userId!))[this._deviceId];
+      if (published) {
+        if (published.keys[`ed25519:${this._deviceId}`] !== this._ed25519 || published.keys[`curve25519:${this._deviceId}`] !== this._curve25519) {
+          throw new CryptoIdentityResetError(this._deviceId);
+        }
+        this._deviceKeysUploaded = true;
+      }
+    }
     await this._uploadKeys();
   }
 
@@ -464,7 +508,7 @@ export class E2eeCrypto {
     };
     deviceKeys.signatures = this._signaturesFor({ ...deviceKeys });
 
-    const body: Record<string, unknown> = { device_keys: deviceKeys };
+    const body: Record<string, unknown> = this._deviceKeysUploaded ? {} : { device_keys: deviceKeys };
 
     if (generateCount && generateCount > 0) {
       account.generate_one_time_keys(generateCount);
@@ -489,8 +533,10 @@ export class E2eeCrypto {
       one_time_key_counts?: Record<string, number>;
     }>("POST", "/_matrix/client/v3/keys/upload", { body });
 
+    this._deviceKeysUploaded = true;
     account.mark_keys_as_published();
     await this._store.put(STORE_ACCOUNT, account.pickle(this._pickleKey));
+    await this._persistSessions();
 
     const remaining = res.one_time_key_counts?.["signed_curve25519"] ?? 0;
     if (remaining < ONE_TIME_KEY_LOW_WATER) {
@@ -682,6 +728,7 @@ export class E2eeCrypto {
       recipient_keys: { ed25519: device.ed25519 },
     });
     const encrypted = session.encrypt(payload);
+    await this._persistSessions();
     const messages: Record<string, Record<string, unknown>> = {
       [targetUserId]: {
         [targetDeviceId]: {
@@ -800,6 +847,7 @@ export class E2eeCrypto {
     const list = this._olmSessions.get(senderKey) ?? [];
     list.unshift(session);
     this._olmSessions.set(senderKey, list);
+    void this._persistSessions();
   }
 
   /* ------------------------------ megolm send ----------------------------- */
@@ -906,7 +954,8 @@ export class E2eeCrypto {
 
     const memberIds = new Set<string>();
     for (const member of room.members.values()) {
-      if (member.membership === "join") memberIds.add(member.userId);
+      const invitedDmPeer = room.isDirect && room.directUserId === member.userId && member.membership === "invite";
+      if (member.membership === "join" || invitedDmPeer) memberIds.add(member.userId);
     }
     memberIds.add(this.host.userId!);
 
@@ -963,6 +1012,7 @@ export class E2eeCrypto {
     }
 
     if (sharedWithAny) {
+      await this._persistSessions();
       const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
       await this.host.api(
         "PUT",
@@ -1018,7 +1068,7 @@ export class E2eeCrypto {
   async requestRoomKey(
     roomId: string,
     senderUserId: string | null,
-    senderKey: string,
+    senderKey: string | null,
     sessionId: string
   ): Promise<void> {
     const dedupeKey = `${senderKey}|${sessionId}`;
@@ -1033,7 +1083,7 @@ export class E2eeCrypto {
       body: {
         algorithm: ALGORITHM_MEGOLM,
         room_id: roomId,
-        sender_key: senderKey,
+        ...(senderKey ? { sender_key: senderKey } : {}),
         session_id: sessionId,
       },
     };
@@ -1077,7 +1127,7 @@ export class E2eeCrypto {
     };
     if (content.action !== "request" || !content.requesting_device_id) return;
     const body = content.body ?? {};
-    if (body.algorithm !== ALGORITHM_MEGOLM || !body.sender_key || !body.session_id) return;
+    if (body.algorithm !== ALGORITHM_MEGOLM || !body.room_id || !body.session_id) return;
 
     const requester = event.sender;
     const requestDevice = content.requesting_device_id;
@@ -1098,8 +1148,11 @@ export class E2eeCrypto {
           }
         }
 
-        const entry = this._inbound.get(`${body.sender_key}|${body.session_id}`);
-        if (!entry) return; /* we do not hold the requested session */
+        const matches = [...this._inbound.entries()].filter(([key, entry]) =>
+          key.endsWith(`|${body.session_id}`) && entry.roomId === body.room_id && (!body.sender_key || key === `${body.sender_key}|${body.session_id}`));
+        if (matches.length !== 1) return;
+        const [storedKey, entry] = matches[0]!;
+        const senderKey = storedKey.split("|")[0]!;
 
         /* export at the earliest index we can provide — the requester
            gets as much history as this device has */
@@ -1109,7 +1162,7 @@ export class E2eeCrypto {
         await this.sendToDeviceEncrypted(requester, requestDevice, "m.forwarded_room_key", {
           algorithm: ALGORITHM_MEGOLM,
           room_id: entry.roomId,
-          sender_key: body.sender_key,
+          sender_key: senderKey,
           session_id: body.session_id,
           session_key: exported,
         });
@@ -1128,7 +1181,6 @@ export class E2eeCrypto {
     if (!roomId || !senderKey || !sessionId || !sessionKey) return;
 
     const key = `${senderKey}|${sessionId}`;
-    if (this._inbound.has(key)) return; /* never downgrade an existing session */
 
     const olm = this._olm!;
     const igs = new olm.InboundGroupSession();
@@ -1142,7 +1194,7 @@ export class E2eeCrypto {
       console.error("[e2ee] forwarded session id mismatch — discarding");
       return;
     }
-    this._inbound.set(key, { session: igs, roomId });
+    if (!this._acceptInbound(key, igs, roomId)) return;
     void this._backupInboundSession(senderKey, sessionId, roomId);
     this.onInboundSessionAdded?.(roomId);
   }
@@ -1373,7 +1425,6 @@ export class E2eeCrypto {
         if (data.session_id !== undefined && data.session_id !== sessionId) continue;
         if (!data.session_key || !data.sender_key) continue;
         const key = `${data.sender_key}|${sessionId}`;
-        if (this._inbound.has(key)) continue;
         const igs = new olm.InboundGroupSession();
         try {
           igs.import_session(data.session_key);
@@ -1381,7 +1432,7 @@ export class E2eeCrypto {
           continue;
         }
         if (igs.session_id() !== sessionId) continue;
-        this._inbound.set(key, { session: igs, roomId });
+        if (!this._acceptInbound(key, igs, roomId, false)) continue;
         imported += 1;
         touchedRooms.add(roomId);
       }
@@ -1389,6 +1440,7 @@ export class E2eeCrypto {
     for (const roomId of touchedRooms) {
       this.onInboundSessionAdded?.(roomId);
     }
+    await this._persistSessions();
     return imported;
   }
 
@@ -1486,6 +1538,22 @@ export class E2eeCrypto {
     }
   }
 
+  private _acceptInbound(key: string, session: OlmInboundGroupSessionApi, roomId: string, persist = true): boolean {
+    const existing = this._inbound.get(key);
+    if (existing && (existing.roomId !== roomId || existing.session.first_known_index() <= session.first_known_index())) {
+      session.free();
+      return false;
+    }
+    existing?.session.free();
+    this._inbound.set(key, { session, roomId });
+    this._backedUpSessions.delete(key);
+    if (persist) void this._persistSessions();
+    return true;
+  }
+
+  /** A verified/recovered session can retry requests previously declined before trust was established. */
+  retryRoomKeyRequests(): void { this._requestedKeys.clear(); }
+
   private _ingestRoomKey(senderCurve25519: string, roomKey: Record<string, unknown>): void {
     const roomId = typeof roomKey.room_id === "string" ? roomKey.room_id : null;
     const sessionId = typeof roomKey.session_id === "string" ? roomKey.session_id : null;
@@ -1500,13 +1568,12 @@ export class E2eeCrypto {
       console.error("[e2ee] bad inbound session key:", err);
       return;
     }
+    if (igs.session_id() !== sessionId) { igs.free(); return; }
     /* indexed by the sender's curve25519 key — that is what m.room.encrypted
        events carry in content.sender_key, and what decryptRoomEvent uses */
-    this._inbound.set(`${senderCurve25519}|${sessionId}`, {
-      session: igs,
-      roomId,
-    });
+    if (!this._acceptInbound(`${senderCurve25519}|${sessionId}`, igs, roomId)) return;
     void this._backupInboundSession(senderCurve25519, sessionId, roomId);
+    this.onInboundSessionAdded?.(roomId);
   }
 
   private _decryptWithOlm(senderKey: string, type: number, body: string): string | null {
@@ -1516,7 +1583,9 @@ export class E2eeCrypto {
     for (const session of sessions) {
       try {
         if (type === 0 && !session.matches_inbound(body)) continue;
-        return session.decrypt(type, body);
+        const plaintext = session.decrypt(type, body);
+        void this._persistSessions();
+        return plaintext;
       } catch {
         /* wrong session — keep trying */
       }
@@ -1542,7 +1611,7 @@ export class E2eeCrypto {
    * Decrypt an m.room.encrypted room event. Returns the inner event
    * {type, content} or null when it cannot be decrypted.
    */
-  decryptRoomEvent(event: MatrixWireEvent): { type: string; content: Record<string, unknown> } | null {
+  decryptRoomEvent(event: MatrixWireEvent, roomId?: string): { type: string; content: Record<string, unknown> } | null {
     const content = event.content as {
       algorithm?: string;
       sender_key?: string;
@@ -1551,20 +1620,23 @@ export class E2eeCrypto {
     };
     if (
       content.algorithm !== ALGORITHM_MEGOLM ||
-      !content.sender_key ||
       !content.session_id ||
       !content.ciphertext
     ) {
       return null;
     }
-    const entry = this._inbound.get(`${content.sender_key}|${content.session_id}`);
+    const matches = [...this._inbound.entries()].filter(([key, entry]) =>
+      key.endsWith(`|${content.session_id}`) && (!content.sender_key || key === `${content.sender_key}|${content.session_id}`) && (!roomId || entry.roomId === roomId));
+    const entry = matches.length === 1 ? matches[0]![1] : null;
     if (!entry) return null; /* room key not shared with this device */
     try {
       const result = entry.session.decrypt(content.ciphertext);
       const payload = JSON.parse(result.plaintext) as {
         type?: string;
+        room_id?: string;
         content?: Record<string, unknown>;
       };
+      if (payload.room_id !== entry.roomId) return null;
       if (!payload.type || !payload.content) return null;
       return { type: payload.type, content: payload.content };
     } catch {
@@ -1573,7 +1645,7 @@ export class E2eeCrypto {
   }
 
   private _storeKeyOutbound(roomId: string): string {
-    return `og:${roomId}`;
+    return `og:${this.host.userId}:${this._deviceId}:${roomId}`;
   }
 }
 

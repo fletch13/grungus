@@ -1,3 +1,4 @@
+import { isBackgroundImage } from "./background.ts";
 /*
  * Grungus — the settings store: typed, persisted to localStorage, with
  * subscribers. One instance drives every settings panel and gates the
@@ -10,6 +11,8 @@ export type ThemeName = "dark" | "light";
 export interface GrungusSettings {
   /* Appearance */
   theme: ThemeName;
+  /** Local normalized background image; empty disables translucent panels. */
+  backgroundImage: string;
   /** font scale multiplier for the whole app (0.85 … 1.3) */
   fontScale: number;
   /** compact message density */
@@ -42,6 +45,9 @@ export interface GrungusSettings {
   audioOutput: string;
   videoInput: string;
 
+  /** KLIPY client API key; saved only on this device. */
+  klipyApiKey: string;
+
   /* Labs */
   /** call mode preference: "auto" follows the room's configured service */
   callMode: "auto" | "mesh" | "livekit";
@@ -49,6 +55,7 @@ export interface GrungusSettings {
 
 export const DEFAULT_SETTINGS: GrungusSettings = {
   theme: "dark",
+  backgroundImage: "",
   fontScale: 1,
   compact: false,
   showTimestamps: true,
@@ -64,6 +71,7 @@ export const DEFAULT_SETTINGS: GrungusSettings = {
   audioOutput: "",
   videoInput: "",
   callMode: "auto",
+  klipyApiKey: "",
 };
 
 const STORAGE_KEY = "grungus-settings";
@@ -75,7 +83,9 @@ function coerce(raw: Partial<GrungusSettings> | null): GrungusSettings {
     const value = raw[key];
     if (value !== undefined && typeof value === typeof DEFAULT_SETTINGS[key]) {
       /* keep numbers sane */
-      if (key === "fontScale") {
+      if (key === "backgroundImage") {
+        out.backgroundImage = isBackgroundImage(value) ? value : "";
+      } else if (key === "fontScale") {
         const scale = Number(value);
         out.fontScale = Math.min(1.4, Math.max(0.8, scale));
       } else {
@@ -112,13 +122,15 @@ export class SettingsStore {
 
   set<K extends keyof GrungusSettings>(key: K, value: GrungusSettings[K]): void {
     let next = value;
+    if (key === "backgroundImage" && value !== "" && !isBackgroundImage(value)) throw new Error("Choose a valid background image.");
     if (key === "fontScale") {
       /* the slider is clamped, but keep the store robust anyway */
       next = Math.min(1.4, Math.max(0.8, Number(value))) as GrungusSettings[K];
     }
     if (this._settings[key] === next) return;
-    this._settings = { ...this._settings, [key]: next };
-    this._persist();
+    const updated = { ...this._settings, [key]: next };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+    this._settings = updated;
     for (const listener of this._listeners) listener(this.all);
   }
 
@@ -127,7 +139,4 @@ export class SettingsStore {
     return () => this._listeners.delete(listener);
   }
 
-  private _persist(): void {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(this._settings));
-  }
 }

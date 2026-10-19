@@ -294,9 +294,21 @@ export class SecretStorage {
     return this._keyId;
   }
 
+  /** Recovery can run before the initial sync has populated account data. */
+  private async readAccountData(type: string): Promise<unknown> {
+    const cached = this.client.getAccountData(type);
+    if (cached !== null && cached !== undefined) return cached;
+    try {
+      return await this.client.api("GET", `/_matrix/client/v3/user/${encodeURIComponent(this.client.userId!)}/account_data/${encodeURIComponent(type)}`);
+    } catch (error) {
+      if ((error as { errcode?: string }).errcode === "M_NOT_FOUND") return null;
+      throw error;
+    }
+  }
+
   /** The default storage key id from account data (or null). */
   async defaultKeyId(): Promise<string | null> {
-    const acct = this.client.getAccountData(SSSS_DEFAULT_KEY) as { key?: string } | null;
+    const acct = await this.readAccountData(SSSS_DEFAULT_KEY) as { key?: string } | null;
     return acct?.key ?? null;
   }
 
@@ -346,7 +358,7 @@ export class SecretStorage {
     if (!key) return null;
     const keyId = await this.defaultKeyId();
     if (!keyId) return null;
-    const desc = this.client.getAccountData(SSSS_KEY_PREFIX + keyId) as
+    const desc = await this.readAccountData(SSSS_KEY_PREFIX + keyId) as
       | SecretStorageKeyDescription
       | null;
     if (!desc) return null;
@@ -370,7 +382,7 @@ export class SecretStorage {
   async deriveFromPassphrase(passphrase: string): Promise<string | null> {
     const keyId = await this.defaultKeyId();
     if (!keyId) return null;
-    const desc = this.client.getAccountData(SSSS_KEY_PREFIX + keyId) as
+    const desc = await this.readAccountData(SSSS_KEY_PREFIX + keyId) as
       | SecretStorageKeyDescription
       | null;
     if (!desc?.passphrase) return null;
@@ -402,7 +414,7 @@ export class SecretStorage {
   /** Fetch and decrypt a stored secret (null when absent). */
   async getSecret(name: string): Promise<string | null> {
     if (!this._key || !this._keyId) throw new Error("no secret storage key");
-    const info = this.client.getAccountData(name) as
+    const info = await this.readAccountData(name) as
       | { encrypted?: Record<string, EncryptedPayload> }
       | null;
     const payload = info?.encrypted?.[this._keyId];

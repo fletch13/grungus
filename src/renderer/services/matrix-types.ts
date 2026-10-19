@@ -34,7 +34,10 @@ export interface SyncJoinedRoom {
   account_data?: { events?: MatrixEvent[] };
 }
 
+export type PresenceState = "online" | "offline" | "unavailable";
+
 export interface SyncResponse {
+  presence?: { events?: MatrixEvent[] };
   next_batch?: string;
   rooms?: {
     join?: Record<string, SyncJoinedRoom>;
@@ -109,6 +112,8 @@ export interface ReplyContext {
 }
 
 export interface SystemItem {
+  callActivity?: "started" | "ended" | "joined" | "left";
+  matrixRtc?: boolean;
   kind: "system";
   id: string | null;
   ts: number;
@@ -159,6 +164,7 @@ export interface RtcMembership {
 }
 
 export interface Room {
+  roomType?: string | null;
   id: string;
   name: string | null;
   canonicalAlias: string | null;
@@ -236,6 +242,7 @@ export type ConnectionState =
 /* ------------------------------ client types ----------------------------- */
 
 export interface ClientEvents {
+  presence: [string[]];
   sync: [];
   ready: [];
   room: [RoomUpdate];
@@ -296,10 +303,13 @@ export interface RegisterCredentials {
 }
 
 export interface CreateRoomOptions {
+  invite?: string[];
+  isDirect?: boolean;
   name?: string;
   topic?: string;
   isPublic?: boolean;
   isSpace?: boolean;
+  isVideo?: boolean;
   /** Enable megolm encryption in the room (initial m.room.encryption state). */
   encrypted?: boolean;
 }
@@ -320,4 +330,29 @@ export interface MediaMessage {
   width?: number | null;
   height?: number | null;
   size?: number | null;
+}
+
+/** A room published in a homeserver directory; listing does not guarantee admission. */
+export interface PublicRoom {
+  room_id: string;
+  name?: string;
+  canonical_alias?: string;
+  topic?: string;
+  avatar_url?: string;
+  num_joined_members: number;
+  join_rule?: string;
+  room_type?: string;
+}
+export interface PublicRoomPage {
+  chunk: PublicRoom[];
+  next_batch?: string;
+  total_room_count_estimate?: number;
+}
+
+export interface SpaceHierarchyRoom extends PublicRoom {
+  children_state: { type: string; state_key: string; content: { via?: string[] } }[];
+}
+export interface SpaceHierarchyPage {
+  rooms: SpaceHierarchyRoom[];
+  next_batch?: string;
 }

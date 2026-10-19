@@ -1,3 +1,4 @@
+import { isVideoRoom } from "../services/room-kind.ts";
 /*
  * Grungus — <room-list>: sidebar with rooms, direct messages, the local
  * user footer, connection indicator, and the inline "new room" form.
@@ -22,6 +23,7 @@ export interface UserInfo {
 
 export class RoomList extends HTMLElement {
   private _rooms: Room[] = [];
+  private _profileAvatars = new Map<string, { expires: number; load: Promise<string | null> }>();
   private _spaces: Room[] = [];
   private _invites: InvitedRoom[] = [];
   private _selectedRoomId: string | null = null;
@@ -51,6 +53,7 @@ export class RoomList extends HTMLElement {
     this._spaces = spaces;
     this._selectedRoomId = selectedRoomId;
     this._spaceId = spaceId;
+    if (this._client !== client) this._profileAvatars.clear();
     this._client = client;
     this._allRooms = allRooms ?? rooms;
     this._render();
@@ -120,7 +123,18 @@ export class RoomList extends HTMLElement {
       }
     });
     head.appendChild(spaceBtn);
+    const newDm = el("button", { type: "button", class: "add-btn", title: "New direct message", "aria-label": "New direct message" }, icon("bubble"));
+    newDm.addEventListener("click", () => this.dispatchEvent(new CustomEvent("grungus:new-dm", { bubbles: true })));
+    head.appendChild(newDm);
+    const browse = el("button", { type: "button", class: "add-btn", title: space ? "Browse space rooms" : "Explore rooms", "aria-label": space ? "Browse space rooms" : "Explore rooms" }, icon("search"));
+    browse.addEventListener("click", () => this.dispatchEvent(new CustomEvent("grungus:explore-rooms", { bubbles: true })));
+    head.appendChild(browse);
     this.appendChild(head);
+    if (space) {
+      const discover = el("button", { type: "button", class: "call-btn space-browse-rooms", text: "Browse rooms in this space" });
+      discover.addEventListener("click", () => this.dispatchEvent(new CustomEvent("grungus:explore-rooms", { bubbles: true })));
+      this.appendChild(discover);
+    }
     const search = el("input", { id: "room-filter", type: "search", placeholder: "Find a conversation", "aria-label": "Filter rooms", value: this._query }) as HTMLInputElement;
     search.addEventListener("input", () => { this._query = search.value; this._filterRooms(); });
     this.appendChild(el("div", { class: "room-search" }, icon("search", 16), search));
@@ -169,8 +183,12 @@ export class RoomList extends HTMLElement {
         maxlength: "80",
         spellcheck: "false",
       }) as HTMLInputElement;
+      const kind = el("select", { "aria-label": "Room type", class: "space-add-select" },
+        el("option", { value: "text", text: "Text room" }),
+        el("option", { value: "video", text: "Video room" })) as HTMLSelectElement;
       const create = el("button", { text: "Create" });
       form.appendChild(input);
+      if (space) form.appendChild(kind);
       form.appendChild(create);
 
       const submitNewRoom = (): void => {
@@ -180,7 +198,7 @@ export class RoomList extends HTMLElement {
         this._showForm = false;
         this.dispatchEvent(
           new CustomEvent("grungus:create-room", {
-            detail: { name },
+            detail: { name, isVideo: !!space && kind.value === "video", spaceId: space?.id ?? null },
             bubbles: true,
           })
         );
@@ -268,7 +286,10 @@ export class RoomList extends HTMLElement {
     const roomsSection = this._rooms.filter((room) => !room.isDirect);
     const dmSection = this._rooms.filter((room) => room.isDirect);
 
-    this._renderSection(scroll, "Rooms", roomsSection);
+    if (space) {
+      this._renderSection(scroll, "Text rooms", roomsSection.filter(room => !isVideoRoom(room)));
+      this._renderSection(scroll, "Video rooms", roomsSection.filter(isVideoRoom));
+    } else this._renderSection(scroll, "Rooms", roomsSection);
     if (!space) {
       this._renderSection(scroll, "Direct Messages", dmSection);
     }
@@ -351,6 +372,18 @@ export class RoomList extends HTMLElement {
     }
   }
 
+  private _peerAvatar(userId: string, avatarMxc: string | null): Promise<string | null> | null {
+    const client = this._client;
+    if (!client) return null;
+    if (avatarMxc) return client.avatarSrc(avatarMxc, 32);
+    const cached = this._profileAvatars.get(userId);
+    if (cached && cached.expires > Date.now()) return cached.load;
+    const load = client.getProfile(userId).then(profile => client.avatarSrc(profile.avatar_url, 32)).catch(() => null);
+    this._profileAvatars.set(userId, { expires: Date.now() + 60_000, load });
+    if (this._profileAvatars.size > 128) this._profileAvatars.delete(this._profileAvatars.keys().next().value!);
+    return load;
+  }
+
   private _buildRoomRow(room: Room): HTMLElement {
     const row = el("div", {
       class:
@@ -361,13 +394,18 @@ export class RoomList extends HTMLElement {
       role: "button", tabindex: "0", "aria-current": room.id === this._selectedRoomId ? "page" : undefined,
     });
     const av = document.createElement("g-avatar");
+    const ownId = this._client?.userId ?? this._user?.userId;
+    const others = [...room.members.values()].filter(member => ["join", "invite"].includes(member.membership) && member.userId !== ownId);
+    const peer = room.isDirect && others.length === 1 ? others[0]! : null;
     av.update({
-      name: room.title,
-      userId: room.directUserId ?? room.id,
+      presence: peer ? this._client?.getPresence?.(peer.userId) ?? null : undefined,
+      name: peer?.displayname || room.title,
+      userId: peer?.userId ?? room.id,
       size: 32,
-      load: this._client ? this._client.avatarSrc(room.avatarMxc, 32) : null,
+      load: peer ? this._peerAvatar(peer.userId, peer.avatarMxc) : this._client ? this._client.avatarSrc(room.avatarMxc, 32) : null,
     });
     row.appendChild(av);
+    if (!room.isDirect) row.appendChild(el("span", { class: "room-kind-icon", title: isVideoRoom(room) ? "Video room" : "Text room", "aria-label": isVideoRoom(room) ? "Video room" : "Text room" }, icon(isVideoRoom(room) ? "video" : "hash", 16)));
     row.appendChild(
       el("span", {
         class: "room-name",

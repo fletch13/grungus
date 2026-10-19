@@ -163,6 +163,7 @@ export interface LkE2eeInit {
   roomId: string;
   /** our livekit participant identity = our Matrix user id */
   identity: string;
+  participantIdentity?: string;
   deviceId: string | null;
   /** same-origin worker script (bundled into dist/ by the build) */
   workerUrl?: string;
@@ -179,6 +180,7 @@ export class LkE2ee {
   private _client: MatrixClient;
   private _roomId: string;
   private _identity: string;
+  private _participantIdentity: string;
   private _deviceId: string | null;
   private _rotation = new KeyRotation();
   private _unsubscribe: (() => void) | null = null;
@@ -201,6 +203,7 @@ export class LkE2ee {
     this._client = init.client;
     this._roomId = init.roomId;
     this._identity = init.identity;
+    this._participantIdentity = init.participantIdentity ?? init.identity;
     this._deviceId = init.deviceId;
   }
 
@@ -250,6 +253,7 @@ export class LkE2ee {
       if (event.roomId && event.roomId !== this._roomId) return;
       if (this.isSelf(event.sender)) return; /* our own key echo */
       void this._applyRemoteKeys(event.sender, event.keys);
+      if (event.deviceId) void this._applyRemoteKeys(`${event.sender}:${event.deviceId}`, event.keys);
     });
     /* keys from current Element clients arrive olm-encrypted as to-device
        io.element.call.encryption_keys — the crypto layer decrypts the
@@ -265,6 +269,11 @@ export class LkE2ee {
           const parsed = parseEncryptionKeysToDeviceEvent(content);
           if (!parsed) return;
           void this._applyRemoteKeys(sender, [parsed]);
+          const member = content.member as { claimed_device_id?: unknown } | undefined;
+          const memberId = typeof content.member_id === "string" ? content.member_id : null;
+          const deviceId = typeof member?.claimed_device_id === "string" ? member.claimed_device_id : null;
+          if (memberId?.startsWith(`${sender}:`)) void this._applyRemoteKeys(memberId, [parsed]);
+          else if (deviceId) void this._applyRemoteKeys(`${sender}:${deviceId}`, [parsed]);
         }
       );
     }
@@ -417,7 +426,7 @@ export class LkE2ee {
       ["deriveBits", "deriveKey"]
     );
     const provider = this.keyProvider as unknown as GrungusKeyProviderLike;
-    provider.onSetEncryptionKey(material, this._identity, index);
+    provider.onSetEncryptionKey(material, this._participantIdentity, index);
     this._appliedKeys.add(`${this._identity}|${index}`);
     this.sendKeys();
   }

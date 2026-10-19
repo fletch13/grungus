@@ -220,3 +220,21 @@ test("ignored users: unignore rewrites m.ignored_user_list", async (t) => {
   assert.equal(remaining.length, 1);
   assert.equal(remaining[0], "@noise:mock.hs");
 });
+
+
+test("custom backgrounds persist, reject unsafe values, and retain the prior setting on storage failure", t => {
+  localStorage.clear();
+  const store = new SettingsStore();
+  const image = "data:image/jpeg;base64,YWJjZA==";
+  store.set("backgroundImage", image);
+  assert.equal(new SettingsStore().get("backgroundImage"), image);
+  assert.throws(() => store.set("backgroundImage", "https://example.org/background.jpg"), /valid background/);
+  assert.throws(() => store.set("backgroundImage", "data:image/svg+xml;base64,YWJj"), /valid background/);
+  const original = localStorage.setItem;
+  t.after(() => { localStorage.setItem = original; localStorage.clear(); });
+  localStorage.setItem = () => { throw new Error("Storage full"); };
+  let notified = false; store.subscribe(() => { notified = true; });
+  assert.throws(() => store.set("backgroundImage", ""), /Storage full/);
+  assert.equal(store.get("backgroundImage"), image);
+  assert.equal(notified, false);
+});

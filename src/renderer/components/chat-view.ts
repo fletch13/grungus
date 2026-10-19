@@ -1,14 +1,20 @@
+import { isVideoRoom } from "../services/room-kind.ts";
 /*
  * Grungus — <chat-view>: room header, message timeline, composer.
  * Emits "grungus:send" with { roomId, body }. Timeline updates arrive as
  * incremental appends (live events, local echoes) or trigger full
  * re-renders (echo reconciliation markers).
  */
+import "./emoji-picker.ts";
+import "./gif-picker.ts";
 import { icon } from "./icons.ts";
 import { el, formatDay, sameDay } from "./ui.ts";
 import type { MatrixClient, MessageItem, Room, RoomEvent, TimelineItem } from "../services/matrix-client.ts";
 
 export class ChatView extends HTMLElement {
+  private _gifPicker!: import("./gif-picker.ts").GifPicker;
+  setKlipyApiKey(key: string): void { this._gifPicker.setApiKey(key); }
+  private _emojiPicker!: import("./emoji-picker.ts").EmojiPicker;
   private _room: Room | null = null;
   private _client: MatrixClient | null = null;
   private _meUserId: string | null = null;
@@ -21,8 +27,10 @@ export class ChatView extends HTMLElement {
   private _windowStart = 0;
   private _input!: HTMLTextAreaElement;
   private _hint!: HTMLElement;
+  private _encryptionStatus!: HTMLElement;
   private _typingBar!: HTMLElement;
   private _callOngoing = false;
+  private _callConnecting = false;
   private _callJoined = false;
   private _typingSentAt = 0;
   private _typingStopTimer: ReturnType<typeof setTimeout> | null = null;
@@ -74,10 +82,39 @@ export class ChatView extends HTMLElement {
     composer.appendChild(attach);
     composer.appendChild(fileInput);
     composer.appendChild(this._input);
+    const emojiButton = el("button", { type: "button", class: "attach-btn emoji-toggle", text: "☺", title: "Choose an emoji", "aria-label": "Choose an emoji", "aria-haspopup": "dialog", "aria-expanded": "false" });
+    this._emojiPicker = document.createElement("emoji-picker");
+    emojiButton.addEventListener("click", () => {
+      if (this._room && !this._input.disabled) { this._gifPicker.close(false); this._emojiPicker.toggle(emojiButton); }
+    });
+    this._emojiPicker.addEventListener("emoji-select", event => {
+      if (!this._room || this._input.disabled) return;
+      const emoji = (event as CustomEvent<{ emoji: string }>).detail.emoji;
+      this._input.setRangeText(emoji, this._input.selectionStart, this._input.selectionEnd, "end");
+      this._input.dispatchEvent(new Event("input"));
+      this._input.focus();
+    });
+    composer.appendChild(emojiButton);
+    wrap.appendChild(this._emojiPicker);
+    const gifButton = el("button", { type: "button", class: "attach-btn gif-toggle", text: "GIF", title: "Choose a GIF", "aria-label": "Choose a GIF", "aria-haspopup": "dialog", "aria-expanded": "false" });
+    this._gifPicker = document.createElement("gif-picker");
+    gifButton.addEventListener("click", () => {
+      if (this._room && !this._input.disabled) { this._emojiPicker.close(false); this._gifPicker.toggle(gifButton); }
+    });
+    this._gifPicker.addEventListener("gif-select", event => {
+      if (!this._room || this._input.disabled) return;
+      const { gif } = (event as CustomEvent<{ gif: import("../services/klipy.ts").KlipyGif }>).detail;
+      this.dispatchEvent(new CustomEvent("grungus:send-gif", { detail: { roomId: this._room.id, url: gif.url }, bubbles: true }));
+      this._input.focus();
+    });
+    composer.appendChild(gifButton); wrap.appendChild(this._gifPicker);
+
     wrap.appendChild(this._replyBar);
     wrap.appendChild(this._typingBar);
     wrap.appendChild(this._seenBar);
     wrap.appendChild(composer);
+    this._encryptionStatus = el("div", { class: "chat-encryption-status", role: "status", "aria-live": "polite", hidden: true });
+    wrap.appendChild(this._encryptionStatus);
     wrap.appendChild(this._hint);
 
     this._input.addEventListener("keydown", (event) => {
@@ -118,7 +155,7 @@ export class ChatView extends HTMLElement {
     const changedRoom = room?.id !== this._room?.id;
     const previousScroll = this._scroll.scrollTop;
     const pinned = this._windowAnchor === null && this._nearBottom();
-    if (changedRoom) this._windowAnchor = null;
+    if (changedRoom) { this._windowAnchor = null; this._emojiPicker.close(false); this._gifPicker.close(false); }
     this._room = room;
     this._client = client;
     this._meUserId = meUserId;
@@ -146,6 +183,17 @@ export class ChatView extends HTMLElement {
   private _renderHeader(): void {
     const room = this._room;
     this._header.textContent = "";
+    this._encryptionStatus.hidden = !room;
+    this._encryptionStatus.replaceChildren();
+    if (room) {
+      this._encryptionStatus.classList.toggle("unencrypted", !room.isEncrypted);
+      this._encryptionStatus.append(icon("shield", 14), el("span", {
+        text: room.isEncrypted ? "New messages are end-to-end encrypted." : "Messages are not end-to-end encrypted.",
+      }));
+      this._encryptionStatus.title = room.isEncrypted
+        ? "Only participants’ devices can read new messages. Device verification is managed separately. Earlier messages may have been sent before encryption was enabled."
+        : "This conversation does not use end-to-end encryption. The homeserver can read messages.";
+    }
     const mobileRooms = el("button", { class: "mobile-room-toggle", "aria-label": "Show conversations", title: "Show conversations" }, icon("folder"));
     mobileRooms.addEventListener("click", () => this.closest("app-shell")?.classList.toggle("show-rooms"));
     this._header.appendChild(mobileRooms);
@@ -153,7 +201,7 @@ export class ChatView extends HTMLElement {
       this._header.appendChild(el("span", { class: "title", text: "Grungus" }));
       return;
     }
-    this._header.appendChild(el("span", { class: "channel-symbol" }, icon(room.isDirect ? "bubble" : "hash", 22)));
+    this._header.appendChild(el("span", { class: "channel-symbol" }, icon(room.isDirect ? "bubble" : isVideoRoom(room) ? "video" : "hash", 22)));
     this._header.appendChild(
       el("span", {
         class: "title",
@@ -161,7 +209,10 @@ export class ChatView extends HTMLElement {
         title: room.isEncrypted ? "End-to-end encrypted (megolm)" : undefined,
       })
     );
-    if (room.isEncrypted) this._header.appendChild(el("span", { class: "encryption-label", title: "End-to-end encrypted" }, icon("shield", 13), "Encrypted"));
+    this._header.appendChild(el("span", {
+      class: `encryption-label${room.isEncrypted ? "" : " unencrypted"}`,
+      title: room.isEncrypted ? "New messages are end-to-end encrypted. This does not indicate device verification." : "Messages are not end-to-end encrypted. The homeserver can read them.",
+    }, icon("shield", 13), room.isEncrypted ? "End-to-end encrypted" : "Not encrypted"));
     const sub = room.topic
       ? `${room.topic}  ·  ${room.joinedMemberCount} members`
       : `${room.joinedMemberCount} members`;
@@ -169,8 +220,14 @@ export class ChatView extends HTMLElement {
 
     /* call controls */
     const controls = el("div", { class: "header-call-controls" });
-    if (this._callJoined) {
+    if (this._callConnecting) {
+      controls.append(el("button", { class: "call-btn-header", disabled: true, text: "Connecting…", "aria-label": "Connecting to call" }));
+    } else if (this._callJoined) {
       controls.appendChild(el("span", { class: "call-live", text: "● in call" }));
+    } else if (isVideoRoom(room)) {
+      const join = el("button", { class: "call-btn-header", text: this._callOngoing ? "Join call" : "Start call", "aria-label": this._callOngoing ? "Join persistent call" : "Start room call", title: this._callOngoing ? "Join this room’s active call" : "Start a call in this video room" }, icon("video", 16));
+      join.addEventListener("click", () => this.dispatchEvent(new CustomEvent("grungus:join-room-call", { detail: { roomId: room.id }, bubbles: true })));
+      controls.appendChild(join);
     } else {
       const callBtn = el("button", {
         class: "call-btn-header",
@@ -226,6 +283,10 @@ export class ChatView extends HTMLElement {
   }
 
   /** Re-render the header's call controls (call state changed). */
+  setCallConnecting(connecting: boolean): void {
+    this._callConnecting = connecting;
+    if (this._room) this._renderHeader();
+  }
   setCallState(ongoing: boolean, joined: boolean): void {
     this._callOngoing = ongoing;
     this._callJoined = joined;
@@ -323,7 +384,18 @@ export class ChatView extends HTMLElement {
     }
 
     if (item.kind === "system") {
-      this._scroll.appendChild(el("sys-line", { text: item.text }));
+      if (item.callActivity) {
+        const card = el("div", { class: "timeline-call-card" }, icon("video", 22),
+          el("div", {}, el("strong", { text: item.text }), el("small", { text: new Date(item.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) })));
+        if (item.callActivity === "started" || item.callActivity === "joined") {
+          const open = el("button", { type: "button", class: "call-btn-header", text: "Open call", "aria-label": "Open room call" });
+          open.addEventListener("click", () => {
+            if (this._room && !this._callConnecting && !this._callJoined) this.dispatchEvent(new CustomEvent("grungus:join-room-call", { detail: { roomId: this._room.id }, bubbles: true }));
+          });
+          card.append(open);
+        }
+        this._scroll.append(card);
+      } else this._scroll.appendChild(el("sys-line", { text: item.text }));
       this._lastItem = item;
       return;
     }
@@ -551,10 +623,10 @@ export class ChatView extends HTMLElement {
     setTimeout(() => this._input.focus(), 0);
   }
 
-  setNotice(text: string): void {
+  setNotice(text: string, persistent = false): void {
     this._hint.textContent = text;
     if (this._noticeTimer) clearTimeout(this._noticeTimer);
-    if (text) {
+    if (text && !persistent) {
       this._noticeTimer = setTimeout(() => {
         this._hint.textContent = "";
       }, 4000);

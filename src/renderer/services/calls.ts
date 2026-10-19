@@ -1,3 +1,5 @@
+import { SettingsStore } from "./settings.ts";
+import { setCamera, switchMicrophone } from "./call-devices.ts";
 /*
  * Grungus — native group calls (MSC3401, full-mesh WebRTC).
  *
@@ -10,10 +12,10 @@
  *
  * Media: WebRTC DTLS-SRTP (always encrypted pairwise; in a full mesh there
  * is no middleman). When no capture devices exist (headless hosts, CI),
- * a synthetic canvas/oscillator stream is used so calls remain testable
- * and demonstrable — the UI shows a notice.
+ * capture errors are reported so the user can choose another device
+ * instead of generating replacement media.
  *
- * Screenshare: getDisplayMedia (or a synthetic screen on hosts without
+ * Screenshare: getDisplayMedia (real capture only; hosts without
  * display capture), added to every peer connection mid-call with
  * renegotiation from either role. Bandwidth discipline for the mesh:
  * content-hinted screen encoding (~1.5 Mbps, 10fps cap) and one share
@@ -52,9 +54,11 @@ export interface CallParticipant {
   screenStream: MediaStream | null;
   sharing: boolean;
   connectionState: string;
+  speaking?: boolean;
 }
 
 export interface CallUiState {
+  localSpeaking?: boolean;
   active: boolean;
   roomId: string | null;
   participants: CallParticipant[];
@@ -90,7 +94,7 @@ export class CallManager {
   private _uiListener: ((state: CallUiState) => void) | null = null;
   private _roomId: string | null = null;
   private _localStream: MediaStream | null = null;
-  /** media acquisition (real capture, synthetic fallback on headless hosts) */
+  /** media acquisition (real device capture only) */
   private _media: CallMedia;
   /** call-state heartbeat (keeps expires_ts fresh while connected) */
   private _memberHeartbeat: ReturnType<typeof setInterval> | null = null;
@@ -201,11 +205,9 @@ export class CallManager {
       this._mediaKeyId = 1;
     }
 
-    const media = await this._media.acquire(opts.video === true);
+    const media = await this._media.acquire(opts.video === true).catch(error => { this._teardown(); throw error; });
     this._localStream = media.stream;
-    this._notice = media.synthetic
-      ? "No microphone/camera available — using a synthetic stream"
-      : null;
+    this._notice = null;
     if (this._mediaE2ee) {
       this._notice = (this._notice ? this._notice + " · " : "") + "🔒 E2EE media";
     }
@@ -288,9 +290,25 @@ export class CallManager {
 
   /* -------------------------------- media -------------------------------- */
 
-  /** Sample the synthetic canvas color (used by e2e verification). */
-  syntheticColorCss(): string | null {
-    return this._media.syntheticColorCss();
+
+  private _cameraTransforms = new WeakSet<RTCRtpSender>();
+  get localCameraEnabled(): boolean { return this._localStream?.getVideoTracks().some(track => track.readyState === "live") ?? false; }
+  async setCameraEnabled(enabled: boolean): Promise<void> {
+    const stream = this._localStream;
+    const prefs = new SettingsStore();
+    await setCamera(stream, [...this._peers.values()].map(peer => peer.pc), () => this._localStream === stream && this._roomId !== null, enabled, prefs.get("videoInput"), sender => {
+      if (this._mediaE2ee && !this._cameraTransforms.has(sender)) {
+        this._cameraTransforms.add(sender);
+        attachSenderTransform(sender, () => ({ keyId: this._mediaKeyId, key: this._mediaKey! }), () => { this._framesEncrypted++; });
+      }
+    });
+    this._emit();
+  }
+
+  async switchAudioInput(deviceId: string): Promise<void> {
+    const stream = this._localStream;
+    await switchMicrophone(stream, () => [...this._peers.values()].map(peer => peer.pc), () => this._localStream === stream && this._roomId !== null, () => this._localMuted, deviceId);
+    this._emit();
   }
 
   setMuted(muted: boolean): void {
@@ -307,7 +325,7 @@ export class CallManager {
     return this._sharing;
   }
 
-  /** The locally captured/synthetic screen stream (for the local tile). */
+  /** The locally captured screen stream (for the local tile). */
   get localScreenStream(): MediaStream | null {
     return this._screenStream;
   }
@@ -315,8 +333,8 @@ export class CallManager {
   /**
    * Start sharing this device's screen with everyone in the call. One share
    * at a time (mesh bandwidth discipline): a remote share blocks starting.
-   * Falls back to a synthetic screen when the host has no display capture
-   * (headless/CI) so the whole pipeline stays verifiable.
+   * Returns without sharing when the host has no display capture
+   * or the user cancels the source picker.
    */
   async startScreenshare(): Promise<void> {
     if (!this.active || this._sharing) return;
@@ -331,11 +349,7 @@ export class CallManager {
     const captured = await this._acquireScreen();
     if (!captured) return;
     this._screenStream = captured.stream;
-    if (captured.synthetic) {
-      this._notice = "No display capture available — sharing a synthetic screen";
-    } else if (this._notice && this._notice.includes("synthetic")) {
-      this._notice = null;
-    }
+
     this._sharing = true;
 
     /* tell the peers BEFORE the media can arrive so their track routing
@@ -385,9 +399,7 @@ export class CallManager {
       }
     }
     this._stopScreenTracks();
-    if (this._notice && this._notice.includes("synthetic screen")) {
-      this._notice = null;
-    }
+
     this._emit();
   }
 
@@ -407,7 +419,7 @@ export class CallManager {
     };
   }
 
-  private async _acquireScreen(): Promise<{ stream: MediaStream; synthetic: boolean } | null> {
+  private async _acquireScreen(): Promise<{ stream: MediaStream } | null> {
     return this._media.acquireScreen();
   }
 
@@ -608,6 +620,7 @@ export class CallManager {
        added — transforms attach per sender) */
     if (this._mediaE2ee) {
       for (const sender of pc.getSenders()) {
+        if (sender.track?.kind === "video") this._cameraTransforms.add(sender);
         attachSenderTransform(
           sender,
           () => ({ keyId: this._mediaKeyId, key: this._mediaKey! }),

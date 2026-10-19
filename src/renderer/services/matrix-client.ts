@@ -63,6 +63,8 @@ export class MatrixClient {
   accessToken: string | null;
   userId: string | null;
   deviceId: string | null;
+  private readonly _presence = new Map<string, import("./matrix-types.ts").PresenceState>();
+  getPresence(userId: string): import("./matrix-types.ts").PresenceState | null { return this._presence.get(userId) ?? null; }
   readonly rooms = new Map<string, Room>();
   /** Rooms with a pending invite (rooms.invite in /sync). */
   readonly invites = new Map<string, InvitedRoom>();
@@ -111,6 +113,7 @@ export class MatrixClient {
    */
   private _pendingEncryption = new Map<string, boolean>();
   private readonly _listeners: { [K in keyof ClientEvents]: Set<Listener<K>> } = {
+    presence: new Set(),
     sync: new Set(),
     ready: new Set(),
     room: new Set(),
@@ -443,9 +446,9 @@ export class MatrixClient {
    * trusted services like the LiveKit token service without handing over
    * the session token).
    */
-  async requestOpenIdToken(): Promise<{ access_token: string; matrix_server_name: string }> {
+  async requestOpenIdToken(): Promise<{ access_token: string; matrix_server_name: string; token_type: string; expires_in: number }> {
     const userId = this.userId ?? "";
-    const res = await this.api<{ access_token?: string; matrix_server_name?: string }>(
+    const res = await this.api<{ access_token?: string; matrix_server_name?: string; token_type?: string; expires_in?: number }>(
       "POST",
       `${CLIENT_PREFIX}/user/${encodeURIComponent(userId)}/openid/request_token`,
       { body: {} }
@@ -453,7 +456,9 @@ export class MatrixClient {
     if (!res.access_token) throw new Error("homeserver issued no OpenID token");
     return {
       access_token: res.access_token,
-      matrix_server_name: res.matrix_server_name ?? "",
+      matrix_server_name: res.matrix_server_name ?? this.userId?.slice(this.userId.indexOf(":") + 1) ?? "",
+      token_type: res.token_type ?? "Bearer",
+      expires_in: res.expires_in ?? 3600,
     };
   }
 
@@ -699,6 +704,13 @@ export class MatrixClient {
       { body: content }
     );
     this._accountData.set(type, content);
+    if (type === "m.direct") {
+      for (const room of this.rooms.values()) {
+        resolveRoomMeta(room, this.userId, content);
+        this.emit("room", { room, newEvents: [] });
+      }
+      this.emit("rooms", this.getRooms());
+    }
   }
 
   /* --------------------------- key signing upload ------------------------- */
@@ -743,9 +755,10 @@ export class MatrixClient {
   async uploadKeySignatures(
     payload: Record<string, Record<string, unknown>>
   ): Promise<void> {
-    await this.api("POST", `${CLIENT_PREFIX}/keys/signatures/upload`, {
+    const result = await this.api<{ failures?: Record<string, unknown> }>("POST", `${CLIENT_PREFIX}/keys/signatures/upload`, {
       body: payload,
     });
+    if (result.failures && Object.keys(result.failures).length) throw new Error(`Homeserver rejected cross-signing signatures: ${JSON.stringify(result.failures)}`);
   }
 
   /* ----------------------------- spaces --------------------------------- */
@@ -793,6 +806,17 @@ export class MatrixClient {
   }
 
   private _applySync(data: SyncResponse): void {
+    const presenceChanged: string[] = [];
+    for (const event of data.presence?.events ?? []) {
+      const state = event.content?.presence;
+      if (event.type !== "m.presence" || !event.sender || !["online", "offline", "unavailable"].includes(String(state))) continue;
+      const presence = state as import("./matrix-types.ts").PresenceState;
+      if (this._presence.get(event.sender) !== presence) {
+        this._presence.set(event.sender, presence); presenceChanged.push(event.sender);
+      }
+    }
+    if (presenceChanged.length) this.emit("presence", presenceChanged);
+
     /* account data (cross-signing keys, etc.) */
     let directMapChanged = false;
     for (const ev of data.account_data?.events ?? []) {
@@ -1231,8 +1255,11 @@ export class MatrixClient {
       name: opts.name ?? "",
       preset: opts.isPublic ? "public_chat" : "private_chat",
     };
+    if (opts.invite?.length) body.invite = opts.invite;
+    if (opts.isDirect) body.is_direct = true;
     if (opts.topic) body.topic = opts.topic;
     if (opts.isSpace) body.creation_content = { type: "m.space" };
+    else if (opts.isVideo) body.creation_content = { type: "org.matrix.msc3417.call" };
     if (opts.encrypted) {
       body.initial_state = [
         {
@@ -1261,10 +1288,73 @@ export class MatrixClient {
     return res.room_id;
   }
 
-  async joinRoom(roomIdOrAlias: string): Promise<string> {
+  /** Direct children, including rooms the user has not joined, visible in a space. */
+  async spaceHierarchy(spaceId: string, from?: string, signal?: AbortSignal): Promise<import("./matrix-types.ts").SpaceHierarchyPage> {
+    return this.api("GET", `/_matrix/client/v1/rooms/${encodeURIComponent(spaceId)}/hierarchy`, {
+      query: { limit: 30, max_depth: 1, suggested_only: "false", from }, signal,
+    });
+  }
+
+  /** Browse the logged-in homeserver's published room directory. */
+  async publicRooms(term = "", since?: string, signal?: AbortSignal): Promise<import("./matrix-types.ts").PublicRoomPage> {
+    return this.api("POST", `${CLIENT_PREFIX}/publicRooms`, {
+      body: { limit: 30, ...(since ? { since } : {}), filter: { ...(term.trim() ? { generic_search_term: term.trim() } : {}), room_types: [null] } }, signal,
+    });
+  }
+
+  /** Search the directory exposed by the authenticated homeserver. */
+  async searchUsers(term: string, signal?: AbortSignal): Promise<{ results: { user_id: string; display_name?: string; avatar_url?: string }[]; limited: boolean }> {
+    if (!term.trim()) return { results: [], limited: false };
+    const result = await this.api<{ results?: { user_id: string; display_name?: string; avatar_url?: string }[]; limited?: boolean }>("POST", `${CLIENT_PREFIX}/user_directory/search`, {
+      body: { search_term: term.trim(), limit: 20 }, signal,
+    });
+    return { results: (result.results ?? []).filter(user => typeof user.user_id === "string" && user.user_id !== this.userId), limited: result.limited === true };
+  }
+
+  private readonly _startingDirect = new Map<string, Promise<string>>();
+  private readonly _createdDirect = new Map<string, string>();
+
+  /** Reuse a one-to-one conversation, otherwise invite the peer into a new encrypted DM. */
+  async startDirectMessage(peer: string): Promise<string> {
+    peer = peer.trim();
+    if (!/^@[^:\s]+:[^\s]+$/.test(peer)) throw new Error("Enter a full Matrix ID, for example @friend:example.org");
+    if (peer === this.userId) throw new Error("Choose another user to start a direct message");
+    const pending = this._startingDirect.get(peer);
+    if (pending) return pending;
+    const operation = this._startDirectMessage(peer);
+    this._startingDirect.set(peer, operation);
+    try { return await operation; } finally { this._startingDirect.delete(peer); }
+  }
+
+  private async _startDirectMessage(peer: string): Promise<string> {
+    let direct = this.getAccountData("m.direct");
+    // Fetch current data before updating it, including before the first sync.
+    try { direct = await this.api<Record<string, unknown>>("GET", `${CLIENT_PREFIX}/user/${encodeURIComponent(this.userId!)}/account_data/m.direct`); }
+    catch (error) { if (!(error instanceof HttpError) || error.errcode !== "M_NOT_FOUND") throw error; }
+    const mapped = Array.isArray(direct?.[peer]) ? direct[peer] as string[] : [];
+    const justCreated = this._createdDirect.get(peer);
+    if (justCreated && !this._leftRooms.has(justCreated)) {
+      const room = this.rooms.get(justCreated);
+      const others = room ? [...room.members.values()].filter(member => member.userId !== this.userId && ["join", "invite"].includes(member.membership)) : null;
+      if (!others || (others.length === 1 && others[0]!.userId === peer)) {
+        if (!mapped.includes(justCreated)) await this.setAccountData("m.direct", { ...direct, [peer]: [...mapped, justCreated] });
+        return justCreated;
+      }
+    }
+    for (const room of this.rooms.values()) {
+      const others = [...room.members.values()].filter(member => member.userId !== this.userId && ["join", "invite"].includes(member.membership));
+      if (!room.isSpace && others.length === 1 && others[0]!.userId === peer && (mapped.includes(room.id) || room.isDirect)) return room.id;
+    }
+    const roomId = await this.createRoom({ invite: [peer], isDirect: true, encrypted: true });
+    this._createdDirect.set(peer, roomId);
+    await this.setAccountData("m.direct", { ...direct, [peer]: [...new Set([...mapped, roomId])] });
+    return roomId;
+  }
+
+  async joinRoom(roomIdOrAlias: string, via: string[] = []): Promise<string> {
     const res = await this.api<{ room_id?: string }>(
       "POST",
-      `${CLIENT_PREFIX}/join/${encodeURIComponent(roomIdOrAlias)}`,
+      `${CLIENT_PREFIX}/join/${encodeURIComponent(roomIdOrAlias)}${via.length ? `?${new URLSearchParams(via.map(server => ["server_name", server]))}` : ""}`,
       { body: {} }
     );
     const roomId = res?.room_id ?? roomIdOrAlias;

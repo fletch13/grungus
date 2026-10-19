@@ -1,3 +1,4 @@
+import { switchMicrophone } from "./call-devices.ts";
 /*
  * Grungus — 1:1 calls over the legacy room-event protocol (MSC2746) —
  * the protocol every Element client speaks in direct messages:
@@ -27,7 +28,7 @@
 import type { MatrixClient, MatrixEvent } from "./matrix-client.ts";
 import { mxidLocalpart } from "./matrix-client.ts";
 import type { CallParticipant, CallUiState } from "./calls.ts";
-import { CallMedia, offerHasVideo } from "./call-media.ts";
+import { CallMedia } from "./call-media.ts";
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
@@ -119,11 +120,9 @@ export class P2PCallManager {
     this._role = "caller";
     this._callId = this._newCallId();
 
-    const media = await this._media.acquire(opts.video === true);
+    const media = await this._media.acquire(opts.video === true).catch(error => { this._teardown(); throw error; });
     this._localStream = media.stream;
-    this._notice = media.synthetic
-      ? "No microphone/camera available — using a synthetic stream"
-      : null;
+    this._notice = null;
 
     const pc = this._createPeerConnection();
     this._pc = pc;
@@ -169,11 +168,9 @@ export class P2PCallManager {
     this._remotePartyId = pending.senderPartyId;
 
     /* answer with camera only when the caller offered a video m-line */
-    const media = await this._media.acquire(offerHasVideo(pending.offer.sdp));
+    const media = await this._media.acquire(false).catch(error => { this._teardown(); throw error; });
     this._localStream = media.stream;
-    this._notice = media.synthetic
-      ? "No microphone/camera available — using a synthetic stream"
-      : null;
+    this._notice = null;
 
     const pc = this._createPeerConnection();
     this._pc = pc;
@@ -205,6 +202,12 @@ export class P2PCallManager {
       version: "1",
     }).catch(() => {});
     this._teardown();
+  }
+
+  async switchAudioInput(deviceId: string): Promise<void> {
+    const stream = this._localStream;
+    await switchMicrophone(stream, () => this._pc ? [this._pc] : [], () => this._localStream === stream && this._roomId !== null, () => this._localMuted, deviceId);
+    this._emit();
   }
 
   setMuted(muted: boolean): void {
@@ -524,11 +527,7 @@ export class P2PCallManager {
     const captured = await this._media.acquireScreen(false);
     if (!captured) return;
     this._screenStream = captured.stream;
-    if (captured.synthetic) {
-      this._notice = "No display capture available — sharing a synthetic screen";
-    } else if (this._notice && this._notice.includes("synthetic")) {
-      this._notice = null;
-    }
+
     this._cameraTrack = sender.track ?? null;
     const screenTrack = captured.stream.getVideoTracks()[0];
     if (!screenTrack) {
@@ -564,9 +563,7 @@ export class P2PCallManager {
     this._screenStream = null;
     this._cameraTrack = null;
     this._sharing = false;
-    if (this._notice && this._notice.includes("synthetic screen")) {
-      this._notice = null;
-    }
+
     await this._sendCallEvent("m.call.screenshare", {
       call_id: this._callId ?? "",
       party_id: this.client.deviceId ?? undefined,

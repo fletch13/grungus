@@ -46,7 +46,7 @@ try {
         console.log(result.message);
         const screenshotDir = ${JSON.stringify(screenshots)};
         if (screenshotDir) {
-          for (const scene of ["workspace", "login", "settings", "light", "mobile"]) {
+          for (const scene of ["workspace", "login", "settings", "light", "mobile", "background", "background-light"]) {
             win.setSize(scene === "mobile" ? 480 : 1440, scene === "mobile" ? 850 : 960);
             await win.webContents.executeJavaScript("window.showPreview(" + JSON.stringify(scene) + ")");
             await new Promise(resolve => setTimeout(resolve, 150));

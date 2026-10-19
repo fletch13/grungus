@@ -1,3 +1,4 @@
+import { discoverCallService, requestCallToken } from "./matrix-call-service.ts";
 /*
  * Grungus — LiveKit calls (SFU).
  *
@@ -12,9 +13,7 @@
  * short-lived LiveKit access token — the API secret never leaves the
  * service.
  *
- * Media falls back to synthetic canvas/oscillator streams on hosts
- * without capture devices (headless/CI), so the whole SFU pipeline
- * stays verifiable — same pattern as the mesh calls.
+ * Calls use real devices only and enter with the camera off.
  */
 import {
   Room as LkRoom,
@@ -22,9 +21,7 @@ import {
   RemoteParticipant,
   RemoteTrack,
   RemoteTrackPublication,
-  LocalVideoTrack,
   Track,
-  VideoPresets,
   createLocalTracks,
   type LocalTrack,
 } from "livekit-client";
@@ -35,6 +32,7 @@ import { LkE2ee } from "./lk-e2ee.ts";
 import { SettingsStore } from "./settings.ts";
 
 export interface LkCallState {
+  localSpeaking: boolean;
   connected: boolean;
   participants: {
     identity: string;
@@ -58,14 +56,13 @@ export class LkCallManager {
   private _notice: string | null = null;
   private _localMuted = false;
   private _roomId: string | null = null;
-  /** synthetic media kept alive across the call */
-  private _syntheticCanvas: HTMLCanvasElement | null = null;
-  private _syntheticTimer: ReturnType<typeof setInterval> | null = null;
-  private _audioCtx: AudioContext | null = null;
+
 
   constructor(client: MatrixClient) {
     this.client = client;
   }
+
+  get roomId(): string | null { return this._roomId; }
 
   get connected(): boolean {
     return this._room !== null && this._room.state === "connected";
@@ -81,25 +78,6 @@ export class LkCallManager {
   private _matrixRtc = false;
   /** call-state heartbeat (keeps the membership expiry fresh) */
   private _memberHeartbeat: ReturnType<typeof setInterval> | null = null;
-
-  /**
-   * Discover the LiveKit service for a MatrixRTC call (Element Call
-   * interop). Returns null when the room has no active memberships
-   * with a LiveKit focus. The focus URL points at the MatrixRTC
-   * authorization service (lk-jwt-service — the same pattern as
-   * Grungus's own livekit/auth-service.ts, which returns the SFU url
-   * together with the token); the LiveKit room for a MatrixRTC call is
-   * the MATRIX ROOM ID (every client in the room gets a token scoped
-   * to the same LiveKit room).
-   */
-  private async _discoverMatrixRtcFocus(
-    matrixRoom: Room,
-    roomId: string
-  ): Promise<{ room: string; authUrl: string } | null> {
-    const focusUrl = matrixRoom.rtcMemberships.find((m) => m.focusUrl)?.focusUrl ?? null;
-    if (!focusUrl) return null;
-    return { room: roomId, authUrl: focusUrl };
-  }
 
   /**
    * Publish our MatrixRTC membership (Element Call format): an
@@ -128,6 +106,7 @@ export class LkCallManager {
          the original { active_focus } for older MSC4143 clients */
       focus_active: {
         type: "livekit",
+        focus_selection: "oldest_membership",
         livekit_service_url: authUrl,
         active_focus: { focus: "livekit", livekit_service_url: authUrl },
         joined_ts: now,
@@ -228,7 +207,7 @@ export class LkCallManager {
     await this.client.sendStateEvent(roomId, "m.call.member", userId, content).catch(() => {});
   }
 
-  async join(): Promise<void> {
+  async join(discoveredService?: string): Promise<void> {
     if (this._room) return;
     const roomId = this._roomId;
     const matrixRoom = roomId ? this.client.getRoom(roomId) : null;
@@ -245,10 +224,10 @@ export class LkCallManager {
     let matrixRtc = false;
 
     if (!service && matrixRoom) {
-      const focus = await this._discoverMatrixRtcFocus(matrixRoom, roomId ?? "");
+      const focus = discoveredService ?? await discoverCallService(this.client, matrixRoom);
       if (focus) {
-        lkRoom = focus.room;
-        authUrl = focus.authUrl;
+        lkRoom = roomId;
+        authUrl = focus;
         matrixRtc = true;
       }
     }
@@ -258,78 +237,29 @@ export class LkCallManager {
     }
     this._matrixRtc = matrixRtc;
 
-    // Session-token authentication is explicitly enabled only for a trusted custom service.
-    let authBody: Record<string, unknown>;
-    if (service?.authMode === "whoami") {
-      authBody = { room: lkRoom, room_id: roomId, matrix_token: this.client.accessToken };
-    } else {
-      const openid = await this.client.requestOpenIdToken();
-      authBody = { room: lkRoom, room_id: roomId, openid_token: openid.access_token };
-    }
-    /* A MatrixRTC focus (Element Call) points at the SERVICE ROOT — the
-       token endpoint lives at a known sub-path. Grungus's own
-       com.grungus.livekit auth_url IS the endpoint already. Try the
-       focus sub-paths first, then the bare URL. */
-    const endpoints = matrixRtc
-      ? [
-          `${authUrl.replace(/\/$/, "")}/session/get_token`,
-          `${authUrl.replace(/\/$/, "")}/sfu/get`,
-          `${authUrl.replace(/\/$/, "")}/get_token`,
-          authUrl,
-        ]
-      : [authUrl];
-    let data: { token?: string; jwt?: string; url?: string; error?: string } = {};
-    let resStatus = 0;
-    let lastError = "token service unreachable";
-    for (const endpoint of endpoints) {
-      try {
-        const res = await fetch(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(authBody),
-        });
-        resStatus = res.status;
-        data = (await res.json().catch(() => ({}))) as {
-          token?: string;
-          jwt?: string;
-          url?: string;
-          error?: string;
-        };
-        /* element-call's legacy /sfu/get answers {url, jwt} */
-        const token = data.token ?? data.jwt;
-        if (res.ok && token && data.url) {
-          data.token = token;
-          lastError = "";
-          break;
-        }
-        lastError = data.error ?? `token service refused (${res.status})`;
-      } catch (err) {
-        lastError = err instanceof Error ? err.message : "network error";
-      }
-    }
-    if (!data.token || !data.url) {
-      throw new Error(lastError || `token service refused (${resStatus})`);
+    let data: { token: string; url: string };
+    if (matrixRtc) data = await requestCallToken(this.client, roomId!, authUrl);
+    else {
+      const proof = service?.authMode === "whoami"
+        ? { matrix_token: this.client.accessToken }
+        : { openid_token: (await this.client.requestOpenIdToken()).access_token };
+      const response = await fetch(authUrl, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ room: lkRoom, room_id: roomId, ...proof }),
+        signal: AbortSignal.timeout(12000), redirect: "error",
+      });
+      const result = await response.json() as { token?: string; jwt?: string; url?: string; error?: string };
+      const token = result.token ?? result.jwt;
+      if (!response.ok || !token || !result.url) throw new Error(result.error || `Call authorization failed (${response.status})`);
+      data = { token, url: result.url };
     }
 
-    /* publish local media first (synthetic fallback on headless hosts);
-       the Voice & Video picks constrain mic and camera ("" = default) */
     const prefs = new SettingsStore();
     const audioInput = prefs.get("audioInput");
-    const videoInput = prefs.get("videoInput");
-    let localTracks;
-    try {
-      localTracks = await createLocalTracks({
-        audio: audioInput ? { deviceId: { ideal: audioInput } } : true,
-        video: {
-          ...(videoInput ? { deviceId: { ideal: videoInput } } : {}),
-          resolution: VideoPresets.h720.resolution,
-        },
-      });
-    } catch (err) {
-      console.warn("[lk-call] capture failed, using synthetic media:", err);
-      localTracks = await this._syntheticTracks();
-      this._notice = "No microphone/camera available — using a synthetic stream";
-    }
+    const localTracks = await createLocalTracks({
+      audio: audioInput ? { deviceId: { ideal: audioInput } } : true,
+      video: false,
+    });
 
     /* LiveKit-path E2EE: encrypted rooms only. Element-compatible —
        livekit's own e2ee worker + per-participant keys over Matrix
@@ -341,6 +271,7 @@ export class LkCallManager {
           client: this.client,
           roomId: roomId ?? "",
           identity: this.client.userId,
+          participantIdentity: matrixRtc ? `${this.client.userId}:${this.client.deviceId}` : this.client.userId,
           deviceId: this.client.deviceId,
         });
       } catch (err) {
@@ -356,6 +287,7 @@ export class LkCallManager {
     });
     this._wireEvents(lk);
     this._room = lk;
+    try {
     await lk.connect(data.url, data.token);
     /* the Voice & Video speaker pick routes all incoming audio ("" =
        system default; unsupported platforms just keep the default) */
@@ -393,6 +325,11 @@ export class LkCallManager {
       void this._publishRtcMembership(roomId ?? "", authUrl).catch(() => {});
     }, 2 * 60_000);
     this._emit();
+    } catch (error) {
+      for (const track of localTracks) track.stop();
+      await this.leave();
+      throw error;
+    }
   }
 
   async leave(): Promise<void> {
@@ -416,15 +353,6 @@ export class LkCallManager {
     } catch {
       /* already gone */
     }
-    if (this._syntheticTimer) {
-      clearInterval(this._syntheticTimer);
-      this._syntheticTimer = null;
-    }
-    this._syntheticCanvas = null;
-    if (this._audioCtx) {
-      void this._audioCtx.close().catch(() => {});
-      this._audioCtx = null;
-    }
     this._notice = null;
     this._localMuted = false;
     this._emit();
@@ -432,6 +360,32 @@ export class LkCallManager {
 
   setRoomId(roomId: string): void {
     this._roomId = roomId;
+  }
+
+  get localCameraEnabled(): boolean { return this._room?.localParticipant.isCameraEnabled ?? false; }
+  get localStream(): MediaStream | null {
+    const tracks = [...(this._room?.localParticipant.trackPublications.values() ?? [])]
+      .filter(publication => publication.source === Track.Source.Camera || publication.source === Track.Source.Microphone)
+      .flatMap(publication => publication.track ? [publication.track.mediaStreamTrack] : []);
+    return tracks.length ? new MediaStream(tracks) : null;
+  }
+  async setCameraEnabled(enabled: boolean): Promise<void> {
+    if (!this._room) throw new Error("No active call");
+    const prefs = new SettingsStore();
+    await this._room.localParticipant.setCameraEnabled(enabled, { deviceId: prefs.get("videoInput") || undefined });
+    this._emit();
+  }
+
+  async switchAudioInput(deviceId: string): Promise<void> {
+    if (!this._room) throw new Error("No active call");
+    const switched = await this._room.switchActiveDevice("audioinput", deviceId || "default");
+    if (!switched) throw new Error("Could not switch microphone");
+  }
+
+  async switchAudioOutput(deviceId: string): Promise<void> {
+    if (!this._room) throw new Error("No active call");
+    const switched = await this._room.switchActiveDevice("audiooutput", deviceId || "default");
+    if (!switched) throw new Error("Could not switch speaker");
   }
 
   setMuted(muted: boolean): void {
@@ -445,44 +399,23 @@ export class LkCallManager {
 
   /** Route incoming audio to a different speaker mid-call ("" = default). */
   setAudioOutput(sinkId: string): void {
-    if (!sinkId || !this._room) return;
+    if (!this._room) return;
     void this._room
       .switchActiveDevice("audiooutput", sinkId)
       .catch((err: unknown) => console.warn("[lk-call] speaker switch failed:", err));
   }
 
-  /** Screen share through the SFU (synthetic fallback on headless hosts). */
+  /** Share a real display through the SFU. */
   async setSharing(enabled: boolean): Promise<void> {
     const room = this._room;
     if (!room) return;
     try {
       if (enabled) {
-        const hasCapture =
-          typeof navigator !== "undefined" &&
-          typeof navigator.mediaDevices?.getDisplayMedia === "function";
-        if (hasCapture) {
-          await room.localParticipant.setScreenShareEnabled(true, {
-            audio: true,
-            contentHint: "detail",
-          });
-        } else {
-          /* synthetic screen through the SFU keeps the pipeline verifiable */
-          const screen = this._syntheticScreen();
-          const rawTrack = screen.getVideoTracks()[0];
-          if (rawTrack) {
-            const track = new LocalVideoTrack(rawTrack as unknown as MediaStreamTrack);
-            await room.localParticipant.publishTrack(track, {
-              source: Track.Source.ScreenShare,
-              name: "screen",
-            });
-          }
-          this._notice = "No display capture available — sharing a synthetic screen";
-        }
+        if (typeof navigator === "undefined" || !navigator.mediaDevices?.getDisplayMedia) throw new Error("Screen capture is unavailable");
+        await room.localParticipant.setScreenShareEnabled(true, { audio: true, contentHint: "detail" });
       } else {
         await room.localParticipant.setScreenShareEnabled(false);
-        if (this._notice && this._notice.includes("synthetic screen")) {
-          this._notice = null;
-        }
+
       }
     } catch (err) {
       console.error("[lk-call] screenshare failed:", err);
@@ -498,8 +431,13 @@ export class LkCallManager {
   /* ------------------------------- events -------------------------------- */
 
   private _wireEvents(lk: LkRoom): void {
+    lk.on(RoomEvent.ActiveSpeakersChanged, () => this._emit());
     lk.on(RoomEvent.TrackSubscribed, () => this._emit());
     lk.on(RoomEvent.TrackUnsubscribed, () => this._emit());
+    lk.on(RoomEvent.TrackMuted, () => this._emit());
+    lk.on(RoomEvent.TrackUnmuted, () => this._emit());
+    lk.on(RoomEvent.LocalTrackPublished, () => this._emit());
+    lk.on(RoomEvent.LocalTrackUnpublished, () => this._emit());
     lk.on(RoomEvent.ParticipantConnected, () => this._emit());
     lk.on(RoomEvent.ParticipantDisconnected, () => this._emit());
     lk.on(RoomEvent.Disconnected, () => {
@@ -513,24 +451,18 @@ export class LkCallManager {
     screenStream: MediaStream | null;
     sharing: boolean;
   } {
-    let stream: MediaStream | null = null;
-    let screenStream: MediaStream | null = null;
-    let sharing = false;
+    const media: MediaStreamTrack[] = [];
+    const screen: MediaStreamTrack[] = [];
     for (const pub of participant.trackPublications.values()) {
       const remotePub = pub as RemoteTrackPublication;
       const track = remotePub.track;
-      if (!track || remotePub.isSubscribed === false || track.kind !== "video") continue;
-      /* livekit's remote track wraps the underlying MediaStreamTrack */
-      const raw = (track as unknown as { mediaStreamTrack?: MediaStreamTrack })
-        .mediaStreamTrack ?? (track as unknown as MediaStreamTrack);
-      const ms = new MediaStream([raw]);
-      if (remotePub.source === Track.Source.ScreenShare) {
-        sharing = true;
-        screenStream = ms;
-      } else {
-        stream = ms;
-      }
+      if (!track || remotePub.isSubscribed === false || (track.kind === "video" && remotePub.isMuted)) continue;
+      if (remotePub.source === Track.Source.ScreenShare || remotePub.source === Track.Source.ScreenShareAudio) screen.push(track.mediaStreamTrack);
+      else media.push(track.mediaStreamTrack);
     }
+    const stream = media.length ? new MediaStream(media) : null;
+    const screenStream = screen.length ? new MediaStream(screen) : null;
+    const sharing = screen.some(track => track.kind === "video");
     return { stream, screenStream, sharing };
   }
 
@@ -553,6 +485,7 @@ export class LkCallManager {
     }
     this._listener({
       connected: this.connected,
+      localSpeaking: !this._localMuted && (room?.localParticipant.isSpeaking ?? false),
       participants,
       notice: this._notice,
       localMuted: this._localMuted,
@@ -560,71 +493,4 @@ export class LkCallManager {
     });
   }
 
-  /* ---------------------------- synthetic media --------------------------- */
-
-  private _syntheticTracks(): Promise<MediaStreamTrack[]> {
-    const canvas = document.createElement("canvas");
-    canvas.width = 320;
-    canvas.height = 240;
-    this._syntheticCanvas = canvas;
-    const ctx = canvas.getContext("2d")!;
-    let tick = 0;
-    const draw = (): void => {
-      tick = (tick + 1) % 320;
-      ctx.fillStyle = "#5865f2";
-      ctx.fillRect(0, 0, 320, 240);
-      ctx.fillStyle = "#ffffff";
-      ctx.font = "16px monospace";
-      ctx.fillText("grungus sfu cam", 12, 30);
-      ctx.fillRect(tick, 120, 20, 40);
-    };
-    draw();
-    this._syntheticTimer = setInterval(draw, 100);
-    const videoStream = canvas.captureStream(15) as MediaStream;
-
-    const AudioCtor =
-      (window as unknown as { AudioContext?: typeof AudioContext }).AudioContext ??
-      AudioContext;
-    this._audioCtx = new AudioCtor();
-    const dest = this._audioCtx.createMediaStreamDestination();
-    const osc = this._audioCtx.createOscillator();
-    const gain = this._audioCtx.createGain();
-    gain.gain.value = 0.02;
-    osc.frequency.value = 440;
-    osc.connect(gain);
-    gain.connect(dest);
-    osc.start();
-
-    return Promise.resolve([
-      ...videoStream.getVideoTracks(),
-      ...dest.stream.getAudioTracks(),
-    ]);
-  }
-
-  private _syntheticScreen(): MediaStream {
-    const canvas = document.createElement("canvas");
-    canvas.width = 640;
-    canvas.height = 360;
-    const ctx = canvas.getContext("2d")!;
-    let tick = 0;
-    const draw = (): void => {
-      tick += 1;
-      ctx.fillStyle = "#101319";
-      ctx.fillRect(0, 0, 640, 360);
-      ctx.fillStyle = "#7ee787";
-      ctx.font = "18px monospace";
-      const lines = [
-        "GRUNGUS — synthetic screen (via SFU)",
-        "",
-        "$ grungus --livekit",
-        "frame " + tick,
-        "",
-        "[ok] simulcast: publisher sends once, SFU fans out",
-      ];
-      lines.forEach((line, i) => ctx.fillText(line, 16, 40 + i * 26));
-    };
-    draw();
-    this._syntheticTimer = setInterval(draw, 100);
-    return canvas.captureStream(10) as MediaStream;
-  }
 }

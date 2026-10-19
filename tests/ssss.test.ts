@@ -318,3 +318,39 @@ test("Element QR mode 0x02: old device scans new device's code, trust propagates
   const bTrustsC = await b.cs.isOwnDeviceTrusted(c.crypto.deviceId);
   assert.equal(bTrustsC, true, "B trusts C via the cross-signing chain");
 });
+
+test("Element recovery key recovers standard cross-signing keys before sync and self-signs the new device", async t => {
+  const { encodeRecoveryKey } = await import("../src/renderer/services/ssss.ts");
+  const { recoverSession } = await import("../src/renderer/services/session-recovery.ts");
+  const hs = new MockHomeserver();
+  await hs.listen(); t.after(() => hs.close());
+  const old = await makeDevice(hs, "element_recovery", "pw");
+  t.after(() => old.client.stopSync());
+  await old.cs.bootstrap(undefined, "existing recovery passphrase");
+  const storage = new SecretStorage(old.client);
+  const raw = await storage.debugKeyBytes("existing recovery passphrase");
+  assert.ok(raw);
+  const recoveryKey = encodeRecoveryKey(raw);
+  // Element publishes public keys through /keys/query, without Grungus's custom account data.
+  const data = hs.accountData.get("element_recovery")!;
+  for (const name of [...data.keys()]) if (name.startsWith("com.grungus.cross_signing.")) data.delete(name);
+  const fresh = new MatrixClient({ baseUrl: hs.baseUrl! });
+  await fresh.loginWithPassword({ username: "element_recovery", password: "pw" });
+  const crypto = new E2eeCrypto({ host: fresh, store: new MemoryCryptoStore() });
+  await crypto.init(); fresh.crypto = crypto;
+  assert.equal(fresh.getAccountData("m.secret_storage.default_key"), null, "Initial sync has not happened");
+  // No history backup exists: identity verification must still succeed independently.
+  const result = await recoverSession(fresh, recoveryKey);
+  assert.equal(result.verified, true);
+  assert.equal(result.restored, null);
+  const ssk = hs.crossSigning.get("element_recovery")!.self_signing as { keys: Record<string, string> };
+  const sskPub = Object.values(ssk.keys)[0]!;
+  const published = await crypto.getRawDeviceKeys(fresh.userId!);
+  assert.ok(published[fresh.deviceId!]?.signatures?.[fresh.userId!]?.[`ed25519:${sskPub}`], "Recovered identity must sign the current device");
+  const cs = new CrossSigning(crypto, fresh);
+  assert.equal(await cs.recoverWithRecovery(encodeRecoveryKey(new Uint8Array(32))), false, "Wrong recovery key cannot verify the device");
+  const badStorage = new SecretStorage(old.client);
+  assert.ok(await badStorage.deriveFromRecoveryKey(recoveryKey));
+  await badStorage.storeSecret(CS_SELF_SIGNING, btoa(String.fromCharCode(...new Uint8Array(32))));
+  await assert.rejects(new CrossSigning(crypto, fresh).recoverWithRecovery(recoveryKey), /do not match/, "Recovery must reject private seeds that do not match the server identity");
+});

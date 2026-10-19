@@ -59,3 +59,23 @@ test("cancelled screen selection never falls back to sharing a synthetic screen"
   t.after(() => { if (original) Object.defineProperty(globalThis, "navigator", original); else Reflect.deleteProperty(globalThis, "navigator"); });
   assert.equal(await new CallMedia("@test:example.org").acquireScreen(), null);
 });
+
+test("microphone capture failures propagate without creating replacement media", async t => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  let requested: MediaStreamConstraints | undefined;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { mediaDevices: {
+    getUserMedia: async (constraints: MediaStreamConstraints) => { requested = constraints; throw new DOMException("Microphone denied", "NotAllowedError"); },
+  } } });
+  t.after(() => { if (original) Object.defineProperty(globalThis, "navigator", original); else Reflect.deleteProperty(globalThis, "navigator"); });
+  await assert.rejects(new CallMedia("@test:example.org").acquire(false), /Microphone denied/);
+  assert.equal(requested?.video, false, "Audio-only entry must not request camera permission");
+});
+
+test("unavailable device and display capture never generate synthetic streams", async t => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { mediaDevices: {} } });
+  t.after(() => { if (original) Object.defineProperty(globalThis, "navigator", original); else Reflect.deleteProperty(globalThis, "navigator"); });
+  const media = new CallMedia("@test:example.org");
+  await assert.rejects(media.acquire(false), /capture is unavailable/);
+  assert.equal(await media.acquireScreen(), null);
+});

@@ -31,6 +31,7 @@ function cryptoAssets(): Plugin {
 
 export default defineConfig(({ command }) => ({
   root: path.join(root, "src/renderer"),
+  envDir: root,
   base: "./",
   plugins: [tailwindcss(), cryptoAssets(), {
     name: "grungus-development-csp",

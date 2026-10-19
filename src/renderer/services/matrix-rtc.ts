@@ -1,84 +1,50 @@
 /** MatrixRTC membership formats and media-key event transports. */
 import type { Room, RtcMembership, MatrixEvent, ToDeviceEvent, MediaKeysEvent } from "./matrix-types.ts";
 
+function focusUrl(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const focus = value as Record<string, unknown>;
+  return (focus.type === "livekit" || focus.focus === "livekit") && typeof focus.livekit_service_url === "string" ? focus.livekit_service_url : null;
+}
+
 export function rebuildRtcMemberships(room: Room): void {
   const now = Date.now();
-  const out: RtcMembership[] = [];
+  const sessions: { membership: RtcMembership; created: number; oldest: boolean; preferred: string | null }[] = [];
   for (const [stateKey, content] of room.callMembers) {
-    /* legacy format: per-user with m.calls[] */
-    const calls = content["m.calls"] as
-      | { "m.call_id"?: string; "m.devices"?: unknown[] }[]
-      | undefined;
+    const calls = content["m.calls"];
     if (Array.isArray(calls)) {
-      for (const call of calls) {
-        const devices = (call["m.devices"] ?? []) as Record<string, unknown>[];
-        for (const device of devices) {
-          const deviceId = typeof device.device_id === "string" ? device.device_id : "";
-          if (!deviceId) continue;
-          const expiresTs =
-            typeof device.expires_ts === "number" ? device.expires_ts : Infinity;
-          const foci = device.foci_active as { focus?: string; livekit_service_url?: string }[] | undefined;
-          const focusUrl = foci?.find((f) => f.focus === "livekit")?.livekit_service_url ?? null;
-          if (expiresTs !== Infinity && expiresTs <= now) continue;
-          out.push({
-            sender: stateKey,
-            deviceId,
-            callId: typeof call["m.call_id"] === "string" ? call["m.call_id"] : "",
-            expiresTs,
-            focusUrl,
-          });
+      for (const call of calls as { "m.call_id"?: string; "m.devices"?: Record<string, unknown>[] }[]) {
+        for (const device of call["m.devices"] ?? []) {
+          if (typeof device.device_id !== "string") continue;
+          const expiresTs = typeof device.expires_ts === "number" ? device.expires_ts : Infinity;
+          if (expiresTs <= now) continue;
+          const foci = Array.isArray(device.foci_active) ? device.foci_active : [];
+          sessions.push({ membership: { sender: stateKey, deviceId: device.device_id, callId: call["m.call_id"] ?? "", expiresTs, focusUrl: foci.map(focusUrl).find(Boolean) ?? null }, created: typeof device.created_ts === "number" ? device.created_ts : 0, oldest: false, preferred: null });
         }
       }
       continue;
     }
-    /* MSC4143 session format: per-device, flattened fields */
-    const deviceId = typeof content.device_id === "string" ? content.device_id : "";
-    if (!deviceId || content.application !== "m.call") continue;
-    const createdTs =
-      typeof content.created_ts === "number" ? content.created_ts : now;
+    if (content.application !== "m.call" || typeof content.device_id !== "string" || !content.device_id) continue;
+    if (content.scope && content.scope !== "m.room") continue;
+    if (content.call_id && content.call_id !== "ROOM") continue;
+    const created = typeof content.created_ts === "number" ? content.created_ts : 0;
     const expires = typeof content.expires === "number" ? content.expires : Infinity;
-    const expiresTs = expires === Infinity ? Infinity : createdTs + expires;
-    if (expiresTs !== Infinity && expiresTs <= now) continue;
-    /* focus_active ships in two shapes: the original { active_focus:
-       { focus, livekit_service_url } } and the current flattened
-       { type: "livekit", livekit_service_url } (what element-call's
-       parser requires) — read both */
-    const focusActive = content.focus_active as
-      | {
-          active_focus?: { focus?: string; livekit_service_url?: string };
-          type?: string;
-          livekit_service_url?: string;
-        }
-      | undefined;
-    const focusUrl =
-      focusActive?.active_focus?.focus === "livekit"
-        ? (focusActive.active_focus.livekit_service_url ?? null)
-        : focusActive?.type === "livekit"
-          ? (focusActive.livekit_service_url ?? null)
-          : null;
-    /* the sender: the state key is `[_]${userId}_${deviceId}_m.call`, and
-       user ids may themselves contain underscores — match against the
-       room's member list first, fall back to a prefix split */
+    const expiresTs = expires === Infinity ? Infinity : created + expires;
+    if (expiresTs <= now) continue;
+    const active = content.focus_active as Record<string, unknown> | undefined;
+    const preferred = (Array.isArray(content.foci_preferred) ? content.foci_preferred : []).map(focusUrl).find(Boolean) ?? null;
     const keyBody = stateKey.startsWith("_") ? stateKey.slice(1) : stateKey;
-    let sender: string | null = null;
-    for (const memberUserId of room.members.keys()) {
-      if (keyBody.startsWith(`${memberUserId}_`)) {
-        sender = memberUserId;
-        break;
-      }
-    }
-    if (!sender) {
-      sender = keyBody.includes("_") ? keyBody.slice(0, keyBody.indexOf("_")) : keyBody;
-    }
-    out.push({
-      sender,
-      deviceId,
-      callId: typeof content.call_id === "string" ? content.call_id : "",
-      expiresTs,
-      focusUrl,
-    });
+    const suffix = `_${content.device_id}_m.call`;
+    const sender = [...room.members.keys()].sort((a, b) => b.length - a.length).find(userId => keyBody.startsWith(`${userId}_`))
+      ?? (keyBody.endsWith(suffix) ? keyBody.slice(0, -suffix.length) : keyBody);
+    sessions.push({ membership: {
+      sender, deviceId: content.device_id, callId: typeof content.call_id === "string" ? content.call_id : "", expiresTs,
+      focusUrl: focusUrl(active) ?? focusUrl(active?.active_focus) ?? preferred,
+    }, created, oldest: active?.focus_selection === "oldest_membership", preferred });
   }
-  room.rtcMemberships = out;
+  sessions.sort((a, b) => a.created - b.created || a.membership.sender.localeCompare(b.membership.sender));
+  const oldestFocus = sessions[0]?.preferred ?? sessions[0]?.membership.focusUrl ?? null;
+  room.rtcMemberships = sessions.map(session => ({ ...session.membership, focusUrl: session.oldest ? oldestFocus : session.membership.focusUrl }));
 }
 
 export class MatrixRtc {

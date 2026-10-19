@@ -11,6 +11,7 @@ export function createRoomRecord(roomId: string): Room {
     topic: null,
     avatarMxc: null,
     isSpace: false,
+    roomType: null,
     creator: null,
     joinRule: null,
     isEncrypted: false,
@@ -40,6 +41,7 @@ export function applyStateEvent(room: Room, ev: MatrixEvent): void {
   const content = ev.content ?? {};
   switch (ev.type) {
     case "m.room.create":
+      room.roomType = typeof content.type === "string" ? content.type : null;
       room.isSpace = content.type === "m.space";
       room.creator = ev.sender ?? null;
       break;
@@ -89,7 +91,7 @@ export function applyStateEvent(room: Room, ev: MatrixEvent): void {
         typeof content.device_id === "string" &&
         content.device_id !== "";
       if (hasDevices || isSessionMembership) {
-        room.callMembers.set(ev.state_key, content);
+        room.callMembers.set(ev.state_key, { ...content, created_ts: typeof content.created_ts === "number" ? content.created_ts : ev.origin_server_ts ?? Date.now() });
       } else {
         room.callMembers.delete(ev.state_key);
       }
@@ -138,6 +140,7 @@ function applyDirectByAccountData(room: Room, joinedOthers: MemberRecord[], dire
 }
 
 export function resolveRoomMeta(room: Room, userId: string | null, directData: Record<string, unknown> | null): void {
+  room.directUserId = null;
   const joinedOthers: MemberRecord[] = [];
   for (const member of room.members.values()) {
     if (member.membership === "join" && member.userId !== userId) {
@@ -145,12 +148,17 @@ export function resolveRoomMeta(room: Room, userId: string | null, directData: R
     }
   }
 
+  const participants = [...room.members.values()].filter(member => member.userId !== userId && ["join", "invite"].includes(member.membership));
+  room.isDirect = !room.isSpace &&
+    ((!room.name && !room.canonicalAlias && joinedOthers.length === 1 && participants.length === 1) ||
+      applyDirectByAccountData(room, participants, directData));
+  const titlePeers = room.isDirect ? participants : joinedOthers;
   if (room.isSpace) {
     room.title = room.name || "Space";
   } else if (room.name) {
     room.title = room.name;
-  } else if (joinedOthers.length === 1) {
-    const other = joinedOthers[0]!;
+  } else if (titlePeers.length === 1) {
+    const other = titlePeers[0]!;
     room.title = other.displayname || mxidLocalpart(other.userId);
     room.directUserId = other.userId;
   } else if (room.canonicalAlias) {
@@ -159,10 +167,7 @@ export function resolveRoomMeta(room: Room, userId: string | null, directData: R
     room.title = "Empty room";
   }
 
-  room.isDirect =
-    !room.isSpace &&
-    ((!room.name && !room.canonicalAlias && joinedOthers.length === 1) ||
-      applyDirectByAccountData(room, joinedOthers, directData));
+  if (room.isDirect && participants.length === 1) room.directUserId = participants[0]!.userId;
   room.joinedMemberCount =
     joinedOthers.length +
     (isMember(room, userId) ? 1 : 0);

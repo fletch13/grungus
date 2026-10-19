@@ -6,6 +6,8 @@
  * (emoji chips with counts), edits (m.replace with "(edited)"),
  * and reply chains (m.in_reply_to with quoted parent).
  */
+import "./emoji-picker.ts";
+import { gifMessageUrl } from "../services/klipy.ts";
 import { el, formatTime } from "./ui.ts";
 import type { MatrixClient, MessageItem, Room } from "../services/matrix-client.ts";
 
@@ -28,6 +30,9 @@ const QUICK_REACTIONS = ["👍", "❤️", "😂", "🎉", "😮", "😢"];
 
 export class MessageItemElement extends HTMLElement {
   private _item: MessageItem | null = null;
+  private _reactionPicker: import("./emoji-picker.ts").EmojiPicker | null = null;
+  disconnectedCallback(): void { this._reactionPicker?.remove(); this._reactionPicker = null; }
+
 
   update(item: MessageItem, opts: MessageItemOptions, actions?: MessageActions): void {
     this._item = item;
@@ -37,6 +42,7 @@ export class MessageItemElement extends HTMLElement {
   private _render(opts: MessageItemOptions, actions: MessageActions): void {
     const item = this._item;
     if (!item) return;
+    this._reactionPicker?.remove(); this._reactionPicker = null;
     const client = opts.client;
 
     this.textContent = "";
@@ -52,10 +58,26 @@ export class MessageItemElement extends HTMLElement {
       toolbar.appendChild(replyBtn);
     }
     /* quick reactions */
-    for (const emoji of QUICK_REACTIONS.slice(0, 3)) {
+    for (const emoji of actions.onReact && item.id && !item.pending && !item.failed ? QUICK_REACTIONS.slice(0, 3) : []) {
       const rBtn = el("button", { class: "msg-toolbar-btn", title: `React ${emoji}`, text: emoji });
       rBtn.addEventListener("click", () => actions.onReact?.(item, emoji));
       toolbar.appendChild(rBtn);
+    }
+    if (actions.onReact && item.id && !item.pending && !item.failed) {
+      const choose = el("button", { type: "button", class: "msg-toolbar-btn", title: "Choose a reaction", "aria-label": "Choose a reaction", "aria-haspopup": "dialog", "aria-expanded": "false", text: "☺+" });
+      choose.addEventListener("click", () => {
+        if (!this._reactionPicker) {
+          const picker = document.createElement("emoji-picker");
+          picker.classList.add("reaction-emoji-picker");
+          picker.addEventListener("emoji-select", event => { actions.onReact?.(item, (event as CustomEvent<{ emoji: string }>).detail.emoji); choose.focus(); });
+          document.body.append(picker); this._reactionPicker = picker;
+        }
+        const rect = choose.getBoundingClientRect();
+        this._reactionPicker.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - 376))}px`;
+        this._reactionPicker.style.top = `${Math.max(8, Math.min(rect.bottom + 8, innerHeight - 440))}px`;
+        this._reactionPicker.toggle(choose);
+      });
+      toolbar.append(choose);
     }
     if (actions.onEdit && item.sender === opts.meUserId && item.id && !item.pending) {
       const editBtn = el("button", { class: "msg-toolbar-btn", title: "Edit", text: "✏️" });
@@ -199,6 +221,21 @@ export class MessageItemElement extends HTMLElement {
       body.style.color = "var(--text-muted)";
     } else {
       body.textContent = item.body;
+    }
+    const gifUrl = item.msgtype === "m.text" ? gifMessageUrl(item.body) : null;
+    if (gifUrl) {
+      body.replaceChildren();
+      const link = el("a", { href: gifUrl, target: "_blank", rel: "noopener noreferrer", text: "KLIPY GIF" });
+      const retry = el("button", { type: "button", class: "call-btn", text: "Retry GIF" });
+      const media = el("div");
+      const load = (): void => {
+        const image = el("img", { class: "remote-gif", src: gifUrl, alt: "GIF from KLIPY", loading: "lazy", decoding: "async", referrerpolicy: "no-referrer" });
+        image.addEventListener("error", () => image.replaceWith(retry));
+        media.replaceChildren(image);
+      };
+      retry.addEventListener("click", load);
+      load();
+      body.append(media, link);
     }
     /* "(edited)" indicator for m.replace'd messages */
     if (item.edited) {
