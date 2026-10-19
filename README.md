@@ -102,14 +102,20 @@ for an open protocol.
   it. Full MSC2746 semantics: party_id is the device id, the caller
   picks the first answerer (select_answer releases the losing
   devices), invites carry a 60s lifetime (stale ones never ring), and
-  the caller's hangup cancels the ring. Media is plain DTLS-SRTP — the
-  insertable-streams E2EE layer is mesh-only (Element cannot decrypt
-  Grungus's v1 frame format) — and screenshare stays on the
-  mesh/LiveKit paths (the legacy protocol has no renegotiation event).
-  Group rooms keep the MSC3401 mesh; LiveKit-focused calls (Element
-  Call) still join through the SFU, now probing the token endpoints
-  Element's lk-jwt-service serves (/session/get_token, /sfu/get,
-  /get_token) before the bare focus URL.
+  the caller's hangup cancels the ring. The chat header's 🎥 starts a
+  VIDEO call — the callee answers with their camera only when the
+  offer carries a video m-line — and screenshare rides the established
+  video sender via replaceTrack (Element-style: no renegotiation
+  event needed; the m.call.screenshare room event is a Grungus hint so
+  the peer stages the share — Element ignores it and simply sees the
+  video change). Audio-only 1:1 calls have no video m-line to ride, so
+  sharing there explains it needs a video call. Media is plain
+  DTLS-SRTP — the insertable-streams E2EE layer is mesh-only (Element
+  cannot decrypt Grungus's v1 frame format). Group rooms keep the
+  MSC3401 mesh; LiveKit-focused calls (Element Call) still join
+  through the SFU, now probing the token endpoints Element's
+  lk-jwt-service serves (/session/get_token, /sfu/get, /get_token)
+  before the bare focus URL.
 - **Discord-style layout** — space rail (servers), room/channel list,
   chat with grouped messages and day dividers, member list, composer.
 - **Spaces as servers** — Matrix Spaces appear in the left rail like

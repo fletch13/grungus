@@ -85,11 +85,6 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
 ];
 
-/* screen encoding caps — mesh bandwidth discipline: screens tolerate
-   low fps, text needs sharpness; ~1.5 Mbps instead of camera defaults */
-const SCREEN_MAX_BITRATE = 1_500_000;
-const SCREEN_MAX_FPS = 10;
-
 export class CallManager {
   private readonly client: MatrixClient;
   private _uiListener: ((state: CallUiState) => void) | null = null;
@@ -122,8 +117,6 @@ export class CallManager {
   /* screenshare state (this device as the sharer) */
   private _sharing = false;
   private _screenStream: MediaStream | null = null;
-  private _syntheticScreenCanvas: HTMLCanvasElement | null = null;
-  private _syntheticScreenTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(client: MatrixClient) {
     this.client = client;
@@ -289,11 +282,7 @@ export class CallManager {
       for (const track of this._screenStream.getTracks()) track.stop();
       this._screenStream = null;
     }
-    if (this._syntheticScreenTimer) {
-      clearInterval(this._syntheticScreenTimer);
-      this._syntheticScreenTimer = null;
-    }
-    this._syntheticScreenCanvas = null;
+    this._media.stopScreen();
     this._sharing = false;
   }
 
@@ -357,7 +346,7 @@ export class CallManager {
       for (const track of screenStream.getTracks()) {
         try {
           const sender = entry.pc.addTrack(track, screenStream);
-          this._capScreenSender(sender);
+          CallMedia.capScreenSender(sender);
           /* the share's frames encrypt too */
           if (this._mediaE2ee) {
             attachSenderTransform(
@@ -418,74 +407,7 @@ export class CallManager {
   }
 
   private async _acquireScreen(): Promise<{ stream: MediaStream; synthetic: boolean }> {
-    try {
-      const md = navigator.mediaDevices;
-      if (md && typeof md.getDisplayMedia === "function") {
-        const stream = await md.getDisplayMedia({
-          video: { frameRate: { ideal: SCREEN_MAX_FPS, max: SCREEN_MAX_FPS } },
-          audio: false,
-        });
-        for (const track of stream.getVideoTracks()) {
-          /* text/detail keeps small UI text sharp at low bitrates */
-          if (typeof track.contentHint === "string") track.contentHint = "detail";
-        }
-        return { stream, synthetic: false };
-      }
-    } catch (err) {
-      console.warn("[call] getDisplayMedia failed, falling back to synthetic screen:", err);
-    }
-    return { stream: this._syntheticScreen(), synthetic: true };
-  }
-
-  /** A synthetic screen: animated text canvas producing REAL RTP frames. */
-  private _syntheticScreen(): MediaStream {
-    const canvas = document.createElement("canvas");
-    canvas.width = 640;
-    canvas.height = 360;
-    this._syntheticScreenCanvas = canvas;
-    const ctx = canvas.getContext("2d")!;
-    let tick = 0;
-    const draw = (): void => {
-      tick += 1;
-      ctx.fillStyle = "#101319";
-      ctx.fillRect(0, 0, 640, 360);
-      ctx.fillStyle = "#7ee787";
-      ctx.font = "18px monospace";
-      const lines = [
-        "GRUNGUS — synthetic screen share",
-        "",
-        "$ grungus --share-screen",
-        "reading frame " + tick + " ...",
-        "",
-        "[ok] renegotiation: offer -> answer",
-        "[ok] screen track flowing (10 fps cap)",
-      ];
-      lines.forEach((line, i) => ctx.fillText(line, 16, 40 + i * 26));
-    };
-    draw();
-    this._syntheticScreenTimer = setInterval(draw, 100);
-    const stream = canvas.captureStream(SCREEN_MAX_FPS) as MediaStream;
-    for (const track of stream.getVideoTracks()) {
-      if (typeof track.contentHint === "string") track.contentHint = "text";
-    }
-    return stream;
-  }
-
-  /** Best-effort sender-side caps for the mesh (~1.5 Mbps, 10fps). */
-  private _capScreenSender(sender: RTCRtpSender): void {
-    try {
-      const params = sender.getParameters();
-      if (!params.encodings || params.encodings.length === 0) {
-        params.encodings = [{}];
-      }
-      params.encodings[0]!.maxBitrate = SCREEN_MAX_BITRATE;
-      params.encodings[0]!.maxFramerate = SCREEN_MAX_FPS;
-      void sender.setParameters(params).catch(() => {
-        /* encoder defaults then — caps are best-effort */
-      });
-    } catch {
-      /* getParameters unsupported — best-effort only */
-    }
+    return this._media.acquireScreen();
   }
 
   private async _broadcastSignal(type: string, content: Record<string, unknown>): Promise<void> {
@@ -674,7 +596,7 @@ export class CallManager {
       for (const track of this._screenStream.getTracks()) {
         try {
           const sender = pc.addTrack(track, this._screenStream);
-          this._capScreenSender(sender);
+          CallMedia.capScreenSender(sender);
         } catch (err) {
           console.error("[call] addTrack(screen) failed:", err);
         }

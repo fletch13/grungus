@@ -7,7 +7,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mediaConstraints } from "../src/renderer/services/call-media.ts";
+import { mediaConstraints, offerHasVideo } from "../src/renderer/services/call-media.ts";
 
 test("media constraints: defaults capture exactly audio, no video", () => {
   assert.deepEqual(mediaConstraints(false, { audioInput: "", videoInput: "" }), {
@@ -37,4 +37,16 @@ test("media constraints: both picks combine", () => {
   const c = mediaConstraints(true, { audioInput: "mic-1", videoInput: "cam-2" });
   assert.deepEqual(c.audio, { deviceId: { ideal: "mic-1" } });
   assert.deepEqual(c.video, { deviceId: { ideal: "cam-2" } });
+});
+
+test("offerHasVideo: an active video m-line is detected", () => {
+  assert.ok(offerHasVideo("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"));
+});
+
+test("offerHasVideo: audio-only SDP has no video", () => {
+  assert.ok(!offerHasVideo("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"));
+});
+
+test("offerHasVideo: a REJECTED video m-line (port 0) does not count", () => {
+  assert.ok(!offerHasVideo("v=0\r\nm=video 0 UDP/TLS/RTP/SAVPF 96\r\n"));
 });

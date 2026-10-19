@@ -563,7 +563,7 @@ function startShell(): void {
     }
   });
 
-  const startCall = (roomId: string): void => {
+  const startCall = (roomId: string, opts: { video?: boolean } = {}): void => {
     const room = active.getRoom(roomId);
     /* LiveKit path when the room has a Grungus service state OR an
        ongoing MatrixRTC call with a LiveKit focus (Element Call interop:
@@ -588,14 +588,14 @@ function startShell(): void {
       room?.isDirect || (room?.joinedMemberCount ?? 0) <= 2;
     if (isDirectRoom) {
       callMode = "p2p";
-      void p2pManager.start(roomId).catch((err: unknown) => {
+      void p2pManager.start(roomId, { video: opts.video === true }).catch((err: unknown) => {
         chat.setNotice(
           `Could not start call: ${err instanceof Error ? err.message : "network error"}`
         );
       });
       return;
     }
-    void callManager.start(roomId).catch((err: unknown) => {
+    void callManager.start(roomId, { video: opts.video === true }).catch((err: unknown) => {
       chat.setNotice(
         `Could not start call: ${err instanceof Error ? err.message : "network error"}`
       );
@@ -603,7 +603,8 @@ function startShell(): void {
   };
 
   chat.addEventListener("grungus:start-call", (event) => {
-    startCall((event as CustomEvent<{ roomId: string }>).detail.roomId);
+    const detail = (event as CustomEvent<{ roomId: string; video?: boolean }>).detail;
+    startCall(detail.roomId, { video: detail.video === true });
   });
 
   /* ---- settings (⚙ next to the name) ---- */

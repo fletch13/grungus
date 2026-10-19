@@ -12,18 +12,22 @@
  * rooms, exactly like Element's call events. party_id is the device id
  * (MSC2746); events from pre-2746 clients without one still work.
  *
- * Media is WebRTC DTLS-SRTP over a single peer connection. The
- * insertable-streams E2EE media layer is mesh-only (Element cannot
- * decrypt Grungus's v1 frame format), and screenshare needs mid-call
- * renegotiation the legacy protocol has no event for — both stay off
- * this path. Group rooms keep the MSC3401 mesh; LiveKit-focused calls
- * (Element Call) join through the SFU instead.
+ * Media is WebRTC DTLS-SRTP over a single peer connection, with video
+ * when the caller offers it (the callee answers with camera only then).
+ * Screenshare rides the ESTABLISHED video sender via replaceTrack —
+ * no renegotiation event needed (Element-style track swap); the
+ * m.call.screenshare room event is a Grungus hint so the peer's UI can
+ * stage the share (Element ignores it and just sees the video change).
+ * The insertable-streams E2EE media layer is mesh-only (Element cannot
+ * decrypt Grungus's v1 frame format). Group rooms keep the MSC3401
+ * mesh; LiveKit-focused calls (Element Call) join through the SFU
+ * instead.
  */
 
 import type { MatrixClient, MatrixEvent } from "./matrix-client.ts";
 import { mxidLocalpart } from "./matrix-client.ts";
 import type { CallParticipant, CallUiState } from "./calls.ts";
-import { CallMedia } from "./call-media.ts";
+import { CallMedia, offerHasVideo } from "./call-media.ts";
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
@@ -64,6 +68,14 @@ export class P2PCallManager {
   private _inviteTimer: ReturnType<typeof setTimeout> | null = null;
   private _notice: string | null = null;
   private _localMuted = false;
+  /** screenshare state: the screen rides the video sender (replaceTrack —
+   *  the legacy protocol has no renegotiation event) */
+  private _sharing = false;
+  private _screenStream: MediaStream | null = null;
+  /** the camera track to restore when the share stops */
+  private _cameraTrack: MediaStreamTrack | null = null;
+  private _remoteSharing = false;
+  private _remoteScreenStream: MediaStream | null = null;
 
   constructor(client: MatrixClient) {
     this.client = client;
@@ -101,13 +113,13 @@ export class P2PCallManager {
   /* ------------------------------ lifecycle ------------------------------ */
 
   /** Start an outgoing 1:1 call: send m.call.invite and ring their side. */
-  async start(roomId: string): Promise<void> {
+  async start(roomId: string, opts: { video?: boolean } = {}): Promise<void> {
     if (this._roomId !== null) return;
     this._roomId = roomId;
     this._role = "caller";
     this._callId = this._newCallId();
 
-    const media = await this._media.acquire(false);
+    const media = await this._media.acquire(opts.video === true);
     this._localStream = media.stream;
     this._notice = media.synthetic
       ? "No microphone/camera available — using a synthetic stream"
@@ -156,7 +168,8 @@ export class P2PCallManager {
     this._remoteUserId = pending.sender;
     this._remotePartyId = pending.senderPartyId;
 
-    const media = await this._media.acquire(false);
+    /* answer with camera only when the caller offered a video m-line */
+    const media = await this._media.acquire(offerHasVideo(pending.offer.sdp));
     this._localStream = media.stream;
     this._notice = media.synthetic
       ? "No microphone/camera available — using a synthetic stream"
@@ -247,9 +260,38 @@ export class P2PCallManager {
       this._handleSelectAnswer(sender, content);
     } else if (type === "m.call.candidates") {
       this._handleCandidates(content);
+    } else if (type === "m.call.screenshare") {
+      this._handleRemoteScreenshare(content);
     } else if (type === "m.call.hangup") {
       this._teardown();
     }
+  }
+
+  /** The peer swapped their camera for a screen (or back). */
+  private _handleRemoteScreenshare(content: Record<string, unknown>): void {
+    const active = content.active === true;
+    this._remoteSharing = active;
+    if (active) {
+      /* the incoming video track IS the screen now — move it to its own
+         wrapper stream so the stage layout picks it up */
+      if (!this._remoteScreenStream) this._remoteScreenStream = new MediaStream();
+      const camera = this._remoteStream?.getVideoTracks() ?? [];
+      for (const track of camera) {
+        this._remoteStream?.removeTrack(track);
+        this._remoteScreenStream.addTrack(track);
+      }
+    } else {
+      const screen = this._remoteScreenStream?.getVideoTracks() ?? [];
+      for (const track of screen) {
+        this._remoteScreenStream?.removeTrack(track);
+        this._remoteStream?.addTrack(track);
+      }
+      if (this._remoteScreenStream) {
+        for (const track of this._remoteScreenStream.getTracks()) track.stop();
+      }
+      this._remoteScreenStream = null;
+    }
+    this._emit();
   }
 
   private _handleInvite(
@@ -428,6 +470,15 @@ export class P2PCallManager {
     this._remoteStream = null;
     this._remoteUserId = null;
     this._remotePartyId = null;
+    if (this._screenStream) {
+      for (const track of this._screenStream.getTracks()) track.stop();
+      this._screenStream = null;
+    }
+    this._media.stopScreen();
+    this._cameraTrack = null;
+    this._sharing = false;
+    this._remoteSharing = false;
+    this._remoteScreenStream = null;
     this._pendingCandidates = [];
     this._pendingInvite = null;
     this._roomId = null;
@@ -445,55 +496,105 @@ export class P2PCallManager {
   }
 
   get localScreenStream(): MediaStream | null {
-    return null;
+    return this._screenStream;
   }
 
-  /** Screenshare needs mid-call renegotiation the legacy protocol lacks. */
-  startScreenshare(): void {
-    this._notice = "Screenshare isn't available in 1:1 calls yet";
+  /**
+   * Share the screen: the legacy protocol has no renegotiation event, so
+   * the screen REPLACES the camera on the established video sender
+   * (replaceTrack — no SDP change, Element-style). Audio-only calls
+   * have no video m-line to ride → the share needs a video call.
+   */
+  async startScreenshare(): Promise<void> {
+    if (!this.active || this._sharing) return;
+    const pc = this._pc;
+    if (!pc) return;
+    const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+    if (!sender) {
+      this._notice = "Screen sharing needs a video call — hang up and start one with 🎥";
+      this._emit();
+      return;
+    }
+    if (this._remoteSharing) {
+      this._notice = "The other side is sharing — one share at a time";
+      this._emit();
+      return;
+    }
+
+    const captured = await this._media.acquireScreen();
+    this._screenStream = captured.stream;
+    if (captured.synthetic) {
+      this._notice = "No display capture available — sharing a synthetic screen";
+    } else if (this._notice && this._notice.includes("synthetic")) {
+      this._notice = null;
+    }
+    this._cameraTrack = sender.track ?? null;
+    const screenTrack = captured.stream.getVideoTracks()[0];
+    if (!screenTrack) {
+      this._media.stopScreen();
+      this._screenStream = null;
+      return;
+    }
+    await sender.replaceTrack(screenTrack);
+    CallMedia.capScreenSender(sender);
+    this._sharing = true;
+    /* tell the peer their incoming video is now a screen (a Grungus
+       extension; Element just sees the video change) */
+    await this._sendCallEvent("m.call.screenshare", {
+      call_id: this._callId ?? "",
+      party_id: this.client.deviceId ?? undefined,
+      active: true,
+    }).catch(() => {});
     this._emit();
   }
 
-  stopScreenshare(): void {
-    if (this._notice === "Screenshare isn't available in 1:1 calls yet") {
-      this._notice = null;
-      this._emit();
+  async stopScreenshare(): Promise<void> {
+    if (!this._sharing) return;
+    const pc = this._pc;
+    const sender = pc?.getSenders().find((s) => s.track?.kind === "video");
+    if (pc && sender && this._cameraTrack) {
+      await sender.replaceTrack(this._cameraTrack).catch(() => {});
+      CallMedia.uncapSender(sender);
     }
+    if (this._screenStream) {
+      for (const track of this._screenStream.getTracks()) track.stop();
+    }
+    this._media.stopScreen();
+    this._screenStream = null;
+    this._cameraTrack = null;
+    this._sharing = false;
+    if (this._notice && this._notice.includes("synthetic screen")) {
+      this._notice = null;
+    }
+    await this._sendCallEvent("m.call.screenshare", {
+      call_id: this._callId ?? "",
+      party_id: this.client.deviceId ?? undefined,
+      active: false,
+    }).catch(() => {});
+    this._emit();
   }
 
   private _emit(): void {
     if (!this._uiListener) return;
     const participants: CallParticipant[] = [];
     const me = this.client.userId ?? "?";
-    if (this._roomId) {
+    if (this._roomId && (this._remoteStream || this._remoteScreenStream)) {
+      const room = this.client.getRoom(this._roomId);
+      const member = this._remoteUserId
+        ? room?.members.get(this._remoteUserId)
+        : undefined;
       participants.push({
-        key: `local|${this.client.deviceId ?? ""}`,
-        userId: me,
-        deviceId: this.client.deviceId ?? "",
-        name: "You",
-        stream: this._localStream,
-        screenStream: null,
-        sharing: false,
-        connectionState: "connected",
+        key: `${this._remoteUserId}|${this._remotePartyId ?? ""}`,
+        userId: this._remoteUserId ?? "",
+        deviceId: this._remotePartyId ?? "",
+        name:
+          member?.displayname ??
+          (this._remoteUserId ? mxidLocalpart(this._remoteUserId) : "?"),
+        stream: this._remoteStream,
+        screenStream: this._remoteScreenStream,
+        sharing: this._remoteSharing,
+        connectionState: this._pc?.connectionState ?? "connecting",
       });
-      if (this._remoteStream) {
-        const room = this.client.getRoom(this._roomId);
-        const member = this._remoteUserId
-          ? room?.members.get(this._remoteUserId)
-          : undefined;
-        participants.push({
-          key: `${this._remoteUserId}|${this._remotePartyId ?? ""}`,
-          userId: this._remoteUserId ?? "",
-          deviceId: this._remotePartyId ?? "",
-          name:
-            member?.displayname ??
-            (this._remoteUserId ? mxidLocalpart(this._remoteUserId) : "?"),
-          stream: this._remoteStream,
-          screenStream: null,
-          sharing: false,
-          connectionState: this._pc?.connectionState ?? "connecting",
-        });
-      }
     }
     this._uiListener({
       active: this._roomId !== null,
@@ -501,7 +602,7 @@ export class P2PCallManager {
       participants,
       notice: this._notice,
       localMuted: this._localMuted,
-      localSharing: false,
+      localSharing: this._sharing,
       localKey: me,
     });
   }

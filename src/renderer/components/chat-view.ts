@@ -172,6 +172,24 @@ export class ChatView extends HTMLElement {
         );
       });
       controls.appendChild(callBtn);
+      /* video call: the offer carries a camera m-line (and screenshare
+         needs one to ride) */
+      if (!this._callOngoing) {
+        const videoBtn = el("button", {
+          class: "call-btn-header",
+          text: "🎥",
+          title: "Start a video call",
+        });
+        videoBtn.addEventListener("click", () => {
+          this.dispatchEvent(
+            new CustomEvent("grungus:start-call", {
+              detail: { roomId: room.id, video: true },
+              bubbles: true,
+            })
+          );
+        });
+        controls.appendChild(videoBtn);
+      }
     }
     if (room.isEncrypted) {
       const verifyBtn = el("button", {
