@@ -7,7 +7,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mediaConstraints, offerHasVideo } from "../src/renderer/services/call-media.ts";
+import { CallMedia, mediaConstraints, offerHasVideo } from "../src/renderer/services/call-media.ts";
 
 test("media constraints: defaults capture exactly audio, no video", () => {
   assert.deepEqual(mediaConstraints(false, { audioInput: "", videoInput: "" }), {
@@ -49,4 +49,13 @@ test("offerHasVideo: audio-only SDP has no video", () => {
 
 test("offerHasVideo: a REJECTED video m-line (port 0) does not count", () => {
   assert.ok(!offerHasVideo("v=0\r\nm=video 0 UDP/TLS/RTP/SAVPF 96\r\n"));
+});
+
+test("cancelled screen selection never falls back to sharing a synthetic screen", async t => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: {
+    mediaDevices: { getDisplayMedia: async () => { throw new DOMException("Cancelled", "NotAllowedError"); } },
+  } });
+  t.after(() => { if (original) Object.defineProperty(globalThis, "navigator", original); else Reflect.deleteProperty(globalThis, "navigator"); });
+  assert.equal(await new CallMedia("@test:example.org").acquireScreen(), null);
 });

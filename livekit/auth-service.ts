@@ -14,20 +14,27 @@
  *     deployments — the client hands its session token to this service.
  *
  * POST /grungus/livekit/join
- *   { room: string, openid_token?: string, matrix_token?: string }
+ *   { room_id: string, openid_token?: string, matrix_token?: string }
  * → { token, url, room }
  *
  * Run: node livekit/auth-service.ts
- * Env: LK_URL, LK_API_KEY, LK_API_SECRET, HS_URL, VERIFY_MODE, PORT
+ * Env: LK_URL, LK_API_KEY, LK_API_SECRET, HS_URL, HS_AUTH_TOKEN, VERIFY_MODE, PORT
  */
 import http from "node:http";
 import jwt from "jsonwebtoken";
+import { authorizeRoom, liveKitRoomName } from "./authorization.ts";
 
 const LK_URL = process.env.LK_URL ?? "http://127.0.0.1:7880";
-const LK_API_KEY = process.env.LK_API_KEY ?? "devkey";
-const LK_API_SECRET = process.env.LK_API_SECRET ?? "secret";
+const LK_API_KEY = process.env.LK_API_KEY?.trim();
+const LK_API_SECRET = process.env.LK_API_SECRET;
 const HS_URL = process.env.HS_URL ?? "http://127.0.0.1:8008";
-const VERIFY_MODE = process.env.VERIFY_MODE === "whoami" ? "whoami" : "openid";
+const VERIFY_MODE = process.env.VERIFY_MODE ?? "openid";
+if (!LK_API_KEY || !LK_API_SECRET || LK_API_SECRET === "secret" || LK_API_KEY === "devkey") {
+  throw new Error("Set LK_API_KEY and LK_API_SECRET to non-default credentials");
+}
+if (VERIFY_MODE !== "openid" && VERIFY_MODE !== "whoami") throw new Error("VERIFY_MODE must be openid or whoami");
+const MAX_BODY_BYTES = 16 * 1024;
+const UPSTREAM_TIMEOUT_MS = 10_000;
 const PORT = Number(process.env.PORT ?? 8090);
 const TOKEN_TTL_S = 3600;
 
@@ -45,7 +52,7 @@ function send(res: http.ServerResponse, status: number, body: Record<string, unk
 async function verifyMatrixIdentity(body: Record<string, unknown>): Promise<string> {
   const errors: string[] = [];
 
-  /* try the standard OpenID path first (works when federation is enabled).
+  /* Use only the configured identity-verification mode.
      The token may arrive as a bare string (Grungus) or as the full
      OpenID token object (element-call's /sfu/get convention). */
   const rawOpenid = body.openid_token;
@@ -55,10 +62,11 @@ async function verifyMatrixIdentity(body: Record<string, unknown>): Promise<stri
       : rawOpenid && typeof rawOpenid === "object"
         ? String((rawOpenid as { access_token?: unknown }).access_token ?? "")
         : null;
-  if (openidToken) {
+  if (VERIFY_MODE === "openid" && openidToken) {
     try {
       const res = await fetch(
-        `${HS_URL}/_matrix/federation/v1/openid_userinfo?access_token=${encodeURIComponent(openidToken)}`
+        `${HS_URL}/_matrix/federation/v1/openid_userinfo?access_token=${encodeURIComponent(openidToken)}`,
+        { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) }
       );
       if (res.ok) {
         const data = (await res.json()) as { sub?: string };
@@ -70,12 +78,12 @@ async function verifyMatrixIdentity(body: Record<string, unknown>): Promise<stri
     }
   }
 
-  /* fall back to whoami verification (for homeservers with federation
-     disabled; the client sends its session token) */
+  /* Whoami mode requires an explicit deployment and client opt-in. */
   const matrixToken = typeof body.matrix_token === "string" ? body.matrix_token : null;
-  if (matrixToken) {
+  if (VERIFY_MODE === "whoami" && matrixToken) {
     const res = await fetch(`${HS_URL}/_matrix/client/v3/account/whoami`, {
       headers: { Authorization: `Bearer ${matrixToken}` },
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
     if (res.ok) {
       const data = (await res.json()) as { user_id?: string };
@@ -87,7 +95,7 @@ async function verifyMatrixIdentity(body: Record<string, unknown>): Promise<stri
   throw new Error(
     errors.length > 0
       ? `identity verification failed: ${errors.join("; ")}`
-      : "no openid_token or matrix_token provided"
+      : `A ${VERIFY_MODE === "openid" ? "openid_token" : "matrix_token"} is required`
   );
 }
 
@@ -107,7 +115,7 @@ function mintLiveKitToken(userId: string, room: string): string {
         canSubscribe: true,
       },
     },
-    LK_API_SECRET,
+    LK_API_SECRET!,
     { expiresIn: TOKEN_TTL_S }
   );
 }
@@ -132,44 +140,53 @@ const server = http.createServer((req, res) => {
     return;
   }
   const chunks: Buffer[] = [];
-  req.on("data", (c: Buffer) => chunks.push(c));
+  let received = 0;
+  let tooLarge = false;
+  req.setTimeout(15_000, () => { req.destroy(); });
+  req.on("error", () => { /* disconnected clients cannot receive a response */ });
+  req.on("data", (chunk: Buffer) => {
+    received += chunk.length;
+    if (received > MAX_BODY_BYTES) {
+      if (!tooLarge) send(res, 413, { error: "Request body exceeds 16 KiB" });
+      tooLarge = true;
+      chunks.length = 0;
+      return;
+    }
+    if (!tooLarge) chunks.push(chunk);
+  });
   req.on("end", () => {
+    if (tooLarge) return;
     void (async () => {
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as Record<
           string,
           unknown
         >;
-        /* "room" (Grungus) or "room_id" (Element Call's lk-jwt-service
-           convention — the MatrixRTC LiveKit room IS the matrix room) */
-        const room =
-          typeof body.room === "string"
-            ? body.room
-            : typeof body.room_id === "string"
-              ? body.room_id
-              : null;
-        /* Matrix room ids contain characters the strict room check
-           would reject — sanitize for the LiveKit room name while
-           keeping every matrix room distinct */
-        const safeRoom = room?.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 120) ?? null;
-        if (!safeRoom || !/^[\w-]{1,120}$/.test(safeRoom)) {
-          send(res, 400, { error: "invalid room name" });
-          return;
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          send(res, 400, { error: "Expected a JSON object" }); return;
         }
+        /* Authorize the actual Matrix room, never a caller-selected SFU name. */
+        const roomId = typeof body.room_id === "string" ? body.room_id : null;
+        if (!roomId) { send(res, 400, { error: "Matrix room_id is required" }); return; }
         const userId = await verifyMatrixIdentity(body);
+        await authorizeRoom(HS_URL, process.env.HS_AUTH_TOKEN, userId, roomId);
+        const safeRoom = liveKitRoomName(roomId);
         const token = mintLiveKitToken(userId, safeRoom);
         console.log(`[lk-auth] ${userId} → room "${safeRoom}" (${isJoin ? "join" : "sfu/get"})`);
         /* element-call's legacy path reads {url, jwt}; Grungus reads {url, token} */
         send(res, 200, { token, jwt: token, url: LK_URL, room: safeRoom });
       } catch (err) {
-        send(res, 403, { error: err instanceof Error ? err.message : String(err) });
+        send(res, err instanceof SyntaxError ? 400 : 403, { error: err instanceof Error ? err.message : String(err) });
       }
     })();
   });
 });
 
+server.headersTimeout = 15_000;
+server.requestTimeout = 15_000;
+
 server.listen(PORT, "127.0.0.1", () => {
   console.log(
-    `[lk-auth] up on http://127.0.0.1:${PORT} | mode=${VERIFY_MODE} | livekit=${LK_URL} | homeserver=${HS_URL}`
+    `[lk-auth] up on http://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port} | mode=${VERIFY_MODE} | livekit=${LK_URL} | homeserver=${HS_URL}`
   );
 });

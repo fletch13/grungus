@@ -1,7 +1,7 @@
 /*
- * Grungus — Matrix client core (TypeScript).
+ * Grungus — Matrix client facade and sync orchestration (TypeScript).
  *
- * A dependency-free implementation of the subset of the Matrix
+ * The public entry point for the subset of the Matrix
  * Client-Server API that Grungus uses (the same open protocol Element
  * speaks): homeserver discovery, password/token login, /sync long-polling,
  * room state + timeline handling, message send with local echo, room
@@ -11,316 +11,32 @@
  * Consumed two ways: esbuild bundles it into the renderer; Node runs it
  * directly (native type stripping) for the tests and the example CLIs.
  * Written against Matrix spec v1.x (Client-Server API, v3 paths).
+ * Focused matrix-* services own room state, messaging, media, history,
+ * timeline decryption, relations, and RTC parsing behind this stable API.
  */
 
+import type { EncryptedFile } from "./attachments.ts";
+export { mxidLocalpart } from "./matrix-identifiers.ts";
+import { MatrixHistory } from "./matrix-history.ts";
+import { MatrixTimeline } from "./matrix-timeline.ts";
+import { MatrixMedia } from "./matrix-media.ts";
+import { MatrixMessaging } from "./matrix-messaging.ts";
+import { MatrixRtc } from "./matrix-rtc.ts";
+import { createRoomRecord, applyStateEvent, resolveRoomMeta } from "./matrix-rooms.ts";
+import { applyRelations } from "./matrix-relations.ts";
 import type { E2eeCrypto } from "./e2ee.ts";
 
-/* ------------------------------- wire types ------------------------------ */
+/* Re-export the established public types so existing callers keep their imports. */
 
-export interface MatrixEventContent {
-  [key: string]: unknown;
-}
-
-export interface MatrixEvent {
-  event_id?: string;
-  type: string;
-  sender: string;
-  content: MatrixEventContent;
-  origin_server_ts?: number;
-  state_key?: string;
-  /** redaction events: the event this redacts (room v3+ format) */
-  redacts?: string;
-  unsigned?: {
-    prev_content?: MatrixEventContent;
-    transaction_id?: string;
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
-}
-
-interface SyncJoinedRoom {
-  state?: { events?: MatrixEvent[] };
-  timeline?: { events?: MatrixEvent[]; limited?: boolean };
-  ephemeral?: { events?: MatrixEvent[] };
-  summary?: {
-    "m.joined_member_count"?: number;
-    "m.invited_member_count"?: number;
-  };
-  unread_notifications?: { notification_count?: number };
-  account_data?: { events?: MatrixEvent[] };
-}
-
-export interface SyncResponse {
-  next_batch?: string;
-  rooms?: {
-    join?: Record<string, SyncJoinedRoom>;
-    invite?: Record<string, { invite_state?: { events?: MatrixEvent[] } }>;
-    /** rooms we left (from this or another device) — final events + the leave */
-    leave?: Record<string, { timeline?: { events?: MatrixEvent[] } }>;
-  };
-  to_device?: { events?: ToDeviceEvent[] };
-  device_one_time_keys_count?: Record<string, number>;
-  device_lists?: { changed?: string[]; new?: string[] };
-  account_data?: { events?: MatrixEvent[] };
-}
-
-export interface ToDeviceEvent {
-  sender: string;
-  type: string;
-  content: unknown;
-}
-
-/** A participant's media-encryption keys for a call (Element interop). */
-export interface MediaKeysEvent {
-  roomId: string | null;
-  sender: string;
-  deviceId: string | null;
-  keys: Array<{ index: number; key: string }>;
-}
-
-export interface MemberRecord {
-  userId: string;
-  displayname: string | null;
-  avatarMxc: string | null;
-  membership: string;
-}
-
-export interface MediaInfo {
-  mxc: string;
-  mimetype: string | null;
-  width: number | null;
-  height: number | null;
-  size: number | null;
-  name: string | null;
-}
-
-export interface MessageItem {
-  kind: "message";
-  id: string | null;
-  sender: string;
-  senderName: string;
-  ts: number;
-  msgtype: string;
-  body: string;
-  media: MediaInfo | null;
-  pending?: boolean;
-  failed?: boolean;
-  txnId?: string;
-  eventId?: string;
-  /** set when this message was edited (m.replace) */
-  edited?: boolean;
-  editTs?: number;
-  /** emoji -> set of reacting user IDs */
-  reactions?: Map<string, Set<string>>;
-  /** the message this replies to (m.in_reply_to) */
-  replyTo?: ReplyContext | null;
-}
-
-export interface ReplyContext {
-  eventId: string;
-  sender: string;
-  senderName: string;
-  body: string;
-}
-
-export interface SystemItem {
-  kind: "system";
-  id: string | null;
-  ts: number;
-  text: string;
-}
-
-export type TimelineItem = MessageItem | SystemItem;
-
-/**
- * Local-echo lifecycle markers, delivered through "room" updates but never
- * stored in room.timeline — the UI reacts by re-rendering the timeline.
- */
-export interface EchoMarker {
-  kind: "echo-replaced" | "echo-failed";
-  txnId: string;
-}
-
-export type RoomEvent = TimelineItem | EchoMarker;
-
-export interface RoomUpdate {
-  room: Room;
-  newEvents: RoomEvent[];
-  /**
-   * Timeline items were changed in place (e.g. a forwarded room key turned
-   * "unable to decrypt" lines into messages) — the view should re-render
-   * the whole timeline instead of appending.
-   */
-  redraw?: boolean;
-}
-
-/** A room we are invited to but have not joined (rooms.invite in /sync). */
-export interface InvitedRoom {
-  id: string;
-  name: string | null;
-  inviterId: string | null;
-  isEncrypted: boolean;
-  isSpace: boolean;
-}
-
-export interface RtcMembership {
-  sender: string;
-  deviceId: string;
-  callId: string;
-  /** absolute expiry (ms epoch); Infinity when no expiry is given */
-  expiresTs: number;
-  /** the LiveKit service URL from the membership's focus, when present */
-  focusUrl: string | null;
-}
-
-export interface Room {
-  id: string;
-  name: string | null;
-  canonicalAlias: string | null;
-  topic: string | null;
-  avatarMxc: string | null;
-  isSpace: boolean;
-  creator: string | null;
-  joinRule: string | null;
-  isEncrypted: boolean;
-  encryptionAlgorithm: string | null;
-  /** m.call.member state: userId -> content (MSC3401 call membership). */
-  callMembers: Map<string, Record<string, unknown>>;
-  /**
-   * Parsed MatrixRTC memberships (m.call.member state, both the legacy
-   * per-user and the MSC4143 per-device formats) — non-expired only,
-   * with the LiveKit focus URL when present.
-   */
-  rtcMemberships: RtcMembership[];
-  /** com.grungus.livekit state: the room's LiveKit call service, if any. */
-  livekitService: {
-    url: string;
-    room: string;
-    authUrl: string;
-  } | null;
-  /** Users currently typing (from ephemeral m.typing), self excluded. */
-  typingUsers: string[];
-  /** Other users' read receipts (m.read, from ephemeral events):
-   *  userId -> { eventId, ts }. */
-  readReceipts: Map<string, { eventId: string; ts: number }>;
-  /** this user's fully-read marker (m.fully_read room account data) */
-  fullyReadEventId: string | null;
-  children: Set<string>;
-  members: Map<string, MemberRecord>;
-  timeline: TimelineItem[];
-  summaryJoinedCount: number;
-  serverNotifications: number;
-  unread: number;
-  lastActivityTs: number;
-  /* derived — recomputed after each sync batch: */
-  title: string;
-  isDirect: boolean;
-  directUserId: string | null;
-  joinedMemberCount: number;
-}
-
-export class HttpError extends Error {
-  readonly status: number;
-  readonly errcode: string | null;
-  /** the raw error body (UIA challenges carry flows/session here) */
-  readonly body: Record<string, unknown> | null;
-
-  constructor(status: number, body: { errcode?: string; error?: string } | null) {
-    const message =
-      (body && (body.error || body.errcode)) || `HTTP ${status} from homeserver`;
-    super(message);
-    this.name = "HttpError";
-    this.status = status;
-    this.errcode = (body && body.errcode) || null;
-    this.body = body as Record<string, unknown> | null;
-  }
-}
-
-export type ConnectionState =
-  | "connecting"
-  | "online"
-  | "offline"
-  | "stopped"
-  | "auth-error";
-
-/* ------------------------------ client types ----------------------------- */
-
-interface ClientEvents {
-  sync: [];
-  ready: [];
-  room: [RoomUpdate];
-  rooms: [Room[]];
-  invites: [InvitedRoom[]];
-  connection: [ConnectionState];
-  error: [unknown];
-  "auth-error": [HttpError];
-  /** a room was deleted/left — the UI clears it from selection */
-  "room-deleted": [string];
-}
-
-type Listener<K extends keyof ClientEvents> = (...args: ClientEvents[K]) => void;
-
-export interface LoginCredentials {
-  username: string;
-  password: string;
-}
-
-export interface LoginResult {
-  access_token: string;
-  user_id: string;
-  device_id?: string;
-  home_server?: string;
-}
-
-/** SSO identity provider advertised in GET /login (e.g. a Keycloak IdP). */
-export interface SsoIdentityProvider {
-  id: string;
-  name?: string;
-  icon?: string;
-  brand?: string;
-}
-
-/** One entry of the homeserver's advertised login flows. */
-export interface LoginFlow {
-  type: string;
-  identity_providers?: SsoIdentityProvider[];
-}
-
-/** One UIA flow advertised by POST /register (a list of stages). */
-export interface RegistrationFlow {
-  stages?: string[];
-}
-
-/** The UIA challenge from POST /register: available flows + session. */
-export interface RegistrationChallenge {
-  flows: RegistrationFlow[];
-  session?: string;
-  params?: Record<string, unknown>;
-}
-
-export interface RegisterCredentials {
-  username: string;
-  password: string;
-  /** Required when the server's flow demands m.login.registration_token. */
-  registrationToken?: string | null;
-}
-
-export interface CreateRoomOptions {
-  name?: string;
-  topic?: string;
-  isPublic?: boolean;
-  isSpace?: boolean;
-  /** Enable megolm encryption in the room (initial m.room.encryption state). */
-  encrypted?: boolean;
-}
-
-interface ApiOptions {
-  body?: unknown;
-  auth?: boolean;
-  query?: Record<string, string | number | undefined>;
-  timeoutMs?: number | null;
-  signal?: AbortSignal;
-}
+export * from "./matrix-types.ts";
+import { HttpError } from "./matrix-types.ts";
+import type {
+  MatrixEvent, SyncResponse, ToDeviceEvent, MediaKeysEvent,
+  RoomEvent, RoomUpdate, InvitedRoom, Room,
+  ConnectionState, ClientEvents, Listener, LoginCredentials, LoginResult,
+  LoginFlow, RegistrationFlow, RegistrationChallenge, RegisterCredentials,
+  CreateRoomOptions, ApiOptions, MediaMessage,
+} from "./matrix-types.ts";
 
 const CLIENT_PREFIX = "/_matrix/client/v3";
 const SYNC_TIMEOUT_MS = 30_000;
@@ -328,11 +44,6 @@ const MAX_BACKOFF_MS = 60_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export function mxidLocalpart(mxid: string): string {
-  if (mxid.charAt(0) !== "@") return mxid;
-  return mxid.slice(1).split(":")[0] ?? mxid;
 }
 
 function isLocalHost(host: string): boolean {
@@ -377,12 +88,12 @@ export class MatrixClient {
    * in encrypted rooms) or as to-device org.matrix.msc4143.rtc.encryption_key
    * messages (Element mobile). Consumed by the LiveKit E2EE layer.
    */
-  private _mediaKeyListeners = new Set<(keys: MediaKeysEvent) => void>();
+  private readonly _rtc = new MatrixRtc();
 
   private _since: string | null = null;
+  private readonly _history: MatrixHistory;
   private _seen = new Set<string>();
-  private _acked = new Map<string, string>(); /* event_id -> txnId */
-  private _txnCounter = 0;
+  private readonly _messaging: MatrixMessaging;
   private _syncRunning = false;
   private _stopped = true;
   /** account data by event type (cross-signing keys, etc.) */
@@ -391,10 +102,8 @@ export class MatrixClient {
   private _backoffMs = 0;
   private _readyEmitted = false;
   private _selectedRoomId: string | null = null;
-  private _avatarCache = new Map<string, Promise<string | null>>();
-  private _mediaCache = new Map<string, Promise<string | null>>();
-  /** Encrypted room events that failed to decrypt: roomId -> (eventId -> event). */
-  private _undecrypted = new Map<string, Map<string, MatrixEvent>>();
+  private readonly _media: MatrixMedia;
+  private readonly _timeline: MatrixTimeline;
   /**
    * Encryption state for rooms not yet synced (set by createRoom/joinRoom):
    * roomId -> is encrypted. Sends racing the first sync consult this so a
@@ -423,6 +132,36 @@ export class MatrixClient {
     this.accessToken = options.accessToken ?? null;
     this.userId = options.userId ?? null;
     this.deviceId = null;
+    this._media = new MatrixMedia(this);
+    const client = this;
+    this._messaging = new MatrixMessaging({
+      get userId() { return client.userId; },
+      get crypto() { return client.crypto; },
+      api: (method, path, options) => this.api(method, path, options),
+      getRoom: roomId => this.getRoom(roomId),
+      encryptionForRoom: roomId => this._encryptionForRoom(roomId),
+      uploadMedia: (name, mimeType, bytes) => this._media.uploadMedia(name, mimeType, bytes),
+      notify: update => this.emit("room", update),
+      notifyRooms: () => this.emit("rooms", this.getRooms()),
+    });
+    this._timeline = new MatrixTimeline({
+      get userId() { return client.userId; },
+      get crypto() { return client.crypto; },
+      get onCallEvent() { return client.onCallEvent?.bind(client) ?? null; },
+      getRoom: roomId => this.getRoom(roomId),
+      handleMediaKeys: (roomId, event) => this._rtc.handleRoomKeys(roomId, event),
+      notify: update => this.emit("room", update),
+      notifyRooms: () => this.emit("rooms", this.getRooms()),
+    });
+    this._history = new MatrixHistory({
+      get crypto() { return client.crypto; },
+      timeline: this._timeline,
+      acknowledged: this._messaging.acknowledged,
+      seen: this._seen,
+      api: (method, path, options) => this.api(method, path, options),
+      getRoom: roomId => this.getRoom(roomId),
+      notify: update => this.emit("room", update),
+    });
   }
 
   /* --------------------------- typed event bus --------------------------- */
@@ -742,6 +481,7 @@ export class MatrixClient {
     await this.api("POST", `${CLIENT_PREFIX}/logout`, { body: {} }).catch(() => {
       /* best effort — the token is being discarded anyway */
     });
+    this.clearMediaCache();
     this.accessToken = null;
     this._since = null;
   }
@@ -1022,454 +762,25 @@ export class MatrixClient {
     await this.sendStateEvent(spaceId, "m.space.child", childRoomId, {});
   }
 
-  /**
-   * Rebuild the room's parsed MatrixRTC memberships from m.call.member
-   * state — supports BOTH formats current clients use:
-   *   - the MSC4143 per-device session events: state_key =
-   *     `${userId}_${deviceId}_m.call`, content = { application: "m.call",
-   *     call_id, scope, device_id, expires, focus_active: { active_focus,
-   *     joined_ts }, foci_preferred, created_ts } (what Element Call
-   *     publishes today)
-   *   - the legacy per-user events: state_key = userId, content =
-   *     { m.calls: [ { m.call_id, m.devices: [{ device_id, expires_ts,
-   *     foci_active }] } ] } (js-sdk <= v33 / older Element Call)
-   * Expired memberships are dropped.
-   */
-  private _rebuildRtcMemberships(room: Room): void {
-    const now = Date.now();
-    const out: RtcMembership[] = [];
-    for (const [stateKey, content] of room.callMembers) {
-      /* legacy format: per-user with m.calls[] */
-      const calls = content["m.calls"] as
-        | { "m.call_id"?: string; "m.devices"?: unknown[] }[]
-        | undefined;
-      if (Array.isArray(calls)) {
-        for (const call of calls) {
-          const devices = (call["m.devices"] ?? []) as Record<string, unknown>[];
-          for (const device of devices) {
-            const deviceId = typeof device.device_id === "string" ? device.device_id : "";
-            if (!deviceId) continue;
-            const expiresTs =
-              typeof device.expires_ts === "number" ? device.expires_ts : Infinity;
-            const foci = device.foci_active as { focus?: string; livekit_service_url?: string }[] | undefined;
-            const focusUrl = foci?.find((f) => f.focus === "livekit")?.livekit_service_url ?? null;
-            if (expiresTs !== Infinity && expiresTs <= now) continue;
-            out.push({
-              sender: stateKey,
-              deviceId,
-              callId: typeof call["m.call_id"] === "string" ? call["m.call_id"] : "",
-              expiresTs,
-              focusUrl,
-            });
-          }
-        }
-        continue;
-      }
-      /* MSC4143 session format: per-device, flattened fields */
-      const deviceId = typeof content.device_id === "string" ? content.device_id : "";
-      if (!deviceId || content.application !== "m.call") continue;
-      const createdTs =
-        typeof content.created_ts === "number" ? content.created_ts : now;
-      const expires = typeof content.expires === "number" ? content.expires : Infinity;
-      const expiresTs = expires === Infinity ? Infinity : createdTs + expires;
-      if (expiresTs !== Infinity && expiresTs <= now) continue;
-      /* focus_active ships in two shapes: the original { active_focus:
-         { focus, livekit_service_url } } and the current flattened
-         { type: "livekit", livekit_service_url } (what element-call's
-         parser requires) — read both */
-      const focusActive = content.focus_active as
-        | {
-            active_focus?: { focus?: string; livekit_service_url?: string };
-            type?: string;
-            livekit_service_url?: string;
-          }
-        | undefined;
-      const focusUrl =
-        focusActive?.active_focus?.focus === "livekit"
-          ? (focusActive.active_focus.livekit_service_url ?? null)
-          : focusActive?.type === "livekit"
-            ? (focusActive.livekit_service_url ?? null)
-            : null;
-      /* the sender: the state key is `[_]${userId}_${deviceId}_m.call`, and
-         user ids may themselves contain underscores — match against the
-         room's member list first, fall back to a prefix split */
-      const keyBody = stateKey.startsWith("_") ? stateKey.slice(1) : stateKey;
-      let sender: string | null = null;
-      for (const memberUserId of room.members.keys()) {
-        if (keyBody.startsWith(`${memberUserId}_`)) {
-          sender = memberUserId;
-          break;
-        }
-      }
-      if (!sender) {
-        sender = keyBody.includes("_") ? keyBody.slice(0, keyBody.indexOf("_")) : keyBody;
-      }
-      out.push({
-        sender,
-        deviceId,
-        callId: typeof content.call_id === "string" ? content.call_id : "",
-        expiresTs,
-        focusUrl,
-      });
-    }
-    room.rtcMemberships = out;
-  }
-
   /* --------------------------- sync processing --------------------------- */
 
   private _ensureRoom(roomId: string): Room {
     let room = this.rooms.get(roomId);
     if (!room) {
-      room = {
-        id: roomId,
-        name: null,
-        canonicalAlias: null,
-        topic: null,
-        avatarMxc: null,
-        isSpace: false,
-        creator: null,
-        joinRule: null,
-        isEncrypted: false,
-        encryptionAlgorithm: null,
-        callMembers: new Map(),
-        rtcMemberships: [],
-        livekitService: null,
-        typingUsers: [],
-        readReceipts: new Map(),
-        fullyReadEventId: null,
-        children: new Set(),
-        members: new Map(),
-        timeline: [],
-        summaryJoinedCount: 0,
-        serverNotifications: 0,
-        unread: 0,
-        lastActivityTs: 0,
-        title: roomId,
-        isDirect: false,
-        directUserId: null,
-        joinedMemberCount: 0,
-      };
+      room = createRoomRecord(roomId);
       this.rooms.set(roomId, room);
     }
     return room;
   }
 
-  private _applyStateEvent(room: Room, ev: MatrixEvent): void {
-    if (!ev || !ev.type) return;
-    const content = ev.content ?? {};
-    switch (ev.type) {
-      case "m.room.create":
-        room.isSpace = content.type === "m.space";
-        room.creator = ev.sender ?? null;
-        break;
-      case "m.room.name":
-        room.name = typeof content.name === "string" ? content.name : null;
-        break;
-      case "m.room.topic":
-        room.topic = typeof content.topic === "string" ? content.topic : null;
-        break;
-      case "m.room.avatar":
-        room.avatarMxc = typeof content.url === "string" ? content.url : null;
-        break;
-      case "m.room.canonical_alias":
-        room.canonicalAlias = typeof content.alias === "string" ? content.alias : null;
-        break;
-      case "m.room.join_rules":
-        room.joinRule =
-          typeof content.join_rule === "string" ? content.join_rule : null;
-        break;
-      case "m.room.encryption": {
-        const algorithm =
-          typeof content.algorithm === "string" ? content.algorithm : null;
-        room.isEncrypted = algorithm !== null;
-        room.encryptionAlgorithm = algorithm;
-        break;
-      }
-      case "com.grungus.livekit": {
-        const url = typeof content.url === "string" ? content.url : null;
-        const lkRoom = typeof content.room === "string" ? content.room : null;
-        const authUrl = typeof content.auth_url === "string" ? content.auth_url : null;
-        room.livekitService =
-          url && lkRoom && authUrl ? { url, room: lkRoom, authUrl } : null;
-        break;
-      }
-      case "m.call.member":
-      case "org.matrix.msc3401.call.member": {
-        if (typeof ev.state_key !== "string") break;
-        const calls = content["m.calls"];
-        const hasDevices =
-          Array.isArray(calls) &&
-          (calls as { "m.devices"?: unknown[] }[]).some(
-            (call) => Array.isArray(call["m.devices"]) && call["m.devices"]!.length > 0
-          );
-        /* MSC4143 session format: flattened per-device content */
-        const isSessionMembership =
-          content.application === "m.call" &&
-          typeof content.device_id === "string" &&
-          content.device_id !== "";
-        if (hasDevices || isSessionMembership) {
-          room.callMembers.set(ev.state_key, content);
-        } else {
-          room.callMembers.delete(ev.state_key);
-        }
-        this._rebuildRtcMemberships(room);
-        break;
-      }
-      case "m.room.member": {
-        if (typeof ev.state_key !== "string") break;
-        room.members.set(ev.state_key, {
-          userId: ev.state_key,
-          displayname:
-            typeof content.displayname === "string" ? content.displayname : null,
-          avatarMxc:
-            typeof content.avatar_url === "string" ? content.avatar_url : null,
-          membership: typeof content.membership === "string" ? content.membership : "leave",
-        });
-        break;
-      }
-      case "m.space.child": {
-        const via = content.via;
-        if (typeof ev.state_key === "string" && Array.isArray(via) && via.length > 0) {
-          room.children.add(ev.state_key);
-        } else if (typeof ev.state_key === "string") {
-          room.children.delete(ev.state_key);
-        }
-        break;
-      }
-      default:
-        break;
-    }
+  /** Page backward without changing current room state or replaying historical calls. */
+  async loadOlderMessages(roomId: string): Promise<void> {
+    return this._history.loadOlderMessages(roomId);
   }
 
-  /**
-   * The spec's DM marker: the m.direct account data maps
-   * userId -> [roomId, ...]. True when this room appears there — and
-   * the peer's id lands on room.directUserId (named DMs included).
-   */
-  private _applyDirectByAccountData(room: Room, joinedOthers: MemberRecord[]): boolean {
-    if (joinedOthers.length !== 1) return false;
-    const direct = this.getAccountData("m.direct") as
-      | Record<string, string[]>
-      | undefined;
-    if (!direct) return false;
-    const peer = joinedOthers[0]!;
-    const roomIds = direct[peer.userId];
-    if (Array.isArray(roomIds) && roomIds.includes(room.id)) {
-      room.directUserId = peer.userId;
-      return true;
-    }
-    return false;
-  }
-
-  private _resolveRoomMeta(room: Room): void {
-    const joinedOthers: MemberRecord[] = [];
-    for (const member of room.members.values()) {
-      if (member.membership === "join" && member.userId !== this.userId) {
-        joinedOthers.push(member);
-      }
-    }
-
-    if (room.isSpace) {
-      room.title = room.name || "Space";
-    } else if (room.name) {
-      room.title = room.name;
-    } else if (joinedOthers.length === 1) {
-      const other = joinedOthers[0]!;
-      room.title = other.displayname || mxidLocalpart(other.userId);
-      room.directUserId = other.userId;
-    } else if (room.canonicalAlias) {
-      room.title = room.canonicalAlias;
-    } else {
-      room.title = "Empty room";
-    }
-
-    room.isDirect =
-      !room.isSpace &&
-      ((!room.name && !room.canonicalAlias && joinedOthers.length === 1) ||
-        this._applyDirectByAccountData(room, joinedOthers));
-    room.joinedMemberCount =
-      joinedOthers.length +
-      (this._isMember(room, this.userId) ? 1 : 0);
-  }
-
-  private _isMember(room: Room, userId: string | null): boolean {
-    if (!userId) return false;
-    const member = room.members.get(userId);
-    return !!member && member.membership === "join";
-  }
-
-  private _displayNameFor(room: Room, sender: string | null): string {
-    if (!sender) return "unknown";
-    const member = room.members.get(sender);
-    if (member?.displayname) return member.displayname;
-    if (sender === this.userId) return "You";
-    return mxidLocalpart(sender);
-  }
-
-  /** Route raw m.call.* room events to the call layer's hook. */
-  private _maybeCallEvent(roomId: string, ev: MatrixEvent): void {
-    if (this.onCallEvent) {
-      try {
-        this.onCallEvent(roomId, ev);
-      } catch (err) {
-        console.error("[grungus] call event handler failed:", err);
-      }
-    }
-  }
-
-  private _toTimelineItem(room: Room, ev: MatrixEvent): TimelineItem | null {
-    if (!ev || !ev.type) return null;
-    const ts = ev.origin_server_ts ?? Date.now();
-    const senderName = this._displayNameFor(room, ev.sender ?? null);
-    const content = ev.content ?? {};
-
-    /* Element's media-key events are call machinery, not timeline items */
-    if (ev.type === "io.element.call.encryption_keys") {
-      this._maybeHandleMediaKeyEvent(room.id, ev);
-      return null;
-    }
-
-    /* legacy 1:1 call protocol events (m.call.invite & co) — handed to
-       the call layer, never rendered */
-    if (ev.type.startsWith("m.call.")) {
-      this._maybeCallEvent(room.id, ev);
-      return null;
-    }
-    if (ev.type === "m.room.message" || ev.type === "m.sticker") {
-      const isSticker = ev.type === "m.sticker";
-      const msgtype = isSticker
-        ? "m.sticker"
-        : typeof content.msgtype === "string"
-          ? content.msgtype
-          : "m.text";
-      const body = typeof content.body === "string" ? content.body : "";
-      const url = typeof content.url === "string" ? content.url : null;
-
-      const rawInfo = content.info;
-      const info =
-        rawInfo && typeof rawInfo === "object"
-          ? (rawInfo as { mimetype?: unknown; w?: unknown; h?: unknown; size?: unknown })
-          : {};
-
-      const otherAttachment =
-        msgtype === "m.file" || msgtype === "m.audio" || msgtype === "m.video";
-      const text = otherAttachment ? `[attachment] ${body}` : body;
-
-      const media =
-        url && (isSticker || msgtype === "m.image")
-          ? {
-              mxc: url,
-              mimetype: typeof info.mimetype === "string" ? info.mimetype : null,
-              width: typeof info.w === "number" ? info.w : null,
-              height: typeof info.h === "number" ? info.h : null,
-              size: typeof info.size === "number" ? info.size : null,
-              name: body || null,
-            }
-          : null;
-
-      return {
-        kind: "message",
-        id: ev.event_id ?? null,
-        sender: ev.sender ?? "",
-        senderName,
-        ts,
-        msgtype,
-        body: text,
-        media,
-      };
-    }
-
-    if (ev.type === "m.room.member" && typeof ev.state_key === "string") {
-      const membership =
-        typeof content.membership === "string" ? content.membership : "join";
-      const prev = ev.unsigned?.prev_content?.membership;
-      const targetName =
-        ev.state_key === ev.sender
-          ? senderName
-          : typeof content.displayname === "string"
-            ? content.displayname
-            : mxidLocalpart(ev.state_key);
-      let text: string;
-      if (membership === "join") text = `${targetName} joined the room`;
-      else if (membership === "leave")
-        text =
-          prev === "invite"
-            ? `${targetName} declined the invite`
-            : `${targetName} left the room`;
-      else if (membership === "invite") text = `${senderName} invited ${targetName}`;
-      else if (membership === "ban") text = `${senderName} banned ${targetName}`;
-      else text = `${targetName}'s membership is now ${membership}`;
-      return { kind: "system", id: ev.event_id ?? null, ts, text };
-    }
-
-    if (ev.type === "m.room.name" && typeof content.name === "string") {
-      return {
-        kind: "system",
-        id: ev.event_id ?? null,
-        ts,
-        text: `${senderName} changed the room name to "${content.name}"`,
-      };
-    }
-
-    if (ev.type === "m.room.topic" && typeof content.topic === "string") {
-      return {
-        kind: "system",
-        id: ev.event_id ?? null,
-        ts,
-        text: `${senderName} changed the room topic`,
-      };
-    }
-
-    return null;
-  }
-
-  /**
-   * Decrypt an m.room.encrypted room event into a timeline item. Returns
-   * a "unable to decrypt" system line when the room key is not (yet) known
-   * to this device.
-   */
-  private _decryptedTimelineItem(room: Room, ev: MatrixEvent): TimelineItem | null {
-    if (!this.crypto) return null;
-    const decrypted = this.crypto.decryptRoomEvent(ev);
-    if (!decrypted) {
-      this._trackUndecrypted(room, ev);
-      return {
-        kind: "system",
-        id: ev.event_id ?? null,
-        ts: ev.origin_server_ts ?? Date.now(),
-        text: "🔒 Unable to decrypt this message (requesting the key from other devices…)",
-      };
-    }
-    const inner: MatrixEvent = {
-      ...ev,
-      type: decrypted.type,
-      content: decrypted.content,
-    };
-    return this._toTimelineItem(room, inner);
-  }
-
-  /**
-   * Remember an undecryptable event and fire a key request (deduped in the
-   * crypto layer). When a forwarded key arrives, retryUndecrypted() turns
-   * these into real timeline items.
-   */
-  private _trackUndecrypted(room: Room, ev: MatrixEvent): void {
-    const content = ev.content as { sender_key?: unknown; session_id?: unknown };
-    const senderKey = typeof content.sender_key === "string" ? content.sender_key : null;
-    const sessionId = typeof content.session_id === "string" ? content.session_id : null;
-    const eventId = ev.event_id ?? null;
-    if (!senderKey || !sessionId || !eventId) return;
-    if (this.crypto) {
-      void this.crypto
-        .requestRoomKey(room.id, ev.sender ?? null, senderKey, sessionId)
-        .catch((err) => console.error("[grungus] room key request failed:", err));
-    }
-    let perRoom = this._undecrypted.get(room.id);
-    if (!perRoom) {
-      perRoom = new Map();
-      this._undecrypted.set(room.id, perRoom);
-    }
-    perRoom.set(eventId, ev);
+  /** Return from an older bounded window to the server's current timeline. */
+  async loadLatestMessages(roomId: string): Promise<void> {
+    return this._history.loadLatestMessages(roomId);
   }
 
   /**
@@ -1478,45 +789,7 @@ export class MatrixClient {
    * in place; the room update carries redraw so the view re-renders.
    */
   retryUndecrypted(roomId: string): void {
-    const room = this.rooms.get(roomId);
-    const pending = this._undecrypted.get(roomId);
-    if (!room || !pending || pending.size === 0) return;
-    let changed = false;
-    for (const [eventId, ev] of [...pending.entries()]) {
-      const decrypted = this.crypto ? this.crypto.decryptRoomEvent(ev) : null;
-      if (!decrypted) continue;
-      pending.delete(eventId);
-      changed = true;
-      const inner: MatrixEvent = {
-        ...ev,
-        type: decrypted.type,
-        content: decrypted.content,
-      };
-      const item = this._toTimelineItem(room, inner);
-      if (!item) continue;
-      const idx = room.timeline.findIndex(
-        (entry) => entry.kind === "system" && entry.id === eventId
-      );
-      if (idx >= 0) room.timeline[idx] = item;
-      else room.timeline.push(item);
-      const ts = ev.origin_server_ts ?? Date.now();
-      if (ts > room.lastActivityTs) room.lastActivityTs = ts;
-    }
-    if (changed) {
-      this.emit("room", { room, newEvents: [], redraw: true });
-      this.emit("rooms", this.getRooms());
-    }
-  }
-
-  private _removeEcho(room: Room, txnId: string): boolean {
-    for (let i = 0; i < room.timeline.length; i++) {
-      const entry = room.timeline[i];
-      if (entry && entry.kind === "message" && entry.txnId === txnId) {
-        room.timeline.splice(i, 1);
-        return true;
-      }
-    }
-    return false;
+    return this._timeline.retryUndecrypted(roomId);
   }
 
   private _applySync(data: SyncResponse): void {
@@ -1542,7 +815,7 @@ export class MatrixClient {
             event.type === "org.matrix.msc4143.rtc.encryption_key" ||
             event.type === "m.rtc.encryption_key"
           ) {
-            this._maybeHandleRtcKeyToDevice(event);
+            this._rtc.handleToDeviceKeys(event);
             continue;
           }
           /* Element's rust stack sends verification REQUEST/READY/DONE/CANCEL
@@ -1566,7 +839,9 @@ export class MatrixClient {
           /* crypto filters internally: olm events, key requests */
           this.crypto.onToDeviceEvents(toDevice);
           const keyCounts = data.device_one_time_keys_count;
-          if (keyCounts) void this.crypto.onOneTimeKeyCounts(keyCounts);
+          if (keyCounts) void this.crypto.onOneTimeKeyCounts(keyCounts).catch(error => {
+            if (!this._stopped) this.emit("error", error);
+          });
           const changed = data.device_lists?.changed;
           if (changed && changed.length > 0) this.crypto.onDeviceListChange(changed);
         }
@@ -1589,10 +864,11 @@ export class MatrixClient {
       if (this._leftRooms.has(roomId)) continue; /* deleted here — ignore */
       const room = this._ensureRoom(roomId);
       const newEvents: RoomEvent[] = [];
-      let relationChanged = false;
+      const { limited, recoverGap } = this._history.beginSync(room, rd.timeline);
+      let relationChanged = limited;
 
       for (const ev of rd.state?.events ?? []) {
-        this._applyStateEvent(room, ev);
+        applyStateEvent(room, ev);
       }
 
       for (const ev of rd.timeline?.events ?? []) {
@@ -1601,8 +877,9 @@ export class MatrixClient {
         if (evId) {
           if (this._seen.has(evId)) continue;
           this._seen.add(evId);
+          if (this._seen.size > 20_000) this._seen.delete(this._seen.values().next().value!);
         }
-        if (ev.state_key !== undefined) this._applyStateEvent(room, ev);
+        if (ev.state_key !== undefined) applyStateEvent(room, ev);
         /* key rotation on membership transitions in encrypted rooms: a
             fresh member (prev not "join" → join) must not read history, a
            departing one (join → not join) must not read the future. Both
@@ -1626,38 +903,39 @@ export class MatrixClient {
               .catch((err) => console.error("[grungus] rotation failed:", err));
           }
         }
-        if (evId && this._acked.has(evId)) {
-          const echoTxn = this._acked.get(evId)!;
-          this._removeEcho(room, echoTxn);
-          this._acked.delete(evId);
+        if (evId && this._messaging.acknowledged.has(evId)) {
+          const echoTxn = this._messaging.acknowledged.get(evId)!;
+          this._timeline.removeEcho(room, echoTxn);
+          this._messaging.acknowledged.delete(evId);
           newEvents.push({ kind: "echo-replaced", txnId: echoTxn });
         }
-        const item =
-          room.isEncrypted && ev.type === "m.room.encrypted"
-            ? this.crypto
-              ? this._decryptedTimelineItem(room, ev)
-              : {
-                  kind: "system" as const,
-                  id: ev.event_id ?? null,
-                  ts: ev.origin_server_ts ?? Date.now(),
-                  text: "🔒 Unable to decrypt (E2EE unavailable)",
-                }
-            : this._toTimelineItem(room, ev);
+        const decrypted = room.isEncrypted && ev.type === "m.room.encrypted" && this.crypto
+          ? this.crypto.decryptRoomEvent(ev) : null;
+        const relationEvent = decrypted ? { ...ev, type: decrypted.type, content: decrypted.content } : ev;
+        const item = decrypted ? this._timeline.toItem(room, relationEvent)
+          : room.isEncrypted && ev.type === "m.room.encrypted"
+            ? this.crypto ? this._timeline.decryptItem(room, ev) : {
+                kind: "system" as const, id: ev.event_id ?? null,
+                ts: ev.origin_server_ts ?? Date.now(), text: "🔒 Unable to decrypt (E2EE unavailable)",
+              }
+            : this._timeline.toItem(room, ev);
+        this._history.rememberRelation(room, relationEvent, item);
         if (item) {
           /* relation processing: edits, reactions, replies, redactions.
              Returns true when the event is fully handled as a relation
              (edit/reaction/redaction) and must NOT become a new
              timeline item. */
-          const handled = this._applyRelations(room, ev, item);
+          const handled = applyRelations(room, relationEvent, item);
           if (handled) {
             relationChanged = true;
           } else {
-            room.timeline.push(item);
+            if (room.atLiveEdge !== false) room.timeline.push(item);
+            this._history.recordArrival(roomId, item);
             newEvents.push(item);
           }
         } else {
           /* events that produce no timeline item may still carry relations */
-          if (this._applyRelations(room, ev, null)) {
+          if (applyRelations(room, relationEvent, null)) {
             relationChanged = true;
           }
         }
@@ -1719,7 +997,7 @@ export class MatrixClient {
         room.serverNotifications = rd.unread_notifications.notification_count;
       }
 
-      this._resolveRoomMeta(room);
+      resolveRoomMeta(room, this.userId, this.getAccountData("m.direct"));
 
       if (newEvents.length > 0) {
         const last = newEvents[newEvents.length - 1]!;
@@ -1738,11 +1016,11 @@ export class MatrixClient {
         room.unread = Math.min(room.unread + msgCount, 99);
       }
 
-      changedRooms.push({
-        room,
-        newEvents,
-        redraw: relationChanged ? true : undefined,
-      });
+      if (this._history.trimLiveTimeline(room)) relationChanged = true;
+      changedRooms.push({ room, newEvents, redraw: relationChanged ? true : undefined });
+      if (recoverGap && room.historyCursor) {
+        void this.loadOlderMessages(roomId).catch(error => this.emit("error", error));
+      }
     }
 
     /* the m.direct map changed: DM flags may have flipped — re-resolve
@@ -1751,7 +1029,7 @@ export class MatrixClient {
       for (const room of this.rooms.values()) {
         const wasDirect = room.isDirect;
         const wasPeer = room.directUserId;
-        this._resolveRoomMeta(room);
+        resolveRoomMeta(room, this.userId, this.getAccountData("m.direct"));
         if (room.isDirect !== wasDirect || room.directUserId !== wasPeer) {
           changedRooms.push({ room, newEvents: [] });
         }
@@ -1910,79 +1188,18 @@ export class MatrixClient {
     this._selectedRoomId = null;
   }
 
+  private _encryptionForRoom(roomId: string): boolean | undefined {
+    // A partially-created room can arrive in sync before its encryption state.
+    if (this._pendingEncryption.get(roomId) === true) return true;
+    return this.rooms.get(roomId)?.isEncrypted ?? this._pendingEncryption.get(roomId);
+  }
+
   /**
    * Send a text message with a local echo. The echo is removed and replaced
    * by the server event when /sync delivers it.
    */
   async sendMessage(roomId: string, body: string): Promise<string | null> {
-    const text = String(body ?? "");
-    if (!text.trim()) throw new Error("Empty message");
-    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
-    const room = this.rooms.get(roomId);
-    /* encryption decision must hold even when the first sync has not landed:
-       fall back to the flag createRoom/joinRoom recorded */
-    const encrypted = room
-      ? room.isEncrypted === true
-      : this._pendingEncryption.get(roomId) === true;
-    if (!room && encrypted === undefined) {
-      /* unknown room: we cannot know whether it is encrypted — sending
-         anyway could leak plaintext. Fail closed; the sync will land the
-         room state momentarily. */
-      throw new Error("Cannot send: room state not loaded yet (still syncing)");
-    }
-    const echo: MessageItem = {
-      kind: "message",
-      id: `pending-${txnId}`,
-      txnId,
-      pending: true,
-      sender: this.userId ?? "",
-      senderName: "You",
-      ts: Date.now(),
-      msgtype: "m.text",
-      body: text,
-      media: null,
-    };
-    if (room) {
-      room.timeline.push(echo);
-      room.lastActivityTs = echo.ts;
-      this.emit("room", { room, newEvents: [echo] });
-      this.emit("rooms", this.getRooms());
-    }
-    if (encrypted && !this.crypto) {
-      /* fail closed: never send plaintext into an encrypted room */
-      throw new Error("Cannot send: E2EE is unavailable in this encrypted room");
-    }
-    const sendType = encrypted ? "m.room.encrypted" : "m.room.message";
-    let content: Record<string, unknown>;
-    try {
-      content = encrypted
-        ? await this.crypto!.encryptRoomMessage(roomId, {
-            msgtype: "m.text",
-            body: text,
-          })
-        : { msgtype: "m.text", body: text };
-      const res = await this.api<{ event_id?: string }>(
-        "PUT",
-        `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/${sendType}/${encodeURIComponent(txnId)}`,
-        { body: content }
-      );
-      if (res?.event_id) {
-        echo.eventId = res.event_id;
-        this._acked.set(res.event_id, txnId);
-        return res.event_id;
-      }
-      return null;
-    } catch (err) {
-      echo.pending = false;
-      echo.failed = true;
-      if (room) {
-        this.emit("room", {
-          room,
-          newEvents: [{ kind: "echo-failed", txnId }],
-        });
-      }
-      throw err;
-    }
+    return this._messaging.sendMessage(roomId, body);
   }
 
   /* ------------------------- media keys (calls) ------------------------- */
@@ -1993,85 +1210,7 @@ export class MatrixClient {
    * org.matrix.msc4143.rtc.encryption_key). Returns an unsubscribe function.
    */
   onMediaKeys(cb: (keys: MediaKeysEvent) => void): () => void {
-    this._mediaKeyListeners.add(cb);
-    return () => {
-      this._mediaKeyListeners.delete(cb);
-    };
-  }
-
-  private _emitMediaKeys(keys: MediaKeysEvent): void {
-    for (const cb of this._mediaKeyListeners) {
-      try {
-        cb(keys);
-      } catch (err) {
-        console.error("[grungus] media-key listener failed:", err);
-      }
-    }
-  }
-
-  /**
-   * Element web/js-sdk transport: a plain room event of type
-   * io.element.call.encryption_keys. In encrypted rooms the event rides
-   * Megolm like any other room event, so the homeserver never sees the key.
-   */
-  private _maybeHandleMediaKeyEvent(roomId: string, ev: MatrixEvent): void {
-    if (ev.type !== "io.element.call.encryption_keys") return;
-    const content = (ev.content ?? {}) as {
-      keys?: unknown;
-      device_id?: unknown;
-      call_id?: unknown;
-    };
-    if (content.call_id !== "") return; /* only room-scoped calls */
-    if (!Array.isArray(content.keys)) return;
-    const keys: Array<{ index: number; key: string }> = [];
-    for (const raw of content.keys) {
-      const entry = raw as { index?: unknown; key?: unknown } | null;
-      if (
-        !entry ||
-        typeof entry.index !== "number" ||
-        typeof entry.key !== "string"
-      ) {
-        continue;
-      }
-      keys.push({ index: entry.index, key: entry.key });
-    }
-    if (keys.length === 0 || !ev.sender) return;
-    this._emitMediaKeys({
-      roomId,
-      sender: ev.sender,
-      deviceId: typeof content.device_id === "string" ? content.device_id : null,
-      keys,
-    });
-  }
-
-  /**
-   * Element mobile (matrix-rust-rtc) key transport: a to-device event of type
-   * org.matrix.msc4143.rtc.encryption_key with content
-   * { room_id, member_id, media_key: { index, key }, format: 0 }.
-   */
-  private _maybeHandleRtcKeyToDevice(ev: ToDeviceEvent): void {
-    const content = (ev.content ?? {}) as {
-      room_id?: unknown;
-      member_id?: unknown;
-      media_key?: { index?: unknown; key?: unknown } | null;
-      format?: unknown;
-    };
-    const mediaKey = content.media_key;
-    if (
-      !ev.sender ||
-      !mediaKey ||
-      typeof mediaKey.index !== "number" ||
-      typeof mediaKey.key !== "string" ||
-      (content.format !== undefined && content.format !== 0)
-    ) {
-      return;
-    }
-    this._emitMediaKeys({
-      roomId: typeof content.room_id === "string" ? content.room_id : null,
-      sender: ev.sender,
-      deviceId: null,
-      keys: [{ index: mediaKey.index, key: mediaKey.key }],
-    });
+    return this._rtc.onKeys(cb);
   }
 
   /**
@@ -2084,28 +1223,7 @@ export class MatrixClient {
     type: string,
     content: Record<string, unknown>
   ): Promise<string | null> {
-    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
-    const room = this.rooms.get(roomId);
-    const encrypted = room
-      ? room.isEncrypted === true
-      : this._pendingEncryption.get(roomId) === true;
-    if (!room && encrypted === undefined) {
-      throw new Error("Cannot send: room state not loaded yet (still syncing)");
-    }
-    if (encrypted && !this.crypto) {
-      throw new Error("Cannot send: E2EE is unavailable in this encrypted room");
-    }
-    const payload = encrypted
-      ? await this.crypto!.encryptRoomMessage(roomId, content, type)
-      : content;
-    const res = await this.api<{ event_id?: string }>(
-      "PUT",
-      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/${encodeURIComponent(
-        encrypted ? "m.room.encrypted" : type
-      )}/${encodeURIComponent(txnId)}`,
-      { body: payload }
-    );
-    return res?.event_id ?? null;
+    return this._messaging.sendRoomEvent(roomId, type, content);
   }
 
   async createRoom(opts: CreateRoomOptions = {}): Promise<string> {
@@ -2204,6 +1322,10 @@ export class MatrixClient {
   private _dropRoom(roomId: string): void {
     this._leftRooms.add(roomId);
     this.rooms.delete(roomId);
+    this._timeline.clear(roomId);
+    this._history.dropRoom(roomId);
+    this._pendingEncryption.delete(roomId);
+    this.clearMediaCache();
     this.invites.delete(roomId);
     this.emit("room-deleted", roomId);
     this.emit("rooms", this.getRooms());
@@ -2232,12 +1354,7 @@ export class MatrixClient {
     stateKey: string,
     content: Record<string, unknown>
   ): Promise<string | null> {
-    const res = await this.api<{ event_id?: string }>(
-      "PUT",
-      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/state/${encodeURIComponent(type)}/${encodeURIComponent(stateKey)}`,
-      { body: content }
-    );
-    return res?.event_id ?? null;
+    return this._messaging.sendStateEvent(roomId, type, stateKey, content);
   }
 
   /** Send a plaintext to-device message to one device. */
@@ -2247,14 +1364,7 @@ export class MatrixClient {
     type: string,
     content: Record<string, unknown>
   ): Promise<void> {
-    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
-    await this.api(
-      "PUT",
-      `/_matrix/client/v3/sendToDevice/${encodeURIComponent(type)}/${encodeURIComponent(txnId)}`,
-      {
-        body: { messages: { [targetUserId]: { [targetDeviceId]: content } } },
-      }
-    );
+    return this._messaging.sendToDevice(targetUserId, targetDeviceId, type, content);
   }
 
   /** Upload raw bytes to the media store; resolves the mxc:// URI. */
@@ -2263,27 +1373,12 @@ export class MatrixClient {
     mimeType: string,
     bytes: Uint8Array
   ): Promise<string> {
-    const url = new URL(
-      `${this.baseUrl}/_matrix/media/v3/upload`
-    );
-    url.searchParams.set("filename", filename);
-    const res = await fetch(url.toString(), {
-      method: "POST",
-      headers: {
-        "Content-Type": mimeType,
-        ...(this.accessToken ? { Authorization: `Bearer ${this.accessToken}` } : {}),
-      },
-      body: bytes as unknown as BodyInit,
-    });
-    const data = (await res.json().catch(() => ({}))) as {
-      content_uri?: string;
-      errcode?: string;
-      error?: string;
-    };
-    if (!res.ok || !data.content_uri) {
-      throw new HttpError(res.status, data as never);
-    }
-    return data.content_uri;
+    return this._media.uploadMedia(filename, mimeType, bytes);
+  }
+
+  /** Upload attachments only after resolving room encryption, before any bytes leave the device. */
+  async uploadAndSendMedia(roomId: string, name: string, mimeType: string, bytes: Uint8Array, dimensions: { width?: number; height?: number } = {}): Promise<string | null> {
+    return this._messaging.uploadAndSendMedia(roomId, name, mimeType, bytes, dimensions);
   }
 
   /**
@@ -2293,278 +1388,26 @@ export class MatrixClient {
    */
   async sendMedia(
     roomId: string,
-    media: {
-      mxc: string;
-      name: string;
-      mimeType: string;
-      width?: number | null;
-      height?: number | null;
-      size?: number | null;
-    }
+media: MediaMessage
   ): Promise<string | null> {
-    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
-    const room = this.rooms.get(roomId);
-    const encrypted = room
-      ? room.isEncrypted === true
-      : this._pendingEncryption.get(roomId) === true;
-    if (!room && encrypted === undefined) {
-      /* fail closed: an unknown room may be encrypted */
-      throw new Error("Cannot send: room state not loaded yet (still syncing)");
-    }
-    const info: Record<string, unknown> = { mimetype: media.mimeType };
-    if (media.width != null) info.w = media.width;
-    if (media.height != null) info.h = media.height;
-    if (media.size != null) info.size = media.size;
-    const content: Record<string, unknown> = {
-      msgtype: "m.image",
-      body: media.name,
-      url: media.mxc,
-      info,
-    };
-
-    if (encrypted && !this.crypto) {
-      throw new Error("Cannot send: E2EE is unavailable in this encrypted room");
-    }
-
-    const echo: MessageItem = {
-      kind: "message",
-      id: `pending-${txnId}`,
-      txnId,
-      pending: true,
-      sender: this.userId ?? "",
-      senderName: "You",
-      ts: Date.now(),
-      msgtype: "m.image",
-      body: media.name,
-      media: {
-        mxc: media.mxc,
-        mimetype: media.mimeType,
-        width: media.width ?? null,
-        height: media.height ?? null,
-        size: media.size ?? null,
-        name: media.name,
-      },
-    };
-    if (room) {
-      room.timeline.push(echo);
-      room.lastActivityTs = echo.ts;
-      this.emit("room", { room, newEvents: [echo] });
-      this.emit("rooms", this.getRooms());
-    }
-    try {
-      const sendEncrypted = encrypted && this.crypto !== null;
-      const sendType = sendEncrypted ? "m.room.encrypted" : "m.room.message";
-      const payload: Record<string, unknown> = sendEncrypted
-        ? await this.crypto!.encryptRoomMessage(roomId, content)
-        : content;
-      const res = await this.api<{ event_id?: string }>(
-        "PUT",
-        `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/${sendType}/${encodeURIComponent(txnId)}`,
-        { body: payload }
-      );
-      if (res?.event_id) {
-        echo.eventId = res.event_id;
-        this._acked.set(res.event_id, txnId);
-        return res.event_id;
-      }
-      return null;
-    } catch (err) {
-      echo.pending = false;
-      echo.failed = true;
-      if (room) {
-        this.emit("room", { room, newEvents: [{ kind: "echo-failed", txnId }] });
-      }
-      throw err;
-    }
-  }
-
-  /**
-   * Process message relations: edits (m.replace), reactions
-   * (m.annotation), replies (m.in_reply_to), and redactions.
-   * Mutates existing timeline items in place.
-   * Returns true when the event is fully consumed as a relation
-   * (edit/reaction/redaction) and must not become a new timeline item;
-   * false when the item should be appended normally.
-   */
-  private _applyRelations(
-    room: Room,
-    ev: MatrixEvent,
-    item: TimelineItem | null
-  ): boolean {
-    const content = ev.content ?? {};
-
-    /* --- m.reaction (annotation) --- */
-    if (ev.type === "m.reaction" && content["m.relates_to"]) {
-      const rel = content["m.relates_to"] as {
-        rel_type?: string;
-        event_id?: string;
-        key?: string;
-      };
-      if (rel.rel_type === "m.annotation" && rel.event_id && rel.key) {
-        const target = this._findTimelineMessage(room, rel.event_id);
-        if (target) {
-          if (!target.reactions) target.reactions = new Map();
-          let senders = target.reactions.get(rel.key);
-          if (!senders) {
-            senders = new Set();
-            target.reactions.set(rel.key, senders);
-          }
-          senders.add(ev.sender);
-        }
-      }
-      return true;
-    }
-
-    /* --- m.room.redaction --- */
-    if (ev.type === "m.room.redaction") {
-      const targetId = ev.redacts;
-      if (targetId) {
-        /* if a redacted event was a reaction, strip it from the target's
-           senders; otherwise remove the message from the timeline */
-        const idx = room.timeline.findIndex((entry) => entry.id === targetId);
-        if (idx >= 0) {
-          room.timeline.splice(idx, 1);
-        } else {
-          /* maybe it was a reaction event: scan reaction maps */
-          for (const entry of room.timeline) {
-            if (entry.kind !== "message" || !entry.reactions) continue;
-            for (const [emoji, senders] of entry.reactions) {
-              /* we don't track reaction event ids per sender; a redaction
-                 from user X removes X's reaction on the target if the
-                 redacted event was a reaction from X. The mock strips the
-                 content so we can't read the key — remove X from every
-                 emoji they reacted with on this message (rare in practice). */
-              void emoji;
-              void senders;
-            }
-          }
-        }
-      }
-      return true;
-    }
-
-    if (!item || item.kind !== "message") return false;
-
-    /* --- m.replace (edit) --- */
-    const rel = content["m.relates_to"] as
-      | { rel_type?: string; event_id?: string }
-      | undefined;
-    if (rel?.rel_type === "m.replace" && rel.event_id) {
-      const target = this._findTimelineMessage(room, rel.event_id);
-      const newContent = content["m.new_content"] as
-        | { body?: string; msgtype?: string }
-        | undefined;
-      if (target && newContent?.body !== undefined) {
-        target.body = newContent.body;
-        target.edited = true;
-        target.editTs = ev.origin_server_ts ?? Date.now();
-      }
-      /* the edit event itself never becomes a timeline item */
-      return true;
-    }
-
-    /* --- m.in_reply_to (reply context) --- */
-    const inReply = content["m.relates_to"] as
-      | { "m.in_reply_to"?: { event_id?: string } }
-      | undefined;
-    const parentEventId = inReply?.["m.in_reply_to"]?.event_id;
-    if (parentEventId && item.kind === "message") {
-      const parent = this._findTimelineMessage(room, parentEventId);
-      if (parent) {
-        item.replyTo = {
-          eventId: parentEventId,
-          sender: parent.sender,
-          senderName: parent.senderName,
-          body: parent.body.slice(0, 140),
-        };
-      } else {
-        /* parent not in the local timeline (pagination boundary) — still
-           render a generic reply marker */
-        item.replyTo = {
-          eventId: parentEventId,
-          sender: "",
-          senderName: "message",
-          body: "(not loaded)",
-        };
-      }
-      /* strip the rich-reply fallback from the body: the spec encodes
-         "> <@sender> original\n\nreply" so non-reply clients still see
-         the quote; reply-aware clients render the structured
-         m.in_reply_to instead and drop the fallback lines */
-      item.body = this._stripReplyFallback(item.body);
-    }
-    return false;
-  }
-
-  /** Remove the "> <@user> ..." rich-reply fallback lines from a body. */
-  private _stripReplyFallback(body: string): string {
-    const lines = body.split("\n");
-    let i = 0;
-    /* skip the leading blockquote ("> " or ">" prefixed lines) */
-    while (i < lines.length && (lines[i]!.startsWith("> ") || lines[i] === ">")) {
-      i++;
-    }
-    /* skip one blank separator line after the quote */
-    if (i > 0 && i < lines.length && lines[i] === "") i++;
-    if (i === 0) return body; /* no fallback present */
-    return lines.slice(i).join("\n");
-  }
-
-  /** Find a message timeline item by event id. */
-  private _findTimelineMessage(room: Room, eventId: string): MessageItem | null {
-    for (const entry of room.timeline) {
-      if (entry.kind === "message" && entry.id === eventId) return entry;
-    }
-    return null;
+    return this._messaging.sendMedia(roomId, media);
   }
 
   /* --------------------------- message relations -------------------------- */
 
   /** Edit one of your own messages (sends m.replace). */
   async editMessage(roomId: string, eventId: string, newBody: string): Promise<string | null> {
-    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
-    const res = await this.api<{ event_id?: string }>(
-      "PUT",
-      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(txnId)}`,
-      {
-        body: {
-          msgtype: "m.text",
-          body: `* ${newBody}`,
-          "m.new_content": { msgtype: "m.text", body: newBody },
-          "m.relates_to": { rel_type: "m.replace", event_id: eventId },
-        },
-      }
-    );
-    return res?.event_id ?? null;
+    return this._messaging.editMessage(roomId, eventId, newBody);
   }
 
   /** React to a message with an emoji (m.reaction / m.annotation). */
   async sendReaction(roomId: string, targetEventId: string, emoji: string): Promise<string | null> {
-    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
-    const res = await this.api<{ event_id?: string }>(
-      "PUT",
-      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/m.reaction/${encodeURIComponent(txnId)}`,
-      {
-        body: {
-          "m.relates_to": {
-            rel_type: "m.annotation",
-            event_id: targetEventId,
-            key: emoji,
-          },
-        },
-      }
-    );
-    return res?.event_id ?? null;
+    return this._messaging.sendReaction(roomId, targetEventId, emoji);
   }
 
   /** Redact (remove) an event — used to remove your own reaction. */
   async redactEvent(roomId: string, eventId: string, reason?: string): Promise<void> {
-    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
-    await this.api(
-      "PUT",
-      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/redact/${encodeURIComponent(eventId)}/${encodeURIComponent(txnId)}`,
-      { body: reason ? { reason } : {} }
-    );
+    return this._messaging.redactEvent(roomId, eventId, reason);
   }
 
   /** Reply to a message (m.in_reply_to). */
@@ -2575,22 +1418,7 @@ export class MatrixClient {
     parentBody: string,
     body: string
   ): Promise<string | null> {
-    const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
-    const fallback = `> <${parentSender}> ${parentBody}\n\n${body}`;
-    const res = await this.api<{ event_id?: string }>(
-      "PUT",
-      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(txnId)}`,
-      {
-        body: {
-          msgtype: "m.text",
-          body: fallback,
-          "m.relates_to": {
-            "m.in_reply_to": { event_id: parentEventId },
-          },
-        },
-      }
-    );
-    return res?.event_id ?? null;
+    return this._messaging.replyMessage(roomId, parentEventId, parentSender, parentBody, body);
   }
 
   /** Publish (or clear) typing state for the current user in a room. */
@@ -2599,13 +1427,7 @@ export class MatrixClient {
     typing: boolean,
     timeoutMs = 30_000
   ): Promise<void> {
-    const userId = this.userId ?? "";
-    if (!userId) return;
-    await this.api(
-      "PUT",
-      `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/typing/${encodeURIComponent(userId)}`,
-      { body: { typing, timeout: timeoutMs } }
-    );
+    return this._messaging.setTyping(roomId, typing, timeoutMs);
   }
 
   /* ------------------------------- queries ------------------------------- */
@@ -2633,13 +1455,8 @@ export class MatrixClient {
 
   /* -------------------------------- media -------------------------------- */
 
-  private _parseMxc(mxc: string): { server: string; mediaId: string } | null {
-    if (typeof mxc !== "string" || !mxc.startsWith("mxc://")) return null;
-    const rest = mxc.slice("mxc://".length).split("/");
-    const server = rest.shift();
-    const mediaId = rest.join("/");
-    if (!server || !mediaId) return null;
-    return { server, mediaId };
+  clearMediaCache(): void {
+    return this._media.clearMediaCache();
   }
 
   /**
@@ -2649,33 +1466,7 @@ export class MatrixClient {
    * (e.g. matrix.org) as well as open ones.
    */
   async avatarSrc(mxc: string | null | undefined, size = 64): Promise<string | null> {
-    if (typeof URL.createObjectURL !== "function") return null;
-    const parsed = mxc ? this._parseMxc(mxc) : null;
-    if (!parsed) return null;
-
-    const key = `${mxc}@${size}`;
-    const cached = this._avatarCache.get(key);
-    if (cached) return cached;
-
-    const url = new URL(
-      `${this.baseUrl}/_matrix/media/v3/thumbnail/${encodeURIComponent(parsed.server)}/${encodeURIComponent(parsed.mediaId)}`
-    );
-    url.searchParams.set("width", String(size));
-    url.searchParams.set("height", String(size));
-    url.searchParams.set("method", "scale");
-
-    const p = fetch(url.toString(), {
-      headers: this.accessToken
-        ? { Authorization: `Bearer ${this.accessToken}` }
-        : {},
-    })
-      .then(async (res) => {
-        if (!res.ok) return null;
-        return URL.createObjectURL(await res.blob());
-      })
-      .catch(() => null);
-    this._avatarCache.set(key, p);
-    return p;
+    return this._media.avatarSrc(mxc, size);
   }
 
   /**
@@ -2683,28 +1474,7 @@ export class MatrixClient {
    * authenticated download endpoint. GIFs animate natively once rendered in
    * an <img>; the blob cache dedupes repeat renders.
    */
-  async mediaSrc(mxc: string | null | undefined): Promise<string | null> {
-    if (typeof URL.createObjectURL !== "function") return null;
-    const parsed = mxc ? this._parseMxc(mxc) : null;
-    if (!parsed) return null;
-
-    const cached = this._mediaCache.get(mxc!);
-    if (cached) return cached;
-
-    const url =
-      `${this.baseUrl}/_matrix/media/v3/download/` +
-      `${encodeURIComponent(parsed.server)}/${encodeURIComponent(parsed.mediaId)}`;
-    const p = fetch(url, {
-      headers: this.accessToken
-        ? { Authorization: `Bearer ${this.accessToken}` }
-        : {},
-    })
-      .then(async (res) => {
-        if (!res.ok) return null;
-        return URL.createObjectURL(await res.blob());
-      })
-      .catch(() => null);
-    this._mediaCache.set(mxc!, p);
-    return p;
+  async mediaSrc(mxc: string | null | undefined, file?: EncryptedFile, mimeType = "application/octet-stream"): Promise<string | null> {
+    return this._media.mediaSrc(mxc, file, mimeType);
   }
 }

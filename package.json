@@ -14,7 +14,10 @@
     "test": "node --test",
     "dist": "npm run build && electron-builder --linux",
     "dist:dir": "npm run build && electron-builder --linux dir",
-    "dist:win": "npm run build && electron-builder --win"
+    "dist:win": "npm run build && electron-builder --win",
+    "test:ui": "node scripts/ui-check.mjs",
+    "test:e2e": "node tests/e2e-real-homeserver.ts",
+    "test:homeserver": "node scripts/homeserver-check.mjs"
   },
   "repository": {
     "type": "git",

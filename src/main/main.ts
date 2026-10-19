@@ -13,6 +13,8 @@
 import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
+import { chooseCaptureSource } from "./capture-picker.ts";
+import { CryptoVault } from "./crypto-vault.ts";
 import { startSsoLoopback, type SsoLoopback } from "./sso-loopback.ts";
 
 const SMOKE = process.argv.includes("--smoke");
@@ -23,7 +25,7 @@ function sessionPath(): string {
   return path.join(app.getPath("userData"), SESSION_FILE);
 }
 
-/* ---- session persistence (access token stays on the main-process side) ---- */
+/* ---- session persistence (access token encrypted at rest when available) ---- */
 
 ipcMain.handle("session:save", (_event, session: unknown): boolean => {
   const payload = JSON.stringify(session ?? null);
@@ -77,47 +79,17 @@ function cryptoVaultPath(): string {
   return path.join(app.getPath("userData"), CRYPTO_VAULT_FILE);
 }
 
-function readCryptoVault(): Record<string, string> {
-  try {
-    const raw = fs.readFileSync(cryptoVaultPath(), "utf8");
-    const parsed = JSON.parse(raw) as {
-      v?: number;
-      encrypted?: boolean;
-      data?: string;
-    };
-    if (!parsed || typeof parsed.data !== "string") return {};
-    const payload = parsed.encrypted
-      ? safeStorage.decryptString(Buffer.from(parsed.data, "base64"))
-      : parsed.data;
-    const map = JSON.parse(payload) as Record<string, string>;
-    return map && typeof map === "object" ? map : {};
-  } catch {
-    return {};
-  }
-}
-
-function writeCryptoVault(map: Record<string, string>): void {
-  const payload = JSON.stringify(map);
-  const stored = safeStorage.isEncryptionAvailable()
-    ? JSON.stringify({
-        v: 1,
-        encrypted: true,
-        data: safeStorage.encryptString(payload).toString("base64"),
-      })
-    : JSON.stringify({ v: 1, encrypted: false, data: payload });
-  fs.writeFileSync(cryptoVaultPath(), stored, { mode: 0o600 });
+function cryptoVault(): CryptoVault {
+  return new CryptoVault(cryptoVaultPath(), safeStorage);
 }
 
 ipcMain.handle("crypto:get", (_event, key: string): string | null => {
-  const map = readCryptoVault();
-  const k = String(key);
-  return Object.prototype.hasOwnProperty.call(map, k) ? map[k]! : null;
+  const map = cryptoVault().read();
+  return Object.prototype.hasOwnProperty.call(map, String(key)) ? map[String(key)]! : null;
 });
 
 ipcMain.handle("crypto:put", (_event, key: string, value: string): boolean => {
-  const map = readCryptoVault();
-  map[String(key)] = String(value);
-  writeCryptoVault(map);
+  cryptoVault().put(String(key), String(value));
   return true;
 });
 
@@ -232,17 +204,18 @@ function createWindow(): BrowserWindow {
     },
   });
 
-  /* screenshare: getDisplayMedia from the renderer — pick the primary
-     screen automatically (a source-picker UI can come later) */
+  let pickingCapture = false;
   win.webContents.session.setDisplayMediaRequestHandler(
-    async (_request, callback) => {
+    async (request, callback) => {
+      if (pickingCapture || request.frame !== win.webContents.mainFrame) { callback({}); return; }
+      pickingCapture = true;
       try {
-        const sources = await desktopCapturer.getSources({ types: ["screen"] });
-        const primary = sources[0];
-        callback(primary ? { video: primary, audio: "loopback" } : {});
+        const sources = await desktopCapturer.getSources({ types: ["screen", "window"], thumbnailSize: { width: 320, height: 180 } });
+        const choice = await chooseCaptureSource(win, sources, request.audioRequested && process.platform === "win32");
+        callback(choice ? { video: choice.source, ...(choice.audio ? { audio: "loopback" as const } : {}) } : {});
       } catch {
         callback({});
-      }
+      } finally { pickingCapture = false; }
     }
   );
 

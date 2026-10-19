@@ -15,5 +15,5 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "examples/**/*.ts"]
+  "include": ["src/**/*.ts", "tests/**/*.ts", "examples/**/*.ts", "livekit/**/*.ts"]
 }

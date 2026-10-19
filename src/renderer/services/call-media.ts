@@ -133,13 +133,13 @@ export class CallMedia {
   /* ------------------------------- screen -------------------------------- */
 
   /** Capture the screen for sharing (synthetic fallback on headless hosts). */
-  async acquireScreen(): Promise<AcquiredMedia> {
+  async acquireScreen(audio = true): Promise<AcquiredMedia | null> {
     try {
       const md = navigator.mediaDevices;
       if (md && typeof md.getDisplayMedia === "function") {
         const stream = await md.getDisplayMedia({
           video: { frameRate: { ideal: SCREEN_MAX_FPS, max: SCREEN_MAX_FPS } },
-          audio: false,
+          audio,
         });
         for (const track of stream.getVideoTracks()) {
           /* text/detail keeps small UI text sharp at low bitrates */
@@ -148,7 +148,8 @@ export class CallMedia {
         return { stream, synthetic: false };
       }
     } catch (err) {
-      console.warn("[call] getDisplayMedia failed, falling back to synthetic screen:", err);
+      console.warn("[call] screen capture cancelled or unavailable:", err);
+      return null;
     }
     return { stream: this._syntheticScreen(), synthetic: true };
   }

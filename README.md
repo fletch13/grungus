@@ -71,8 +71,8 @@ for an open protocol.
   a synthetic canvas/oscillator stream keeps calls working (with a
   visible notice) — handy on headless hosts.
 - **Screen sharing** — "Share screen" in the call overlay captures the
-  display (getDisplayMedia; in Electron the primary screen is picked
-  automatically) and adds it to every peer connection with mid-call
+  display (getDisplayMedia; in Electron a picker lists screens and windows, with system audio
+  off until explicitly selected on supported platforms) and adds it to every peer connection with mid-call
   renegotiation from either role (perfect negotiation with polite-side
   rollback). The active screen renders as a large presentation tile.
   Mesh bandwidth discipline: content-hinted screen encoding (~1.5 Mbps
@@ -391,9 +391,8 @@ for an open protocol.
   (locally-verified device → MSK → SSK → signed device) before
   trusting. Signatures use the spec's canonical JSON + Ed25519
   (accepted by conduwuit's server-side checks). Private-key
-  distribution to other own devices (SSSS secret storage) is a
-  follow-up — the bootstrapping device holds the signing keys; other
-  devices verify chains but cannot sign until SSSS ships. Cross-user
+  distribution to other own devices uses SSSS recovery and encrypted secret
+  sharing after own-device verification, so recovered devices can also sign. Cross-user
   USK signing exists; fetching OTHER users' MSKs depends on the server
   distributing them via /keys/query (Synapse does; this conduwuit
   build does not).
@@ -450,9 +449,10 @@ for an open protocol.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **esbuild** produces three outputs in `dist/`: the main process and
-  preload (CJS, `.cjs` because package.json is `type: module`) and the
-  renderer as ONE classic-script IIFE. A bundle is required: Chromium and
+- **esbuild** produces the main process, the app preload, and the capture
+  picker preload as CJS bundles (`.cjs` because package.json is `type:
+  module`). The app renderer and capture picker each have a classic-script
+  IIFE bundle in `dist/`. A bundle is required: Chromium and
   Electron block ES modules loaded from `file://` (CORS). libolm's
   universal wrapper needs fs/path/crypto shims when bundling for the
   browser (handled in scripts/build.mjs), and `olm.wasm` ships in `dist/`.
@@ -462,12 +462,32 @@ for an open protocol.
   `document.createElement("chat-view")` returns the right element class.
 - **Tests and examples run the .ts sources directly** on Node ≥ 24 via
   native type stripping — no separate build for the test suite.
-- No framework: native custom elements, one stylesheet.
+- No framework: native custom elements; separate styles for the app and capture picker.
 - The session and the E2EE identity pickles are stored encrypted via
   Electron's `safeStorage` when the platform keychain is available.
 - CSP: scripts and styles only from the app plus `'wasm-unsafe-eval'`
   (WebAssembly for libolm, without allowing `eval()`); `connect-src *`
   because the homeserver URL is user-configured.
+
+The `MatrixClient` public API and its existing imports remain the entry point
+for the app, tests, and examples. It owns authentication, account APIs, room
+lifecycle, and sync orchestration. Its implementation delegates to:
+
+| Module | Responsibility |
+|---|---|
+| [`matrix-types.ts`](src/renderer/services/matrix-types.ts) | Wire types, client event contracts, shared room/message shapes, HTTP errors |
+| [`matrix-rooms.ts`](src/renderer/services/matrix-rooms.ts) | Room defaults, current state, names, membership, and DM metadata |
+| [`matrix-messaging.ts`](src/renderer/services/matrix-messaging.ts) | Outgoing messages, encryption guards, local echoes, and transaction IDs |
+| [`matrix-media.ts`](src/renderer/services/matrix-media.ts) | Authenticated uploads/downloads, attachment decryption, and blob-cache ownership |
+| [`matrix-history.ts`](src/renderer/services/matrix-history.ts) | Pagination, sync-gap boundaries, bounded windows, and deferred relations |
+| [`matrix-timeline.ts`](src/renderer/services/matrix-timeline.ts) | Incoming timeline conversion, deferred decryption, and echo reconciliation |
+| [`matrix-relations.ts`](src/renderer/services/matrix-relations.ts) | Edits, reactions, replies, and redactions applied to timeline items |
+| [`matrix-rtc.ts`](src/renderer/services/matrix-rtc.ts) | RTC membership formats, media-key transports, and subscriptions |
+| [`matrix-identifiers.ts`](src/renderer/services/matrix-identifiers.ts) | Identifier display helpers |
+
+The services use explicit host interfaces or pure functions. They do not
+import the facade at runtime; the facade re-exports shared types and helpers
+so callers do not need to change their imports.
 
 ## Matrix protocol coverage
 
@@ -489,7 +509,7 @@ Client-Server API (v3 paths, spec v1.x):
 | Logout | `POST /_matrix/client/v3/logout` |
 | Device keys | `POST /keys/upload`, `POST /keys/query`, `POST /keys/claim` |
 | Room key sharing | `PUT /sendToDevice/m.room.encrypted/{txnId}` (olm) |
-| Avatars / media | `GET /_matrix/media/v3/{thumbnail,download}/…` (Bearer) |
+| Avatars / media | `GET /_matrix/client/v1/media/{thumbnail,download}/…` (Bearer; legacy media/v3 fallback) |
 | Calls (MSC3401) | `m.call.member` state; `m.call.negotiate` / `m.call.candidates` to-device (olm in encrypted rooms, plaintext otherwise) |
 
 Room state (names, topics, members, spaces, encryption) is derived from
@@ -584,24 +604,36 @@ In this mode the session and E2EE pickles are stored in `localStorage`
 
 ## Security notes
 
-- Renderer runs with `contextIsolation`, `sandbox`, no Node access;
-  the only bridge is a small `grungusPlatform` API (session + crypto vaults).
+- Renderer runs with `contextIsolation`, `sandbox`, and no Node access.
+  Its allowlisted `grungusPlatform` bridge handles persistence and SSO.
+  The separate capture-picker window has a restricted bridge for listing
+  sources and returning a selection.
 - Access tokens and olm identity pickles are stored via `safeStorage`
   (OS keychain) where available; the fallback plaintext file is written
   `0600` in the Electron user data directory and is documented here as a
   known trade-off. In browser dev mode pickles live in `localStorage`.
-- **E2EE is trust-on-first-use (v1)**: device keys are not verified (no
-  SAS/QR verification UI, no cross-signing), there is no key backup and
-  no key forwarding — a new device cannot decrypt history that predates
-  it, and outbound sessions are not rotated on membership change. Treat
-  it as protection against the server, not against device substitution.
+- **Device trust**: SAS and QR verification, cross-signing, and encrypted
+  secret storage are available. Newly sent room keys are currently shared
+  with all joined members' devices, including unverified ones; verification
+  does not enable a verified-devices-only sending policy. Verify device
+  identities or establish a trusted cross-signing chain when identity
+  assurance matters.
+- **History and recovery**: server-side encrypted key backup and restore
+  are supported. Room-key forwarding permits your own devices and verified
+  devices of other users. Sessions rotate on membership changes; a new
+  device needs a backup or an eligible forwarding device to recover older
+  history. Cross-signing seeds can be restored through SSSS or shared after
+  own-device verification.
 - Sends fail closed: an encrypted room without a working E2EE layer never
   receives plaintext.
-- **Calls**: signaling is olm-encrypted inside encrypted rooms; media is
-  WebRTC DTLS-SRTP, and in a full mesh there is no middleman. New rooms
-  are created with `m.call.member` permitted at power level 0 (the same
-  grant Element Call uses); in legacy rooms with restrictive power
-  levels, joining members cannot publish call state.
+- **Calls**: encrypted-room mesh signaling uses Olm; legacy 1:1 call events
+  use Megolm. WebRTC provides DTLS-SRTP transport encryption. Mesh calls add
+  frame encryption when insertable streams are available, and encrypted
+  LiveKit calls use the LiveKit E2EE worker. Legacy 1:1 calls use DTLS-SRTP
+  without Grungus's additional frame format for Element compatibility.
+  Matrix call membership and room metadata remain visible to the server.
+  New rooms permit `m.call.member` at power level 0; restrictive power
+  levels in existing rooms can prevent members from publishing call state.
 - Messages render as text only; HTML from other clients is not executed.
 - Media is fetched with authenticated requests (Bearer header) and
   rendered from blob object URLs — compatible with homeservers that
@@ -609,23 +641,26 @@ In this mode the session and E2EE pickles are stored in `localStorage`
 
 ## Testing
 
-Four layers, all driving the same typed client modules that ship in the app:
+Checks exercise the typed client modules and custom elements that ship in the app:
 
 1. **Typecheck** — `npm run typecheck` (`tsc --noEmit`, strict, across
-   src/tests/examples).
-2. **Integration tests vs an in-repo mock homeserver** — `npm test`
-   (login, sync, bidirectional messages, local echo, unread, DM
-   resolution, spaces, media metadata, auth-error handling, E2EE: key
-   upload, encrypted round-trips both ways with real libolm identities,
-   plaintext-rooms regression).
-3. **Real-homeserver e2e** — `tests/e2e-real-homeserver.ts` (run manually
-   against conduwuit/Synapse/matrix.org-style servers; exercises UIA
-   registration, real sync, real state events, authenticated media, and
-   a full E2EE round-trip including a server-side check that stored
-   events are opaque megolm ciphertext). See the header of that file for
-   the env vars.
-4. **CI** — typecheck + tests + an Electron boot smoke test
-   (`electron . --smoke` under xvfb on ubuntu-latest).
+   src/tests/examples/livekit).
+2. **Integration tests vs an in-repo mock homeserver** — `npm test` covers
+   authentication, sync, messages and relations, history, media, calls,
+   verification, cross-signing, key recovery, and fail-closed encryption.
+3. **Renderer interactions** — `npm run test:ui` runs sandboxed Electron
+   checks for capture selection/cancellation, audio consent, image retry,
+   safe text rendering, and bounded history navigation.
+4. **Real-homeserver e2e** — `npm run test:homeserver` starts a disposable
+   Synapse instance and checks real pagination, encrypted chat and media,
+   verification, key forwarding, rotation, invites, and backup restoration.
+   To use another server, run `npm run test:e2e` with the environment
+   variables documented in `tests/e2e-real-homeserver.ts`.
+5. **Electron boot** — `npm run smoke` builds the application, opens its
+   window, and exits after it becomes ready.
+
+CI runs these checks on Ubuntu, using Xvfb for Electron and a separate
+Synapse interoperability job, and packages Linux and Windows distributables.
 
 The E2EE layer has also been verified in a real browser against a real
 homeserver: bidirectional encrypted chat with a headless second device,
@@ -709,3 +744,83 @@ the same client from Node — handy for debugging and demos.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### LiveKit room authorization
+
+The bundled token service requires `HS_AUTH_TOKEN`, the access token of a
+service account joined to every Matrix room it serves. It checks the requesting
+user's current `m.room.member` state before issuing a LiveKit token. Missing
+configuration, inaccessible rooms, and users who have left are denied.
+Clients must send the actual Matrix room ID as `room_id`; `room` is no longer
+an authorization input. LiveKit room names are derived from the SHA-256 hash
+of the complete Matrix room ID, so custom names and truncated/sanitized names
+are no longer used by this service. Upgrade the service and clients together,
+and restart existing calls when migrating. This service-account approach
+requires inviting the account into private rooms; deployments requiring
+membership checks without a joined account need a homeserver-side integration.
+
+### Attachment and vault protection
+
+Images sent into encrypted rooms use Matrix encrypted attachments v2: the
+client uploads ciphertext and includes its key, IV, and ciphertext hash only
+inside the encrypted room message. Downloads verify the hash before decrypting.
+Previously uploaded plaintext media remains on the server; this change does
+not retroactively encrypt it. Raw `sendMedia` calls are refused in encrypted
+rooms; use `uploadAndSendMedia` instead.
+
+Desktop crypto-vault updates use an atomic replacement and retain the previous
+valid file as `grungus-crypto-vault.json.bak` in the user-data directory. An
+unreadable vault or locked keychain produces an error instead of initializing
+an empty vault. Unlock the keychain and retry; if the file is corrupted, close
+the app and restore a known-good vault backup before restarting. Backups can
+lag the latest session writes, so preserve both files before recovery.
+
+### History and memory limits
+
+Use **Earlier messages**, **Newer messages**, and **Latest messages** above the
+chat to browse history. History uses the homeserver's `/messages` tokens and
+preserves chronological order, edits, and reactions across pages. A limited
+sync starts a fresh contiguous window and automatically fetches the first
+missing page; Earlier messages continues backward if the gap is larger.
+Historical state does not replace current room state, and old call events do
+not ring again.
+
+Each room retains up to 1,000 timeline items, and the chat renders at most 100
+at once. Paging beyond that window drops its newer end; Latest messages
+returns to the current server timeline. Media and avatar caches retain at
+most 128 entries each (64 MiB and 8 MiB respectively), release blob URLs on
+eviction/logout, and allow failed downloads to be retried. An individual
+image larger than the media cache limit is not displayed inline.
+
+### Screen sharing
+
+The desktop app asks which screen or window to share. Share stays disabled
+until a source is selected; cancelling never starts a synthetic share. System
+audio is off by default and can be explicitly enabled for supported Windows
+mesh/SFU captures. Legacy 1:1 calls share video only. Synthetic capture remains
+available when the display-capture API itself is absent in test environments.
+
+### Token-service configuration
+
+Set non-default `LK_API_KEY` and `LK_API_SECRET`; the service refuses missing
+or development credentials. `VERIFY_MODE=openid` is the default and accepts
+only OpenID proofs. Trusted deployments using session-token authentication
+must explicitly set `VERIFY_MODE=whoami` and `auth_mode: "whoami"` in their
+`com.grungus.livekit` room state. OpenID clients no longer include their session
+token as an automatic fallback. Identity and membership requests time out
+after 10 seconds; JSON request bodies are limited to 16 KiB, with 15-second
+HTTP request/header deadlines.
+
+### Additional automated checks
+
+```bash
+npm run test:ui          # sandboxed Electron renderer interaction checks; needs a display
+npm run test:homeserver  # disposable Synapse 1.160.0 via Docker
+CONTAINER_RUNTIME=podman npm run test:homeserver
+```
+
+The Synapse runner binds an ephemeral port on loopback and removes its own
+container and volume afterward. `SYNAPSE_IMAGE` overrides the pinned version.
+CI runs renderer checks under Xvfb and runs the real-homeserver suite in a
+separate job, alongside the mock integration tests and strict typechecking
+(which includes the deployable token service).

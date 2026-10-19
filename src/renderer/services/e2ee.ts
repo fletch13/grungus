@@ -11,13 +11,14 @@
  *     to every member device
  *   - decryption of m.room.encrypted room events and to-device payloads
  *
- * Known v1 limits (deliberate, documented in the README):
- *   - trust-on-first-use: device keys are not verified (no SAS UI);
- *     there is no cross-signing, no key backup, no key forwarding, and
- *     no room-key rotation on membership change.
- *   - identity/session pickles are stored via the injected CryptoStore
- *     (OS-keychain-encrypted file in Electron, localStorage in browser
- *     dev mode, memory in tests).
+ * Device trust and recovery:
+ *   - SAS/QR verification and cross-signing are provided by the verification
+ *     and cross-signing services. Outbound keys are shared with all joined
+ *     member devices, including unverified devices.
+ *   - Backup/restore, own-device and verified-device forwarding, and outbound
+ *     session rotation on membership changes are supported here.
+ *   - Identity/session pickles use the injected CryptoStore (safeStorage-backed
+ *     vault in Electron, localStorage in browser dev mode, memory in tests).
  */
 
 import * as OlmNs from "@matrix-org/olm";
@@ -1415,6 +1416,7 @@ export class E2eeCrypto {
           body: {
             first_message_index: entry.session.first_known_index(),
             forwarded_count: 0,
+            is_verified: false,
             session_data: envelope,
           },
         }

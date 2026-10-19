@@ -258,20 +258,13 @@ export class LkCallManager {
     }
     this._matrixRtc = matrixRtc;
 
-    /* prove our Matrix identity to the token service — send BOTH the
-       scoped OpenID token and (as fallback for services on homeservers
-       with federation disabled) the session token; the service picks */
+    // Session-token authentication is explicitly enabled only for a trusted custom service.
     let authBody: Record<string, unknown>;
-    try {
+    if (service?.authMode === "whoami") {
+      authBody = { room: lkRoom, room_id: roomId, matrix_token: this.client.accessToken };
+    } else {
       const openid = await this.client.requestOpenIdToken();
-      authBody = {
-        room: lkRoom,
-        room_id: lkRoom,
-        openid_token: openid.access_token,
-        matrix_token: this.client.accessToken,
-      };
-    } catch {
-      authBody = { room: lkRoom, room_id: lkRoom, matrix_token: this.client.accessToken };
+      authBody = { room: lkRoom, room_id: roomId, openid_token: openid.access_token };
     }
     /* A MatrixRTC focus (Element Call) points at the SERVICE ROOT — the
        token endpoint lives at a known sub-path. Grungus's own
@@ -469,7 +462,7 @@ export class LkCallManager {
           typeof navigator.mediaDevices?.getDisplayMedia === "function";
         if (hasCapture) {
           await room.localParticipant.setScreenShareEnabled(true, {
-            audio: false,
+            audio: true,
             contentHint: "detail",
           });
         } else {

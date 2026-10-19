@@ -1768,3 +1768,8 @@ body.compact-messages .msg {
 body.compact-messages .msg-grouped .msg-body {
   margin-top: 0;
 }
+
+.history-controls { display: flex; flex: 0 0 auto; gap: 8px; padding: 6px 16px; }
+.history-controls button { color: var(--text-muted, #b5bac1); background: transparent; border: 0; cursor: pointer; }
+.history-controls button:disabled { opacity: .45; cursor: default; }
+.history-controls button:focus-visible { outline: 2px solid var(--brand, #5865f2); }

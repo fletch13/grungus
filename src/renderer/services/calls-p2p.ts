@@ -521,7 +521,8 @@ export class P2PCallManager {
       return;
     }
 
-    const captured = await this._media.acquireScreen();
+    const captured = await this._media.acquireScreen(false);
+    if (!captured) return;
     this._screenStream = captured.stream;
     if (captured.synthetic) {
       this._notice = "No display capture available — sharing a synthetic screen";

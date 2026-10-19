@@ -953,13 +953,7 @@ function startShell(): void {
     void (async () => {
       try {
         const bytes = new Uint8Array(await detail.file.arrayBuffer());
-        const mxc = await active.uploadMedia(detail.file.name, detail.file.type || "image/png", bytes);
-        await active.sendMedia(detail.roomId, {
-          mxc,
-          name: detail.file.name,
-          mimeType: detail.file.type || "image/png",
-          size: bytes.length,
-        });
+        await active.uploadAndSendMedia(detail.roomId, detail.file.name, detail.file.type || "image/png", bytes);
       } catch (err) {
         chat.setNotice(
           `Could not send image: ${err instanceof Error ? err.message : "unknown error"}`

@@ -74,6 +74,9 @@ interface CreateRoomOptions {
 }
 
 export class MockHomeserver {
+  timelineLimit = Infinity;
+  historyPageLimit = 100;
+  failHistory = false;
   readonly users = new Map<string, MockUser>();
   /** token -> { username, deviceId } — tokens are device-bound like real servers. */
   readonly tokens = new Map<string, { username: string; deviceId: string }>();
@@ -1062,6 +1065,21 @@ export class MockHomeserver {
       return;
     }
 
+    const historyMatch = route.match(/^rooms\/([^/]+)\/messages$/);
+    if (req.method === "GET" && historyMatch) {
+      const room = this.rooms.get(historyMatch[1]!);
+      if (!room || room.members.get(user.userId) !== "join") {
+        this._err(res, 403, "M_FORBIDDEN", "Not in room"); return;
+      }
+      if (this.failHistory) { this._err(res, 503, "M_UNKNOWN", "History unavailable"); return; }
+      const from = Number(query.get("from") ?? (room.events.at(-1)?.seq ?? this._seq) + 1);
+      const limit = Math.min(Number(query.get("limit") ?? 100), this.historyPageLimit);
+      const events = room.events.filter(event => event.seq < from).reverse().slice(0, limit);
+      const end = events.at(-1)?.seq;
+      this._send(res, 200, { chunk: events, ...(end !== undefined ? { end: String(end) } : {}) });
+      return;
+    }
+
     const sendMatch = route.match(/^rooms\/([^/]+)\/send\/([^/]+)\/([^/]+)$/);
     if (req.method === "PUT" && sendMatch) {
       const room = this.rooms.get(sendMatch[1] ?? "");
@@ -1435,7 +1453,11 @@ export class MockHomeserver {
         .map(([userId]) => userId);
       const joinEntry: Record<string, unknown> = {
         state: { events: stateEvents },
-        timeline: { events: timelineEvents },
+        timeline: {
+          events: timelineEvents.slice(-this.timelineLimit),
+          limited: timelineEvents.length > this.timelineLimit,
+          prev_batch: String(timelineEvents.slice(-this.timelineLimit)[0]?.seq ?? this._seq + 1),
+        },
         summary: {
           "m.joined_member_count": joinedCount,
           "m.invited_member_count": 0,

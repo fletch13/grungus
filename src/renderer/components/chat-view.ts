@@ -7,10 +7,6 @@
 import { el, formatDay, sameDay } from "./ui.ts";
 import type { MatrixClient, MessageItem, Room, RoomEvent, TimelineItem } from "../services/matrix-client.ts";
 
-function isTimelineItem(event: RoomEvent): event is TimelineItem {
-  return event.kind === "message" || event.kind === "system";
-}
-
 export class ChatView extends HTMLElement {
   private _room: Room | null = null;
   private _client: MatrixClient | null = null;
@@ -19,6 +15,9 @@ export class ChatView extends HTMLElement {
   private _noticeTimer: ReturnType<typeof setTimeout> | null = null;
   private _header!: HTMLElement;
   private _scroll!: HTMLElement;
+  private _historyControls!: HTMLElement;
+  private _windowAnchor: string | null = null;
+  private _windowStart = 0;
   private _input!: HTMLTextAreaElement;
   private _hint!: HTMLElement;
   private _typingBar!: HTMLElement;
@@ -43,6 +42,7 @@ export class ChatView extends HTMLElement {
   private _renderSkeleton(): void {
     this.textContent = "";
     this._header = el("div", { class: "chat-header" });
+    this._historyControls = el("nav", { class: "history-controls", "aria-label": "Message history" });
     this._scroll = el("div", { class: "chat-scroll" });
     this._scroll.appendChild(
       el("div", {
@@ -107,11 +107,16 @@ export class ChatView extends HTMLElement {
     });
 
     this.appendChild(this._header);
+    this.appendChild(this._historyControls);
     this.appendChild(this._scroll);
     this.appendChild(wrap);
   }
 
   setRoom(room: Room | null, client: MatrixClient | null, meUserId: string | null): void {
+    const changedRoom = room?.id !== this._room?.id;
+    const previousScroll = this._scroll.scrollTop;
+    const pinned = this._windowAnchor === null && this._nearBottom();
+    if (changedRoom) this._windowAnchor = null;
     this._room = room;
     this._client = client;
     this._meUserId = meUserId;
@@ -119,6 +124,7 @@ export class ChatView extends HTMLElement {
     this._renderHeader();
     if (!room) {
       this._clearTimeline();
+      this._historyControls.textContent = "";
       this._input.disabled = true;
       this._input.placeholder = "Message…";
       return;
@@ -126,7 +132,8 @@ export class ChatView extends HTMLElement {
     this._input.disabled = false;
     this._input.placeholder = `Message ${room.title}`;
     this._renderTimeline();
-    this._scrollToBottom();
+    if (changedRoom || pinned) this._scrollToBottom();
+    else this._scroll.scrollTop = previousScroll;
     this.refreshSeenState();
   }
 
@@ -231,9 +238,51 @@ export class ChatView extends HTMLElement {
     }
     this._scroll.textContent = "";
     this._lastItem = null;
-    for (const item of room.timeline) {
-      this._appendItem(item);
-    }
+    const anchor = this._windowAnchor ? room.timeline.findIndex(item => item.id === this._windowAnchor) : -1;
+    this._windowStart = this._windowAnchor ? Math.max(0, anchor) : Math.max(0, room.timeline.length - 100);
+    const end = Math.min(room.timeline.length, this._windowStart + 100);
+    for (const item of room.timeline.slice(this._windowStart, end)) this._appendItem(item);
+    this._renderHistoryControls();
+  }
+
+  private _renderHistoryControls(): void {
+    const room = this._room;
+    this._historyControls.textContent = "";
+    if (!room) return;
+    const older = el("button", { text: room.historyLoading ? "Loading…" : "Earlier messages", disabled: room.historyLoading || (this._windowStart === 0 && !room.historyCursor) });
+    older.addEventListener("click", () => {
+      void (async () => {
+        if (this._windowStart > 0) {
+          this._windowAnchor = room.timeline[Math.max(0, this._windowStart - 100)]?.id ?? null;
+        } else {
+          const first = room.timeline[0]?.id;
+          await this._client?.loadOlderMessages(room.id);
+          if (this._room !== room) return;
+          const previousStart = room.timeline.findIndex(item => item.id === first);
+          this._windowAnchor = room.timeline[Math.max(0, previousStart - 100)]?.id ?? null;
+        }
+        this._renderTimeline();
+        this._scroll.scrollTop = 0;
+      })().catch(error => this.setNotice(`Could not load history: ${error instanceof Error ? error.message : "unknown error"}`));
+    });
+    const newer = el("button", { text: "Newer messages", disabled: this._windowStart + 100 >= room.timeline.length });
+    newer.addEventListener("click", () => {
+      const next = this._windowStart + 100;
+      this._windowAnchor = next + 100 >= room.timeline.length ? null : room.timeline[next]?.id ?? null;
+      this._renderTimeline();
+      this._scroll.scrollTop = 0;
+    });
+    const latest = el("button", { text: "Latest messages", disabled: room.historyLoading });
+    latest.addEventListener("click", () => {
+      void (async () => {
+        if (room.atLiveEdge === false) await this._client?.loadLatestMessages(room.id);
+        if (this._room !== room) return;
+        this._windowAnchor = null;
+        this._renderTimeline();
+        this._scrollToBottom();
+      })().catch(error => this.setNotice(`Could not load messages: ${error instanceof Error ? error.message : "unknown error"}`));
+    });
+    this._historyControls.append(older, newer, latest);
   }
 
   /**
@@ -243,22 +292,13 @@ export class ChatView extends HTMLElement {
    */
   appendEvents(room: Room, events: RoomEvent[]): void {
     if (!this._room || room.id !== this._room.id) return;
-    const hasMarker = events.some(
-      (event) => event.kind === "echo-replaced" || event.kind === "echo-failed"
-    );
-    if (hasMarker) {
-      const pinned = this._nearBottom();
-      this._renderTimeline();
-      if (pinned) this._scrollToBottom();
-      return;
-    }
-    const pinned = this._nearBottom();
-    const items = events.filter(isTimelineItem);
-    const fromMe = items.some(
-      (item) => item.kind === "message" && item.sender === this._meUserId
-    );
-    for (const item of items) this._appendItem(item);
-    if (pinned || fromMe) this._scrollToBottom();
+    if (events.length === 0) { this._renderHistoryControls(); return; }
+    const pinned = this._nearBottom() && this._windowAnchor === null;
+    if (!pinned && !this._windowAnchor) this._windowAnchor = room.timeline[this._windowStart]?.id ?? null;
+    const position = this._scroll.scrollTop;
+    this._renderTimeline();
+    if (pinned) this._scrollToBottom();
+    else this._scroll.scrollTop = position;
   }
 
   private _appendItem(item: TimelineItem): void {

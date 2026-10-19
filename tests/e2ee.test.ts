@@ -238,3 +238,84 @@ test("plaintext rooms are unaffected by the crypto layer", async (t) => {
   );
   assert.ok(stored, "plaintext room stores the plaintext event (as expected)");
 });
+
+test("encrypted attachments upload ciphertext and decrypt on the receiving device", async t => {
+  const hs = new MockHomeserver();
+  await hs.listen();
+  t.after(() => hs.close());
+  const a = await makeCryptoUser(hs, "image_a", "pw");
+  const b = await makeCryptoUser(hs, "image_b", "pw");
+  const roomId = await a.createRoom({ name: "encrypted images", isPublic: true, encrypted: true });
+  await b.joinRoom(roomId);
+  a.startSync();
+  b.startSync();
+  t.after(() => { a.stopSync(); b.stopSync(); });
+  await waitFor(() => !!a.getRoom(roomId) && !!b.getRoom(roomId));
+  const original = new TextEncoder().encode("secret image content");
+  await assert.rejects(() => a.sendMedia(roomId, { mxc: "mxc://mock.hs/raw", name: "raw.png", mimeType: "image/png" }), /encrypted attachments/);
+  await a.uploadAndSendMedia(roomId, "private.png", "image/png", original);
+  const image = (): MessageItem | undefined => b.getRoom(roomId)?.timeline.find((item): item is MessageItem => item.kind === "message" && !!item.media?.file);
+  await waitFor(() => !!image());
+  const media = image()!.media!;
+  const stored = hs.media.get(media.mxc.slice("mxc://mock.hs/".length))!;
+  assert.notDeepEqual(new Uint8Array(stored.bytes), original);
+  const src = await b.mediaSrc(media.mxc, media.file, media.mimetype!);
+  assert.ok(src);
+  assert.deepEqual(new Uint8Array(await (await fetch(src)).arrayBuffer()), original);
+  URL.revokeObjectURL(src);
+});
+
+test("a partially synced encrypted room cannot downgrade sends to plaintext", async t => {
+  const hs = new MockHomeserver();
+  await hs.listen();
+  t.after(() => hs.close());
+  const client = await makeCryptoUser(hs, "partial_room", "pw");
+  const roomId = await client.createRoom({ name: "partial", encrypted: true, isPublic: true });
+  client.startSync();
+  t.after(() => client.stopSync());
+  await waitFor(() => !!client.getRoom(roomId));
+  client.stopSync();
+  // Reproduce the room-create sync arriving ahead of its encryption state.
+  client.getRoom(roomId)!.isEncrypted = false;
+  const eventId = await client.sendMessage(roomId, "must remain private");
+  const event = hs.rooms.get(roomId)!.events.find(event => event.event_id === eventId);
+  assert.equal(event?.type, "m.room.encrypted");
+  await client.sendRoomEvent(roomId, "m.test", { private: true });
+  assert.equal(hs.rooms.get(roomId)!.events.at(-1)?.type, "m.room.encrypted");
+  client.crypto = null;
+  await assert.rejects(() => client.uploadAndSendMedia(roomId, "private.png", "image/png", new Uint8Array([1])), /E2EE is unavailable/);
+  assert.equal(hs.media.size, 0);
+});
+
+test("edits, replies, and reactions use the encrypted sender and fail closed without crypto", async t => {
+  const hs = new MockHomeserver();
+  await hs.listen();
+  t.after(() => hs.close());
+  const a = await makeCryptoUser(hs, "relations_a", "pw");
+  const b = await makeCryptoUser(hs, "relations_b", "pw");
+  const roomId = await a.createRoom({ name: "private relations", isPublic: true, encrypted: true });
+  await b.joinRoom(roomId);
+  a.startSync();
+  b.startSync();
+  t.after(() => { a.stopSync(); b.stopSync(); });
+  await waitFor(() => a.getRoom(roomId)?.members.get(b.userId!)?.membership === "join" && !!b.getRoom(roomId));
+  const original = await a.sendMessage(roomId, "private original");
+  await waitFor(() => messageBodies(b, roomId).includes("private original"));
+  const edit = await a.editMessage(roomId, original!, "private edited text");
+  await waitFor(() => messageBodies(b, roomId).includes("private edited text"));
+  const reply = await a.replyMessage(roomId, original!, a.userId!, "private edited text", "private reply text");
+  await waitFor(() => messageBodies(b, roomId).includes("private reply text"));
+  const reaction = await b.sendReaction(roomId, original!, "👍");
+  await waitFor(() => a.getRoom(roomId)!.timeline.some(item => item.kind === "message" && item.id === original && item.reactions?.get("👍")?.has(b.userId!)));
+  for (const eventId of [edit, reply, reaction]) {
+    const event = hs.rooms.get(roomId)!.events.find(event => event.event_id === eventId)!;
+    assert.equal(event.type, "m.room.encrypted");
+    assert.ok(!JSON.stringify(event.content).includes("private"));
+  }
+  a.crypto = null;
+  const count = hs.rooms.get(roomId)!.events.length;
+  await assert.rejects(() => a.editMessage(roomId, original!, "do not leak"), /E2EE is unavailable/);
+  await assert.rejects(() => a.replyMessage(roomId, original!, a.userId!, "parent", "do not leak"), /E2EE is unavailable/);
+  await assert.rejects(() => a.sendReaction(roomId, original!, "👍"), /E2EE is unavailable/);
+  assert.equal(hs.rooms.get(roomId)!.events.length, count);
+});

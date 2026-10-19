@@ -224,6 +224,15 @@ async function main(): Promise<void> {
   );
   log("local echo replaced by the real event (no duplicates) ✓");
 
+  /* Exercise real /messages tokens and ensure sync/history overlap stays deduplicated. */
+  await a.loadLatestMessages(roomId);
+  await a.loadOlderMessages(roomId);
+  const historyIds = a.getRoom(roomId)!.timeline.map(item => item.id);
+  assert.equal(new Set(historyIds).size, historyIds.length);
+  assert.ok(timelineHas(a, roomId, bodyA));
+  assert.ok(timelineHas(a, roomId, bodyB));
+  log("history pagination: real server tokens, decrypted timeline, no duplicates ✓");
+
   /* 2. unnamed 1:1 room resolves as a direct message */
   const dmId = await a.createRoom({ isPublic: true }); /* no name: 1:1 */
   await b.joinRoom(dmId);
@@ -354,16 +363,7 @@ async function main(): Promise<void> {
 
   /* 4d. media sending in an encrypted room (event is megolm-wrapped) */
   const mediaBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 8, 7, 6]);
-  const mxc = await a.uploadMedia("e2e.png", "image/png", mediaBytes);
-  assert.ok(mxc.startsWith("mxc://"), "upload returns an mxc URI");
-  await a.sendMedia(encRoomId, {
-    mxc,
-    name: "e2e.png",
-    mimeType: "image/png",
-    size: mediaBytes.length,
-    width: 32,
-    height: 32,
-  });
+  await a.uploadAndSendMedia(encRoomId, "e2e.png", "image/png", mediaBytes, { width: 32, height: 32 });
   await waitFor(
     () =>
       (b.getRoom(encRoomId)?.timeline ?? []).some(
@@ -376,11 +376,13 @@ async function main(): Promise<void> {
     .timeline.find(
       (item): item is MessageItem => item.kind === "message" && (item as MessageItem).media !== null
     )! as MessageItem;
-  assert.equal(mediaItem.media!.mxc, mxc);
+  const mxc = mediaItem.media!.mxc;
+  assert.ok(mediaItem.media!.file, "image carries encrypted file metadata");
   assert.equal(mediaItem.media!.width, 32);
-  const fetched = await b.mediaSrc(mxc);
+  const fetched = await b.mediaSrc(mxc, mediaItem.media!.file, "image/png");
   assert.ok(fetched, "authenticated media download resolves");
-  /* the mxc URL itself must be hidden from the server: fetch the raw event */
+  assert.deepEqual(new Uint8Array(await (await fetch(fetched)).arrayBuffer()), mediaBytes);
+  URL.revokeObjectURL(fetched);
   log("media message sent megolm-encrypted and media downloaded ✓");
 
   /* 4e. rotation: b joining an encrypted room reads post-join but not pre-join.
@@ -391,7 +393,7 @@ async function main(): Promise<void> {
     isPublic: true,
     encrypted: true,
   });
-  await waitFor(() => a.getRoom(rotRoom) !== null, "rotation room syncs");
+  await waitFor(() => a.getRoom(rotRoom)?.isEncrypted === true, "rotation room encryption syncs");
   await a.sendMessage(rotRoom, "rot-before-join");
   await waitFor(
     () =>

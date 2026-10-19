@@ -329,6 +329,7 @@ export class CallManager {
     }
 
     const captured = await this._acquireScreen();
+    if (!captured) return;
     this._screenStream = captured.stream;
     if (captured.synthetic) {
       this._notice = "No display capture available — sharing a synthetic screen";
@@ -406,7 +407,7 @@ export class CallManager {
     };
   }
 
-  private async _acquireScreen(): Promise<{ stream: MediaStream; synthetic: boolean }> {
+  private async _acquireScreen(): Promise<{ stream: MediaStream; synthetic: boolean } | null> {
     return this._media.acquireScreen();
   }
 

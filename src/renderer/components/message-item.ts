@@ -164,25 +164,27 @@ export class MessageItemElement extends HTMLElement {
     holder.appendChild(loading);
 
     if (client) {
-      void client.mediaSrc(mxc).then((src) => {
-        /* the timeline may have re-rendered under us — only paint if we are
-           still attached and still the same item */
-        if (!src || !this.isConnected) return;
+      const load = async (): Promise<void> => {
+        holder.replaceChildren(loading);
+        const src = await client.mediaSrc(mxc, item.media?.file, item.media?.mimetype ?? "application/octet-stream");
+        if (!this.isConnected || !this.contains(holder)) return;
         holder.textContent = "";
+        if (!src) {
+          const retry = el("button", { class: "msg-media-retry", text: "Image unavailable — retry" });
+          retry.addEventListener("click", () => { void load(); });
+          holder.appendChild(retry);
+          return;
+        }
         const img = document.createElement("img");
         img.className = "msg-media-img";
         img.alt = item.media?.name ?? "image";
         img.title = img.alt;
         img.src = src;
         holder.appendChild(img);
-
         const caption = item.media?.name;
-        if (caption && caption !== item.body) {
-          holder.appendChild(
-            el("div", { class: "msg-media-caption", text: caption })
-          );
-        }
-      });
+        if (caption && caption !== item.body) holder.appendChild(el("div", { class: "msg-media-caption", text: caption }));
+      };
+      void load();
     }
     return holder;
   }

@@ -70,6 +70,17 @@ await build({
 });
 
 await build({
+  ...common, entryPoints: [path.join(root, "src/main/capture-preload.ts")],
+  outfile: path.join(dist, "capture-preload.cjs"), platform: "node", format: "cjs",
+  target: "node24", external: ["electron"],
+});
+await build({
+  ...common, entryPoints: [path.join(root, "src/renderer/capture-picker-entry.ts")],
+  outfile: path.join(dist, "capture-picker.js"), platform: "browser", format: "iife", target: "es2022",
+});
+await cp(path.join(root, "src/renderer/capture-picker.html"), path.join(dist, "capture-picker.html"));
+
+await build({
   ...common,
   entryPoints: [path.join(root, "src/renderer/index.ts")],
   outfile: path.join(dist, "renderer.js"),

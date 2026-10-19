@@ -54,6 +54,23 @@ jobs:
       - name: Build and boot the app headlessly, then exit
         run: xvfb-run -a npm run smoke
 
+      - name: Renderer interaction tests
+        run: xvfb-run -a npm run test:ui
+
+  interoperability:
+    name: Matrix interoperability (Synapse)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Test against a disposable real homeserver
+        run: npm run test:homeserver
+
   package:
     name: Package Linux distributables
     runs-on: ubuntu-latest
