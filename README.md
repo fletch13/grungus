@@ -16,6 +16,14 @@ for an open protocol.
 - **Matrix login** — two-step: enter the homeserver domain first, then the
   app queries the server's real login flows (GET /login) and offers
   exactly what that server supports: password, access token, and SSO.
+- **Account creation** — "Need an account? Create one" on the login card
+  registers a fresh user over POST /register with the spec's
+  User-Interactive Auth: m.login.dummy (open registration) and
+  m.login.registration_token (shared-token homeservers, e.g. conduwuit —
+  the token field appears only when the server demands it). The new
+  session lands straight in the app; servers requiring recaptcha/terms
+  are declined with a pointer to their website or Element, and
+  M_USER_IN_USE / M_INVALID_USERNAME render as friendly messages.
 - **SSO / redirect login (m.login.sso)** — for homeservers that federate
   an IdP (e.g. a university Keycloak), each advertised identity provider
   becomes a "Continue with …" button. The redirect dance runs in the
@@ -442,6 +450,7 @@ Client-Server API (v3 paths, spec v1.x):
 | Homeserver discovery | `GET /.well-known/matrix/client` |
 | Feature negotiation | `GET /_matrix/client/versions` |
 | Login | `POST /_matrix/client/v3/login` (m.login.password) |
+| Account creation | `POST /_matrix/client/v3/register` (UIA: m.login.dummy, m.login.registration_token) |
 | Token check | `GET /_matrix/client/v3/account/whoami` |
 | Profile | `GET /_matrix/client/v3/profile/{userId}` |
 | Realtime | `GET /_matrix/client/v3/sync` (long-poll, incl. to-device) |

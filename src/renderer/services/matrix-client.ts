@@ -286,6 +286,25 @@ export interface LoginFlow {
   identity_providers?: SsoIdentityProvider[];
 }
 
+/** One UIA flow advertised by POST /register (a list of stages). */
+export interface RegistrationFlow {
+  stages?: string[];
+}
+
+/** The UIA challenge from POST /register: available flows + session. */
+export interface RegistrationChallenge {
+  flows: RegistrationFlow[];
+  session?: string;
+  params?: Record<string, unknown>;
+}
+
+export interface RegisterCredentials {
+  username: string;
+  password: string;
+  /** Required when the server's flow demands m.login.registration_token. */
+  registrationToken?: string | null;
+}
+
 export interface CreateRoomOptions {
   name?: string;
   topic?: string;
@@ -593,6 +612,76 @@ export class MatrixClient {
         password,
         initial_device_display_name: "Grungus",
       },
+    });
+    if (!res || !res.access_token) {
+      throw new Error("Homeserver returned no access token");
+    }
+    this.accessToken = res.access_token;
+    this.userId = res.user_id;
+    this.deviceId = res.device_id ?? null;
+    return res;
+  }
+
+  /**
+   * Probe the homeserver's registration UIA flows (POST /register with an
+   * empty body). A 401 is the expected "here are the flows" challenge —
+   * its body carries them; a 200 means the server registers without UIA.
+   * 403 M_FORBIDDEN means registration is disabled entirely.
+   */
+  async registrationFlows(): Promise<RegistrationChallenge> {
+    try {
+      const res = await this.api<{ flows?: RegistrationFlow[] }>(
+        "POST",
+        `${CLIENT_PREFIX}/register`,
+        { auth: false, body: {} }
+      );
+      return { flows: res.flows ?? [] };
+    } catch (err) {
+      if (err instanceof HttpError && err.status === 401 && err.body) {
+        return {
+          flows: (err.body.flows as RegistrationFlow[]) ?? [],
+          session: err.body.session as string | undefined,
+          params: (err.body.params as Record<string, unknown>) ?? undefined,
+        };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Create an account and log in with it (inhibit_login: false — the
+   * server returns a fresh session). Satisfies the UIA stages Grungus
+   * can do without a browser: m.login.dummy (open registration) and
+   * m.login.registration_token (shared-token servers, e.g. conduwuit).
+   * Servers demanding recaptcha/terms are declined with a clear message.
+   */
+  async registerWithPassword(credentials: RegisterCredentials): Promise<LoginResult> {
+    const username = String(credentials.username ?? "").trim();
+    const password = credentials.password ?? "";
+    if (!username || !password) {
+      throw new Error("Username and password are required");
+    }
+    const challenge = await this.registrationFlows();
+    const stages = new Set(challenge.flows.flatMap((flow) => flow.stages ?? []));
+    let auth: Record<string, unknown>;
+    if (stages.size === 0 || stages.has("m.login.dummy")) {
+      auth = { type: "m.login.dummy" };
+    } else if (stages.has("m.login.registration_token")) {
+      const token = credentials.registrationToken?.trim();
+      if (!token) {
+        throw new Error("This homeserver requires a registration token");
+      }
+      auth = { type: "m.login.registration_token", registration_token: token };
+    } else {
+      throw new Error(
+        `Unsupported registration flow (${[...stages].join(", ")}) — ` +
+          "create the account on your homeserver's website or in Element"
+      );
+    }
+    if (challenge.session) auth.session = challenge.session;
+    const res = await this.api<LoginResult>("POST", `${CLIENT_PREFIX}/register`, {
+      auth: false,
+      body: { username, password, auth, inhibit_login: false },
     });
     if (!res || !res.access_token) {
       throw new Error("Homeserver returned no access token");

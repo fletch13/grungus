@@ -6,7 +6,7 @@
  * MatrixClient and the component tree.
  */
 import { el } from "./components/ui.ts";
-import { LoginView, type LoginDetail } from "./components/login-view.ts";
+import { LoginView, type LoginDetail, type RegisterDetail } from "./components/login-view.ts";
 import type { SpaceRail } from "./components/space-rail.ts";
 import type { RoomList, UserInfo } from "./components/room-list.ts";
 import { SettingsView } from "./components/settings-view.ts";
@@ -111,6 +111,12 @@ function showLogin(): void {
   });
   view.addEventListener("grungus:login", (event) => {
     handleLogin((event as CustomEvent<LoginDetail>).detail, view);
+  });
+  view.addEventListener("grungus:register", () => {
+    void handleRegisterFlows(view);
+  });
+  view.addEventListener("grungus:register-submit", (event) => {
+    void handleRegisterSubmit((event as CustomEvent<RegisterDetail>).detail, view);
   });
   root.appendChild(view);
 }
@@ -269,6 +275,73 @@ async function handleLogin(detail: LoginDetail, view: LoginView): Promise<void> 
           ? `${(err as { errcode?: string }).errcode}: ${err.message}`
           : err.message
         : "Login failed";
+    view.setStatus(message, true);
+  }
+}
+
+/** Probe the server's registration flows for the Create Account form. */
+async function handleRegisterFlows(view: LoginView): Promise<void> {
+  const baseUrl = loginBaseUrl;
+  if (!baseUrl) return;
+  view.setBusy(true);
+  view.setStatus("Checking registration…", false);
+  try {
+    const probe = new MatrixClient({ baseUrl });
+    const challenge = await probe.registrationFlows();
+    view.setBusy(false);
+    view.setStatus("", false);
+    view.showRegisterFlows(challenge);
+  } catch (err) {
+    view.setBusy(false);
+    const errcode =
+      err instanceof Error && "errcode" in err
+        ? (err as { errcode?: string }).errcode
+        : null;
+    const status =
+      errcode === "M_FORBIDDEN"
+        ? "Registration is disabled on this homeserver"
+        : `Registration is not available: ${
+            err instanceof Error ? err.message : "unknown error"
+          }`;
+    view.setStatus(status, true);
+  }
+}
+
+/** Create the account over POST /register (UIA) and log straight in. */
+async function handleRegisterSubmit(
+  detail: RegisterDetail,
+  view: LoginView
+): Promise<void> {
+  const baseUrl = loginBaseUrl;
+  if (!baseUrl) return;
+  view.setBusy(true);
+  view.setStatus("Creating your account…", false);
+  try {
+    const active = new MatrixClient({ baseUrl });
+    await active.registerWithPassword({
+      username: detail.username,
+      password: detail.password,
+      registrationToken: detail.registrationToken,
+    });
+    await finishLogin(baseUrl, active);
+  } catch (err) {
+    view.setBusy(false);
+    const errcode =
+      err instanceof Error && "errcode" in err
+        ? (err as { errcode?: string }).errcode
+        : null;
+    let message: string;
+    if (errcode === "M_USER_IN_USE") {
+      message = "That username is already taken — try another one";
+    } else if (errcode === "M_INVALID_USERNAME") {
+      message = "Invalid username — use letters, numbers, ., _, =, -";
+    } else if (errcode === "M_FORBIDDEN") {
+      message = "Registration rejected: " + (err instanceof Error ? err.message : "forbidden");
+    } else if (errcode) {
+      message = `${errcode}: ${err instanceof Error ? err.message : "registration failed"}`;
+    } else {
+      message = err instanceof Error ? err.message : "Registration failed";
+    }
     view.setStatus(message, true);
   }
 }

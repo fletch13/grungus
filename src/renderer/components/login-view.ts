@@ -9,13 +9,23 @@
  * "grungus:sso" {idpId}, "grungus:login" with LoginDetail.
  */
 import { el } from "./ui.ts";
-import type { LoginFlow, SsoIdentityProvider } from "../services/matrix-client.ts";
+import type {
+  LoginFlow,
+  RegistrationChallenge,
+  SsoIdentityProvider,
+} from "../services/matrix-client.ts";
 
 export interface LoginDetail {
   homeserver: string;
   username: string;
   password: string;
   accessToken: string | null;
+}
+
+export interface RegisterDetail {
+  username: string;
+  password: string;
+  registrationToken: string | null;
 }
 
 export class LoginView extends HTMLElement {
@@ -25,6 +35,8 @@ export class LoginView extends HTMLElement {
   private _flows: LoginFlow[] | null = null;
   private _baseUrl: string | null = null;
   private _homeserverInput = "matrix.org";
+  /** the server's registration UIA flows, once the user picks Create Account */
+  private _register: RegistrationChallenge | null = null;
 
   connectedCallback(): void {
     this._render();
@@ -53,6 +65,19 @@ export class LoginView extends HTMLElement {
   showServerStep(): void {
     this._flows = null;
     this._baseUrl = null;
+    this._register = null;
+    this._render();
+  }
+
+  /** Show the Create Account form with the server's registration flows. */
+  showRegisterFlows(challenge: RegistrationChallenge): void {
+    this._register = challenge;
+    this._render();
+  }
+
+  /** Back to the login form from the Create Account form. */
+  showLoginStep(): void {
+    this._register = null;
     this._render();
   }
 
@@ -72,7 +97,9 @@ export class LoginView extends HTMLElement {
       })
     );
 
-    if (!this._flows) {
+    if (this._register) {
+      this._renderRegisterStep(form);
+    } else if (!this._flows) {
       this._renderServerStep(form);
     } else {
       this._renderCredentialStep(form);
@@ -244,6 +271,17 @@ export class LoginView extends HTMLElement {
       this._render();
     });
 
+    /* account creation — the app probes the server's registration flows
+       and calls showRegisterFlows() with them */
+    const registerToggle = el("div", { class: "login-toggle" });
+    const registerLink = el("a", { text: "Need an account? Create one" });
+    registerToggle.appendChild(registerLink);
+    form.appendChild(registerToggle);
+    registerLink.addEventListener("click", () => {
+      if (this._busy) return;
+      this.dispatchEvent(new CustomEvent("grungus:register", { bubbles: true }));
+    });
+
     const back = el("div", { class: "login-toggle" });
     const backLink = el("a", { text: "← use a different homeserver" });
     back.appendChild(backLink);
@@ -262,6 +300,119 @@ export class LoginView extends HTMLElement {
             username: userInput.value.trim(),
             password: passInput.value,
             accessToken: this._tokenMode ? tokenInput.value.trim() : null,
+          },
+          bubbles: true,
+        })
+      );
+    });
+  }
+
+  /* ---- create account: the modes this server's registration allows ---- */
+
+  private _renderRegisterStep(form: HTMLFormElement): void {
+    const host = this._baseUrl
+      ? new URL(this._baseUrl).host
+      : "your homeserver";
+    form.appendChild(
+      el("p", {
+        class: "login-server-title",
+        text: `Create an account on ${host}`,
+      })
+    );
+
+    const stages = new Set(
+      (this._register?.flows ?? []).flatMap((flow) => flow.stages ?? [])
+    );
+    const needsToken =
+      !stages.has("m.login.dummy") && stages.has("m.login.registration_token");
+    const supported =
+      stages.size === 0 ||
+      stages.has("m.login.dummy") ||
+      stages.has("m.login.registration_token");
+
+    const userInput = el("input", {
+      type: "text",
+      id: "register-username",
+      autocomplete: "username",
+      spellcheck: "false",
+      placeholder: "e.g. alice",
+      disabled: this._busy ? "" : null,
+    }) as HTMLInputElement;
+    const passInput = el("input", {
+      type: "password",
+      id: "register-password",
+      autocomplete: "new-password",
+      placeholder: "••••••••",
+      disabled: this._busy ? "" : null,
+    }) as HTMLInputElement;
+    const tokenInput = el("input", {
+      type: "password",
+      id: "register-token",
+      autocomplete: "off",
+      spellcheck: "false",
+      placeholder: "registration token",
+      disabled: this._busy ? "" : null,
+    }) as HTMLInputElement;
+
+    if (!supported) {
+      form.appendChild(
+        el("div", {
+          class: "hint",
+          text:
+            `This homeserver requires ${[...stages].join(", ")} to register — ` +
+            "create the account on its website or in Element, then log in here.",
+        })
+      );
+    } else {
+      const userField = el("div", { class: "field" });
+      userField.appendChild(el("label", { for: "register-username", text: "Username" }));
+      userField.appendChild(userInput);
+      form.appendChild(userField);
+
+      const passField = el("div", { class: "field" });
+      passField.appendChild(el("label", { for: "register-password", text: "Password" }));
+      passField.appendChild(passInput);
+      form.appendChild(passField);
+
+      if (needsToken) {
+        const tokenField = el("div", { class: "field" });
+        tokenField.appendChild(
+          el("label", { for: "register-token", text: "Registration token" })
+        );
+        tokenField.appendChild(tokenInput);
+        tokenField.appendChild(
+          el("div", {
+            class: "hint",
+            text: "This homeserver only registers with a shared token — ask your admin.",
+          })
+        );
+        form.appendChild(tokenField);
+      }
+
+      form.appendChild(
+        el("button", { class: "btn-primary", type: "submit", disabled: this._busy ? "" : null },
+          this._busy ? "Creating…" : "Create Account")
+      );
+    }
+
+    const back = el("div", { class: "login-toggle" });
+    const backLink = el("a", { text: "← log in instead" });
+    back.appendChild(backLink);
+    form.appendChild(back);
+    backLink.addEventListener("click", () => {
+      if (this._busy) return;
+      this.showLoginStep();
+    });
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (this._busy || !supported) return;
+      this.dispatchEvent(
+        new CustomEvent<RegisterDetail>("grungus:register-submit", {
+          detail: {
+            username: userInput.value.trim(),
+            password: passInput.value,
+            registrationToken: needsToken ? tokenInput.value.trim() : null,
           },
           bubbles: true,
         })

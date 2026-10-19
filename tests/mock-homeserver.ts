@@ -95,6 +95,8 @@ export class MockHomeserver {
   /** SSO simulation: advertised identity providers (enableSso() to use). */
   ssoEnabled = false;
   readonly ssoProviders = [{ id: "keycloak", name: "University Keycloak" }];
+  /** When set, POST /register demands m.login.registration_token with this value. */
+  registrationToken: string | null = null;
   /** loginToken -> username, issued by the fake IdP redirect. */
   private readonly ssoLoginTokens = new Map<string, string>();
   /** Server-side key backup (single version, per-user). */
@@ -521,6 +523,67 @@ export class MockHomeserver {
       this._send(res, 200, {
         access_token: token,
         user_id: user.userId,
+        device_id: deviceId,
+        home_server: "mock.hs",
+      });
+      return;
+    }
+
+    /* POST /register: account creation with UIA (m.login.dummy, or
+       m.login.registration_token when this.registrationToken is set) */
+    if (req.method === "POST" && route === "register") {
+      const auth = body.auth as
+        | { type?: string; registration_token?: string }
+        | undefined;
+      if (!auth) {
+        /* UIA probe: the client sends an empty body to learn the flows */
+        const stages = this.registrationToken
+          ? ["m.login.registration_token"]
+          : ["m.login.dummy"];
+        this._send(res, 401, {
+          flows: [{ stages }],
+          params: {},
+          session: "uia_" + crypto.randomBytes(8).toString("hex"),
+        });
+        return;
+      }
+      const username = String(body.username ?? "");
+      if (!/^[a-z0-9._=/-]+$/.test(username)) {
+        this._err(res, 400, "M_INVALID_USERNAME", "Username may only contain a-z, 0-9, ., _, =, -, /");
+        return;
+      }
+      if (this.users.has(username)) {
+        this._err(res, 400, "M_USER_IN_USE", "That username is already taken");
+        return;
+      }
+      if (
+        this.registrationToken &&
+        auth.registration_token !== this.registrationToken
+      ) {
+        this._err(res, 403, "M_FORBIDDEN", "Invalid registration token");
+        return;
+      }
+      const userId = this.registerUser(username, String(body.password ?? ""));
+      if (body.inhibit_login === true) {
+        this._send(res, 200, { user_id: userId });
+        return;
+      }
+      const token = "tok_" + crypto.randomBytes(12).toString("hex");
+      const deviceId = "MOCK_" + crypto.randomBytes(6).toString("hex");
+      this.tokens.set(token, { username, deviceId });
+      const regDevices = this.devices.get(username) ?? new Map<string, MockDevice>();
+      if (!regDevices.has(deviceId)) {
+        regDevices.set(deviceId, {
+          deviceId,
+          deviceKeys: {},
+          oneTimeKeys: new Map(),
+          displayName: null,
+        });
+      }
+      this.devices.set(username, regDevices);
+      this._send(res, 200, {
+        access_token: token,
+        user_id: userId,
         device_id: deviceId,
         home_server: "mock.hs",
       });
