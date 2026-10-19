@@ -8,3 +8,4 @@ npm-debug.log*
 .env.*
 !.env.example
 release/
+.git-commit-msg.tmp
