@@ -38,3 +38,20 @@ appImage:
 
 deb:
   artifactName: grungus_${version}_${arch}.deb
+
+# Windows: built ONLY in CI on a native windows runner — building
+# win targets on Linux needs wine (for rcedit), and this system
+# deliberately stays wine-free.
+win:
+  target:
+    - nsis
+    - portable
+  icon: build/icon.ico
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  artifactName: Grungus-Setup-${version}.${ext}
+
+portable:
+  artifactName: Grungus-${version}-portable.${ext}

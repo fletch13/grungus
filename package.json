@@ -13,7 +13,8 @@
     "smoke": "npm run build && electron . --smoke",
     "test": "node --test",
     "dist": "npm run build && electron-builder --linux",
-    "dist:dir": "npm run build && electron-builder --linux dir"
+    "dist:dir": "npm run build && electron-builder --linux dir",
+    "dist:win": "npm run build && electron-builder --win"
   },
   "repository": {
     "type": "git",
