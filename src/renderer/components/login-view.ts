@@ -8,6 +8,7 @@
  * access-token modes. Events: "grungus:server-chosen" {homeserver},
  * "grungus:sso" {idpId}, "grungus:login" with LoginDetail.
  */
+import { icon } from "./icons.ts";
 import { el } from "./ui.ts";
 import type {
   LoginFlow,
@@ -88,12 +89,20 @@ export class LoginView extends HTMLElement {
 
   private _render(): void {
     this.textContent = "";
+    const intro = el("aside", { class: "login-intro" });
+    intro.append(el("div", { class: "brand-wordmark" }, icon("bubble", 24), "grungus"),
+      el("span", { class: "login-eyebrow", text: "YOUR PEOPLE. YOUR SPACE." }),
+      el("h2", { text: "Good conversations.\nOn your terms." }),
+      el("p", { text: "A little closer to your communities. An open, independent home for your messages, spaces, and calls." }),
+      el("div", { class: "login-network" }, icon("globe", 18), "Connected by Matrix. Made for you."));
+    this.appendChild(intro);
     const form = el("form", { class: "login-card", novalidate: true }) as HTMLFormElement;
-    form.appendChild(el("h1", { class: "login-logo", text: "Grungus" }));
+    form.appendChild(el("div", { class: "login-mark" }, icon("bubble", 26)));
+    form.appendChild(el("h1", { class: "login-logo", text: this._register ? "Make yourself at home" : this._flows ? "Welcome back" : "Your conversations start here" }));
     form.appendChild(
       el("p", {
         class: "login-sub",
-        text: "A Discord-style chat client for the Matrix network.",
+        text: this._flows ? "Sign in to your Matrix account." : "Choose your homeserver to get connected.",
       })
     );
 

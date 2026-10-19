@@ -6,7 +6,7 @@
  * (emoji chips with counts), edits (m.replace with "(edited)"),
  * and reply chains (m.in_reply_to with quoted parent).
  */
-import { el, colorFor, formatTime } from "./ui.ts";
+import { el, formatTime } from "./ui.ts";
 import type { MatrixClient, MessageItem, Room } from "../services/matrix-client.ts";
 
 export interface MessageItemOptions {
@@ -92,7 +92,7 @@ export class MessageItemElement extends HTMLElement {
         class: "msg-author",
         text: item.senderName || "unknown",
       });
-      author.style.color = colorFor(item.sender);
+
       head.appendChild(author);
       if (opts.showTimestamps !== false) {
         head.appendChild(el("span", { class: "msg-time", text: formatTime(item.ts) }));

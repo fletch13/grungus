@@ -1,6 +1,7 @@
 /*
  * Grungus — <member-list>: right-hand member pane for the selected room.
  */
+import { icon } from "./icons.ts";
 import { el } from "./ui.ts";
 import { mxidLocalpart, type MatrixClient, type Room } from "../services/matrix-client.ts";
 
@@ -38,7 +39,7 @@ export class MemberList extends HTMLElement {
 
     this.textContent = "";
     this.appendChild(
-      el("div", { class: "member-head", text: `Members — ${members.length}` })
+      el("div", { class: "member-head" }, icon("users", 16), "Members", el("span", { class: "member-count", text: String(members.length) }))
     );
 
     for (const member of members) {

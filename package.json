@@ -10,14 +10,18 @@
     "start": "npm run build && electron .",
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "smoke": "npm run build && electron . --smoke",
+    "smoke": "npm run build && node scripts/smoke.mjs",
     "test": "node --test",
     "dist": "npm run build && electron-builder --linux",
     "dist:dir": "npm run build && electron-builder --linux dir",
     "dist:win": "npm run build && electron-builder --win",
     "test:ui": "node scripts/ui-check.mjs",
     "test:e2e": "node tests/e2e-real-homeserver.ts",
-    "test:homeserver": "node scripts/homeserver-check.mjs"
+    "test:homeserver": "node scripts/homeserver-check.mjs",
+    "dev": "node scripts/dev.mjs",
+    "dev:web": "vite",
+    "preview": "vite preview",
+    "test:dev": "node scripts/dev-check.mjs"
   },
   "repository": {
     "type": "git",
@@ -29,20 +33,22 @@
   "author": "fletch13",
   "license": "MIT",
   "devDependencies": {
+    "@matrix-org/olm": "^3.2.15",
+    "@tailwindcss/vite": "^4.3.3",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^26.6.5",
     "@types/qrcode": "^1.5.6",
     "electron": "^44.7.2",
     "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
-    "typescript": "^7.0.2",
-    "@matrix-org/olm": "^3.2.15",
     "jsonwebtoken": "^9.0.3",
     "jsqr": "^1.4.0",
     "livekit-client": "^2.22.4",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4"
   },
-  "dependencies": {},
   "allowScripts": {
     "esbuild@0.28.2": true
   },

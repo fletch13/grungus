@@ -5,6 +5,7 @@
  * Components stay dumb; this file is the only place that touches both the
  * MatrixClient and the component tree.
  */
+import { resetSessionBackup } from "./services/session-recovery.ts";
 import { el } from "./components/ui.ts";
 import { LoginView, type LoginDetail, type RegisterDetail } from "./components/login-view.ts";
 import type { SpaceRail } from "./components/space-rail.ts";
@@ -33,6 +34,7 @@ export interface SavedSession {
 
 export interface GrungusPlatform {
   isElectron: boolean;
+  loadLegacySettings?(): Promise<string | null>;
   saveSession(session: SavedSession): Promise<boolean>;
   loadSession(): Promise<SavedSession | null>;
   clearSession(): Promise<boolean>;
@@ -246,7 +248,7 @@ async function finishLogin(baseUrl: string, activeClient: MatrixClient): Promise
   await storage.saveSession(session);
   client = active;
   await attachCrypto(active);
-  startShell();
+  startShell(true);
 }
 
 async function handleLogin(detail: LoginDetail, view: LoginView): Promise<void> {
@@ -414,7 +416,7 @@ function logout(): void {
   });
 }
 
-function startShell(): void {
+function startShell(promptRecovery = false): void {
   const active = client;
   if (!root || !active) return;
   root.textContent = "";
@@ -618,6 +620,7 @@ function startShell(): void {
     const all = settings.all;
     document.body.classList.toggle("theme-light", all.theme === "light");
     document.body.style.fontSize = `${all.fontScale * 15}px`;
+    document.body.style.setProperty("--ui-font-scale", String(all.fontScale));
     document.body.classList.toggle("compact-messages", all.compact);
     chat.applyPreferences({
       enterToSend: all.enterToSend,
@@ -769,6 +772,45 @@ function startShell(): void {
           true
         );
       });
+  });
+
+  const recoveryView = document.createElement("session-recovery-view");
+  recoveryView.hidden = true;
+  root.appendChild(recoveryView);
+  if (promptRecovery && active.crypto) recoveryView.show();
+  recoveryView.addEventListener("session-device", () => {
+    recoveryView.hide();
+    verifyView.setSessionMode(true);
+    verifyView.markSessionRequested();
+    void verification?.startSessionVerification().then(transactions => {
+      if (!transactions.length) {
+        verifyView.setSessionMode(false);
+        recoveryView.show();
+        recoveryView.setStatus("No other device is available. Use your recovery passphrase/key, or reset the backup.");
+      }
+    }).catch((error: unknown) => {
+      verifyView.setSessionMode(false);
+      recoveryView.show();
+      recoveryView.setStatus(error instanceof Error ? error.message : "Could not request verification.");
+    });
+  });
+  recoveryView.addEventListener("session-restore", (event) => {
+    recoveryView.setStatus("Recovering encrypted history…", true);
+    void active.crypto!.restoreWithRecovery((event as CustomEvent<string>).detail).then(() => recoveryView.hide()).catch((error: unknown) => {
+      recoveryView.setStatus(error instanceof Error ? error.message : "Recovery failed.");
+    });
+  });
+  recoveryView.addEventListener("session-reset", (event) => {
+    recoveryView.setStatus("Confirming password and deleting the old backup…", true);
+    void resetSessionBackup(active, (event as CustomEvent<string>).detail).then(() => {
+      serverHasBackup = false;
+      recoveryView.hide();
+      backupView.update(active.crypto, false);
+      backupView.show();
+      backupView.setStatus("Old backup removed. Create a new backup with a new passphrase.", false);
+    }).catch((error: unknown) => {
+      recoveryView.setStatus(error instanceof Error ? error.message : "Reset failed. You can retry safely.");
+    });
   });
 
   const cryptoLayer = active.crypto;
@@ -1338,7 +1380,16 @@ async function completeSsoReturn(params: URLSearchParams): Promise<void> {
   }
 }
 
-function boot(): void {
+async function boot(): Promise<void> {
+  if (window.grungusPlatform?.loadLegacySettings && !localStorage.getItem("grungus-settings-migrated")) {
+    try {
+      if (!localStorage.getItem("grungus-settings")) {
+        const legacy = await window.grungusPlatform.loadLegacySettings();
+        if (legacy) localStorage.setItem("grungus-settings", legacy);
+      }
+      localStorage.setItem("grungus-settings-migrated", "1");
+    } catch { /* Preserve the old preferences so migration can be retried on next launch. */ }
+  }
   const bootParams = new URLSearchParams(location.search);
   if (bootParams.get("sso") === "1" && bootParams.get("loginToken")) {
     void completeSsoReturn(bootParams);
@@ -1381,4 +1432,4 @@ function boot(): void {
     });
 }
 
-boot();
+void boot();

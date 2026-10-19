@@ -57,6 +57,9 @@ jobs:
       - name: Renderer interaction tests
         run: xvfb-run -a npm run test:ui
 
+      - name: Vite development integration
+        run: xvfb-run -a npm run test:dev
+
   interoperability:
     name: Matrix interoperability (Synapse)
     runs-on: ubuntu-latest

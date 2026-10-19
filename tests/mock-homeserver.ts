@@ -503,7 +503,8 @@ export class MockHomeserver {
         return;
       }
       const identifier = (body.identifier ?? {}) as { user?: string };
-      const user = this.users.get(String(identifier.user ?? ""));
+      const loginName = String(identifier.user ?? "");
+      const user = this.users.get(loginName) ?? [...this.users.values()].find(candidate => candidate.userId === loginName);
       if (!user || user.password !== body.password) {
         this._err(res, 403, "M_FORBIDDEN", "Invalid username or password");
         return;
@@ -647,6 +648,18 @@ export class MockHomeserver {
       let count = 0;
       for (const perRoom of Object.values(rooms)) count += Object.keys(perRoom).length;
       this._send(res, 200, { ...backup.body, version: backup.version, count, etag: "1" });
+      return;
+    }
+
+    if (req.method === "DELETE" && route.startsWith("room_keys/version/")) {
+      const backup = this.keyBackups.get(user.username);
+      if (!backup || backup.version !== decodeURIComponent(route.slice("room_keys/version/".length))) {
+        this._err(res, 404, "M_NOT_FOUND", "Unknown backup version");
+        return;
+      }
+      this.keyBackups.delete(user.username);
+      this.backedUpKeys.delete(user.username);
+      this._send(res, 200, {});
       return;
     }
 

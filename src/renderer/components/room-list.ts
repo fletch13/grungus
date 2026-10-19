@@ -4,6 +4,7 @@
  * Events: "grungus:select-room" {roomId}, "grungus:create-room" {name},
  * "grungus:logout".
  */
+import { icon } from "./icons.ts";
 import { el } from "./ui.ts";
 import {
   mxidLocalpart,
@@ -26,6 +27,7 @@ export class RoomList extends HTMLElement {
   private _selectedRoomId: string | null = null;
   private _spaceId: string | null = null;
   private _client: MatrixClient | null = null;
+  private _query = "";
   private _showForm = false;
   private _showSpaceForm = false;
   /** every joined non-DM room (for the space add-room picker) */
@@ -75,19 +77,21 @@ export class RoomList extends HTMLElement {
 
   private _render(): void {
     const space = this._currentSpace();
+    const restoreSearchFocus = document.activeElement?.id === "room-filter";
     this.textContent = "";
 
     /* header */
     const head = el("div", { class: "sidebar-head" });
     head.appendChild(
-      el("span", { class: "head-title", text: space ? space.title : "Home" })
+      el("span", { class: "head-title", text: space ? space.title : "Your workspace" })
     );
     const addBtn = el("button", {
       class: "add-btn",
       title: "Create a room",
       "aria-label": "Create a room",
-      text: "+",
+
     });
+    addBtn.appendChild(icon("plus"));
     addBtn.addEventListener("click", () => {
       this._showForm = !this._showForm;
       this._showSpaceForm = false;
@@ -103,8 +107,9 @@ export class RoomList extends HTMLElement {
       class: "add-btn",
       title: "Create a space",
       "aria-label": "Create a space",
-      text: "🗂",
+
     });
+    spaceBtn.appendChild(icon("folder"));
     spaceBtn.addEventListener("click", () => {
       this._showSpaceForm = !this._showSpaceForm;
       this._showForm = false;
@@ -116,6 +121,9 @@ export class RoomList extends HTMLElement {
     });
     head.appendChild(spaceBtn);
     this.appendChild(head);
+    const search = el("input", { id: "room-filter", type: "search", placeholder: "Find a conversation", "aria-label": "Filter rooms", value: this._query }) as HTMLInputElement;
+    search.addEventListener("input", () => { this._query = search.value; this._filterRooms(); });
+    this.appendChild(el("div", { class: "room-search" }, icon("search", 16), search));
 
     /* inline create-space form */
     if (this._showSpaceForm) {
@@ -278,6 +286,16 @@ export class RoomList extends HTMLElement {
 
     this.appendChild(scroll);
     this.appendChild(this._buildFooter());
+    this._filterRooms();
+    if (restoreSearchFocus) { search.focus(); search.setSelectionRange(search.value.length, search.value.length); }
+  }
+
+  private _filterRooms(): void {
+    const query = this._query.trim().toLocaleLowerCase();
+    const titles = new Map(this._rooms.map(room => [room.id, room.title.toLocaleLowerCase()]));
+    for (const row of this.querySelectorAll<HTMLElement>(".room-row")) {
+      row.classList.toggle("hidden", !!query && !titles.get(row.dataset.roomId ?? "")?.includes(query));
+    }
   }
 
   private _renderSection(container: HTMLElement, label: string, rooms: Room[]): void {
@@ -340,6 +358,7 @@ export class RoomList extends HTMLElement {
         (room.id === this._selectedRoomId ? " active" : "") +
         (room.unread > 0 ? " has-unread" : ""),
       dataset: { roomId: room.id },
+      role: "button", tabindex: "0", "aria-current": room.id === this._selectedRoomId ? "page" : undefined,
     });
     const av = document.createElement("g-avatar");
     av.update({
@@ -352,7 +371,7 @@ export class RoomList extends HTMLElement {
     row.appendChild(
       el("span", {
         class: "room-name",
-        text: `${room.isEncrypted ? "🔒 " : ""}${room.title}`,
+        text: room.title,
       })
     );
     if (room.unread > 0) {
@@ -364,8 +383,9 @@ export class RoomList extends HTMLElement {
       class: "room-delete",
       title: "Delete chat (leaves the room)",
       "aria-label": `Delete chat ${room.title}`,
-      text: "🗑",
+
     });
+    del.appendChild(icon("trash", 14));
     let armed = false;
     let armTimer: ReturnType<typeof setTimeout> | null = null;
     del.addEventListener("click", (ev) => {
@@ -377,7 +397,7 @@ export class RoomList extends HTMLElement {
         armTimer = setTimeout(() => {
           armed = false;
           del.classList.remove("armed");
-          del.textContent = "🗑";
+          del.replaceChildren(icon("trash", 14));
         }, 3_000);
         return;
       }
@@ -390,6 +410,7 @@ export class RoomList extends HTMLElement {
       );
     });
     row.appendChild(del);
+    row.addEventListener("keydown", event => { if (event.target === row && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); row.click(); } });
     row.addEventListener("click", () => {
       this.dispatchEvent(
         new CustomEvent("grungus:select-room", {
@@ -433,8 +454,9 @@ export class RoomList extends HTMLElement {
     const cog = el("button", {
       class: "settings-cog",
       title: "User settings",
-      text: "⚙",
+      "aria-label": "User settings",
     });
+    cog.appendChild(icon("settings", 17));
     cog.addEventListener("click", () => {
       this.dispatchEvent(new CustomEvent("grungus:open-settings", { bubbles: true }));
     });
@@ -462,8 +484,9 @@ export class RoomList extends HTMLElement {
       class: "backup-btn",
       title: "Key backup / restore",
       "aria-label": "Key backup",
-      text: "🔑",
+
     });
+    backup.appendChild(icon("key", 16));
     backup.addEventListener("click", () => {
       this.dispatchEvent(new CustomEvent("grungus:open-backup", { bubbles: true }));
     });
@@ -473,8 +496,9 @@ export class RoomList extends HTMLElement {
       class: "backup-btn",
       title: "Verify this session against your other devices",
       "aria-label": "Verify session",
-      text: "🛡",
+
     });
+    verifySession.appendChild(icon("shield", 16));
     verifySession.addEventListener("click", () => {
       this.dispatchEvent(new CustomEvent("grungus:verify-session", { bubbles: true }));
     });

@@ -1,10 +1,4 @@
-/*
- * Grungus — renderer entry.
- *
- * ES-module imports; esbuild bundles everything into dist/renderer.js as
- * ONE classic script (Chromium/Electron block ES modules from file://).
- * Import order is irrelevant — the module graph resolves dependencies.
- */
+/* Renderer entry: Vite builds native ES modules; Tailwind compiles the linked theme. */
 import "./components/ui.ts";
 import "./components/login-view.ts";
 import "./components/space-rail.ts";
@@ -18,4 +12,5 @@ import "./components/verify-view.ts";
 import "./components/backup-view.ts";
 import "./components/settings-view.ts";
 import "./components/incoming-call.ts";
+import "./components/session-recovery-view.ts";
 import "./app.ts";

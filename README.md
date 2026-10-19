@@ -9,7 +9,7 @@ familiar, Discord-like UI.
 Not affiliated with Discord or Element. Grungus is an independent client
 for an open protocol.
 
-![Grungus screenshot](docs/screenshot.png)
+![Grungus workspace preview with sample conversations](docs/screenshot.png)
 
 ## Features
 
@@ -437,7 +437,7 @@ for an open protocol.
 └───────────────┬──────────────────────────────────────────────┘
                 │ contextBridge (contextIsolation, sandbox on)
 ┌───────────────┴──────────────────────────────────────────────┐
-│ Renderer                 src/renderer/ → dist/renderer.js     │
+│ Renderer            src/renderer/ → dist/assets/*.js + CSS  │
 │                                                               │
 │   app.ts ── orchestrates state and wiring                     │
 │     ├── services/matrix-client.ts  typed Matrix CS API client │
@@ -449,20 +449,23 @@ for an open protocol.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **esbuild** produces the main process, the app preload, and the capture
-  picker preload as CJS bundles (`.cjs` because package.json is `type:
-  module`). The app renderer and capture picker each have a classic-script
-  IIFE bundle in `dist/`. A bundle is required: Chromium and
-  Electron block ES modules loaded from `file://` (CORS). libolm's
-  universal wrapper needs fs/path/crypto shims when bundling for the
-  browser (handled in scripts/build.mjs), and `olm.wasm` ships in `dist/`.
+- **Vite + Tailwind CSS** build the renderer and capture picker as native ES
+  modules with hashed JavaScript/CSS assets. Tailwind's theme tokens and
+  component layer define the charcoal/mint interface, light theme, responsive
+  layouts, and consistent controls. Existing custom elements remain the UI
+  components; the Matrix services are independent of the build tools.
+- **esbuild** bundles the Electron main process and sandboxed preloads as
+  `.cjs`. Packaged renderer pages load from the secure `grungus://app` origin,
+  which supports modules, authenticated fetches, WASM, and E2EE workers. The
+  protocol serves only bundled renderer asset types. Vite emits `olm.wasm`
+  and the LiveKit encryption worker unchanged at the renderer root.
 - **Strict TypeScript end to end**: typed Matrix event/sync wire shapes,
   a typed client event bus, a timeline item union
   (`MessageItem | SystemItem`), and `HTMLElementTagNameMap` entries so
   `document.createElement("chat-view")` returns the right element class.
 - **Tests and examples run the .ts sources directly** on Node ≥ 24 via
   native type stripping — no separate build for the test suite.
-- No framework: native custom elements; separate styles for the app and capture picker.
+- Native custom elements; Tailwind utilities and shared component styles for the app and capture picker.
 - The session and the E2EE identity pickles are stored encrypted via
   Electron's `safeStorage` when the platform keychain is available.
 - CSP: scripts and styles only from the app plus `'wasm-unsafe-eval'`
@@ -521,7 +524,9 @@ same way Element signs them.
 
 ```bash
 npm install
-npm start        # build + launch the desktop app
+npm start        # production build + launch the desktop app
+npm run dev      # Vite development server + Electron
+npm run dev:web  # Vite development server in a browser
 ```
 
 Log in with your Matrix credentials (e.g. `matrix.org` + username +
@@ -530,7 +535,7 @@ password), or with an access token from Element: Settings → Help & About.
 Other scripts:
 
 ```bash
-npm run build      # esbuild -> dist/
+npm run build      # Electron (esbuild) + renderer (Vite/Tailwind) -> dist/
 npm run typecheck  # tsc --noEmit (strict)
 npm test           # client + E2EE suites vs the in-repo mock homeserver
 npm run smoke      # build + boot the app, then exit (--smoke)
@@ -538,13 +543,13 @@ npm run smoke      # build + boot the app, then exit (--smoke)
 
 ### Building distributables (no npm start)
 
-The app is fully bundled into `dist/` (main + preload + renderer +
-styles + `olm.wasm` + the LiveKit E2EE worker), so packaged builds ship
+The app is fully bundled into `dist/` (main + preloads + Vite renderer
+assets + `olm.wasm` + the LiveKit E2EE worker), so packaged builds ship
 ZERO node_modules — electron-builder wraps the dist plus the Electron
 runtime:
 
 ```bash
-npm run dist       # esbuild + electron-builder -> release/
+npm run dist       # Vite/Tailwind + Electron packaging -> release/
 npm run dist:dir   # same, but only the portable directory (fast)
 ```
 
@@ -588,19 +593,31 @@ resource-editing step), which this system deliberately stays free of —
 hence the CI-only path. The `npm run dist:win` script exists for
 Windows machines that have the repo checked out.
 
-### Web demo mode
-
-The renderer bundle is plain web tech and `dist/` is self-contained, so
-you can serve it without Electron:
+### Frontend development and web preview
 
 ```bash
+npm run dev      # Electron + Vite at http://127.0.0.1:5173
+npm run dev:web  # browser-only Vite development server
 npm run build
-cd dist && python3 -m http.server 8080
-# open http://localhost:8080
+npm run preview  # serve the production renderer build
 ```
 
-In this mode the session and E2EE pickles are stored in `localStorage`
-(fine for testing, use the desktop app for day-to-day).
+Vite provides renderer reloads and CSS hot updates. Restart `npm run dev`
+after changing Electron main/preload code. `vite.config.ts` configures both
+HTML entries, Tailwind, and the WASM/worker runtime assets. The strict packaged
+CSP remains in place; only development permits Vite's injected styles.
+
+Browser sessions and crypto pickles live in `localStorage` and are intended
+for testing. Desktop sessions and crypto stay in their native vault files.
+On the first desktop launch with the new renderer origin, the app copies
+legacy appearance and device preferences from the previous file origin if
+new-origin preferences have not already been set.
+
+`npm run test:ui` builds the renderer fixtures with Vite and tests their real
+Tailwind CSS, Olm WASM, E2EE worker loading, navigation, filtering, capture
+consent, and legacy preference recovery. `npm run test:dev` checks the Vite
+development server in Electron. `npm run smoke` tests the production renderer
+and runtime assets with an isolated profile, leaving your account untouched.
 
 ## Security notes
 
@@ -644,7 +661,7 @@ In this mode the session and E2EE pickles are stored in `localStorage`
 Checks exercise the typed client modules and custom elements that ship in the app:
 
 1. **Typecheck** — `npm run typecheck` (`tsc --noEmit`, strict, across
-   src/tests/examples/livekit).
+   src/tests/examples/livekit and the Vite configuration).
 2. **Integration tests vs an in-repo mock homeserver** — `npm test` covers
    authentication, sync, messages and relations, history, media, calls,
    verification, cross-signing, key recovery, and fail-closed encryption.
@@ -824,3 +841,23 @@ container and volume afterward. `SYNAPSE_IMAGE` overrides the pinned version.
 CI runs renderer checks under Xvfb and runs the real-homeserver suite in a
 separate job, alongside the mock integration tests and strict typechecking
 (which includes the deployable token service).
+
+### Recovery after sign-in
+
+After a new login (password, token, or SSO), Grungus prompts you to verify
+with another signed-in device or restore history using your recovery
+passphrase/security key. Device verification uses the existing emoji/QR flow;
+recovery restores keys but does not itself mark a device cross-signed. You can
+skip and return through the sidebar's verification and key-backup actions.
+Existing saved sessions resume without repeating the prompt.
+
+If neither recovery method is available, choose **I cannot recover my keys**.
+After you acknowledge the possible loss of older history, Grungus checks your
+account password with the homeserver using a temporary session, then deletes
+the current backup version and clears the obsolete `m.megolm_backup.v1` secret.
+The temporary session is logged out without replacing your current session.
+You are then prompted to create a backup with a new passphrase. This requires
+password login support; SSO-only accounts must recover through another device
+or their homeserver's account recovery process. Reset does not replace your
+cross-signing identity or erase keys held locally on your devices. History
+whose only keys were in the deleted backup can no longer be recovered.

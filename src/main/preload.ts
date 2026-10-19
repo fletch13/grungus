@@ -10,6 +10,7 @@ import { contextBridge, ipcRenderer } from "electron";
 
 contextBridge.exposeInMainWorld("grungusPlatform", {
   isElectron: true,
+  loadLegacySettings: (): Promise<string | null> => ipcRenderer.invoke("settings:legacy"),
   /** Persist the login session (JSON-serializable). */
   saveSession: (session: unknown): Promise<unknown> =>
     ipcRenderer.invoke("session:save", session),

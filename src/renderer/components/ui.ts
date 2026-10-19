@@ -139,7 +139,7 @@ export class GAvatar extends HTMLElement {
     const av = el("span", { class: "av" });
     av.style.width = `${size}px`;
     av.style.height = `${size}px`;
-    av.style.background = colorFor(o.userId || o.name || "?");
+    av.style.background = colorFor(o.userId || o.name || "?").replace("58%, 48%", "28%, 34%");
     av.style.fontSize = `${Math.max(10, Math.round(size * 0.4))}px`;
     av.textContent = initials(o.name);
 

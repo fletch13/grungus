@@ -3,6 +3,7 @@
  * Matrix Spaces map onto Discord servers; Home shows all joined rooms.
  * Emits "grungus:select-space" with { spaceId: string | null }.
  */
+import { icon } from "./icons.ts";
 import { el } from "./ui.ts";
 import type { MatrixClient, Room } from "../services/matrix-client.ts";
 
@@ -35,6 +36,8 @@ export class SpaceRail extends HTMLElement {
     const spaces = this._spaces;
     const client = this._client;
     this.textContent = "";
+    this.setAttribute("role", "navigation");
+    this.setAttribute("aria-label", "Spaces");
 
     const home = el("button", {
       class: "rail-btn" + (this._selectedId ? "" : " active"),
@@ -42,7 +45,8 @@ export class SpaceRail extends HTMLElement {
       "aria-label": "Home",
     });
     home.appendChild(el("span", { class: "rail-indicator" }));
-    home.appendChild(el("span", { text: "G" }));
+    home.appendChild(icon("bubble", 23));
+    home.setAttribute("aria-pressed", String(!this._selectedId));
     home.addEventListener("click", () => this._select(null));
     this.appendChild(home);
 
@@ -54,6 +58,7 @@ export class SpaceRail extends HTMLElement {
         title: space.title,
         "aria-label": space.title,
       });
+      btn.setAttribute("aria-pressed", String(this._selectedId === space.id));
       btn.appendChild(el("span", { class: "rail-indicator" }));
       const av = document.createElement("g-avatar");
       av.update({

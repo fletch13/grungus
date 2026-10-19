@@ -1,5 +1,6 @@
 import { BrowserWindow, type DesktopCapturerSource } from "electron";
 import path from "node:path";
+import { rendererUrl } from "./app-assets.ts";
 
 /** A separate sandboxed window with a bridge limited to this one capture request. */
 export function chooseCaptureSource(
@@ -37,6 +38,6 @@ export function chooseCaptureSource(
     picker.webContents.on("will-navigate", event => event.preventDefault());
     picker.on("closed", () => finish(null));
     picker.once("ready-to-show", () => picker.show());
-    void picker.loadFile(path.join(__dirname, "capture-picker.html")).catch(() => finish(null));
+    void picker.loadURL(rendererUrl("capture-picker.html")).catch(() => finish(null));
   });
 }

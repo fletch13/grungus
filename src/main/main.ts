@@ -7,17 +7,20 @@
  * platform keychain is available (plain file fallback, see README security
  * notes).
  *
- * esbuild bundles this to dist/main.js (CJS); "main" in package.json
- * points there. dist/ also holds preload.js, index.html, renderer.js.
+ * esbuild bundles this to dist/main.cjs. Vite emits index.html and hashed
+ * renderer assets, served over the secure grungus://app origin.
  */
 import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
+import { readLegacySettings } from "./legacy-settings.ts";
+import { registerAppAssets, rendererUrl } from "./app-assets.ts";
 import { chooseCaptureSource } from "./capture-picker.ts";
 import { CryptoVault } from "./crypto-vault.ts";
 import { startSsoLoopback, type SsoLoopback } from "./sso-loopback.ts";
 
 const SMOKE = process.argv.includes("--smoke");
+if (SMOKE && process.env.GRUNGUS_SMOKE_PROFILE) app.setPath("userData", process.env.GRUNGUS_SMOKE_PROFILE);
 const DEBUG = process.argv.includes("--debug");
 const SESSION_FILE = "grungus-session.json";
 
@@ -92,6 +95,10 @@ ipcMain.handle("crypto:put", (_event, key: string, value: string): boolean => {
   cryptoVault().put(String(key), String(value));
   return true;
 });
+
+/* Read legacy local preferences once; sessions and crypto remain in their native vaults. */
+let legacySettings: Promise<string | null> | undefined;
+ipcMain.handle("settings:legacy", () => legacySettings ??= readLegacySettings());
 
 /* ---- SSO (Electron): system browser with a loopback capture ---- */
 
@@ -219,8 +226,8 @@ function createWindow(): BrowserWindow {
     }
   );
 
-  /* dist/ holds main.js, preload.js, index.html, renderer.js, styles/ */
-  void win.loadFile(path.join(__dirname, "index.html"));
+  /* Production assets use a secure standard scheme; development uses local Vite. */
+  void win.loadURL(rendererUrl());
 
   win.once("ready-to-show", () => {
     /* open using the full screen — a 1280x800 window on a desktop
@@ -228,8 +235,25 @@ function createWindow(): BrowserWindow {
     win.maximize();
     win.show();
     if (SMOKE) {
-      console.log("[grungus] smoke: window ready");
-      setTimeout(() => app.exit(0), 500);
+      void (async () => {
+        await win.webContents.executeJavaScript(`new Promise((resolve, reject) => {
+          const deadline = Date.now() + 8000;
+          const check = () => {
+            const login = document.querySelector('login-view .login-card');
+            if (login && getComputedStyle(document.querySelector('login-view')).display === 'grid') return resolve(true);
+            if (Date.now() > deadline) return reject(new Error('Vite renderer did not initialize'));
+            setTimeout(check, 50);
+          };
+          check();
+        })`);
+        await win.webContents.executeJavaScript(`Promise.all(['olm.wasm', 'livekit-client.e2ee.worker.js'].map(async file => {
+          const response = await fetch(new URL(file, document.baseURI));
+          if (!response.ok) throw new Error('Missing runtime asset: ' + file);
+          if (file.endsWith('.wasm')) await WebAssembly.compile(await response.arrayBuffer());
+        }))`);
+        console.log("[grungus] smoke: Vite renderer, Tailwind styles, and crypto assets ready");
+        app.exit(0);
+      })().catch(error => { console.error("[grungus] smoke:", error); app.exit(1); });
     }
   });
 
@@ -265,6 +289,7 @@ if (!gotLock) {
   });
 
   void app.whenReady().then(() => {
+    registerAppAssets();
     createWindow();
 
     app.on("activate", () => {

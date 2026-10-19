@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <!--
     CSP: scripts/styles only from this app; 'wasm-unsafe-eval' permits
     WebAssembly (libolm) without allowing eval(); images from blob/data
@@ -10,18 +11,13 @@
   -->
   <meta
     http-equiv="Content-Security-Policy"
-    content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; connect-src *"
+    content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; connect-src *; worker-src 'self' blob:; object-src 'none'; base-uri 'self'"
   />
   <title>Grungus</title>
-  <link rel="stylesheet" href="styles/theme.css" />
+  <link rel="stylesheet" href="/styles/theme.css" />
 </head>
 <body>
   <div id="root"></div>
-  <!--
-    One classic-script bundle (dist/renderer.js) built by esbuild. Kept as a
-    classic script — not type="module" — so Electron's loadFile (file://)
-    works: Chromium blocks ES modules from file:// origins.
-  -->
-  <script src="./renderer.js"></script>
+  <script type="module" src="/index.ts"></script>
 </body>
 </html>

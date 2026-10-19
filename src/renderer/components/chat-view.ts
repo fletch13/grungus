@@ -4,6 +4,7 @@
  * incremental appends (live events, local echoes) or trigger full
  * re-renders (echo reconciliation markers).
  */
+import { icon } from "./icons.ts";
 import { el, formatDay, sameDay } from "./ui.ts";
 import type { MatrixClient, MessageItem, Room, RoomEvent, TimelineItem } from "../services/matrix-client.ts";
 
@@ -53,7 +54,8 @@ export class ChatView extends HTMLElement {
 
     const wrap = el("div", { class: "composer-wrap" });
     const composer = el("div", { class: "composer" });
-    const attach = el("button", { class: "attach-btn", title: "Send an image", text: "📎" });
+    const attach = el("button", { class: "attach-btn", title: "Send an image", "aria-label": "Send an image" });
+    attach.appendChild(icon("plus", 20));
     const fileInput = el("input", {
       type: "file",
       accept: "image/*,image/gif",
@@ -144,17 +146,22 @@ export class ChatView extends HTMLElement {
   private _renderHeader(): void {
     const room = this._room;
     this._header.textContent = "";
+    const mobileRooms = el("button", { class: "mobile-room-toggle", "aria-label": "Show conversations", title: "Show conversations" }, icon("folder"));
+    mobileRooms.addEventListener("click", () => this.closest("app-shell")?.classList.toggle("show-rooms"));
+    this._header.appendChild(mobileRooms);
     if (!room) {
       this._header.appendChild(el("span", { class: "title", text: "Grungus" }));
       return;
     }
+    this._header.appendChild(el("span", { class: "channel-symbol" }, icon(room.isDirect ? "bubble" : "hash", 22)));
     this._header.appendChild(
       el("span", {
         class: "title",
-        text: `${room.isEncrypted ? "🔒 " : ""}${room.title}`,
+        text: room.title,
         title: room.isEncrypted ? "End-to-end encrypted (megolm)" : undefined,
       })
     );
+    if (room.isEncrypted) this._header.appendChild(el("span", { class: "encryption-label", title: "End-to-end encrypted" }, icon("shield", 13), "Encrypted"));
     const sub = room.topic
       ? `${room.topic}  ·  ${room.joinedMemberCount} members`
       : `${room.joinedMemberCount} members`;
@@ -167,9 +174,11 @@ export class ChatView extends HTMLElement {
     } else {
       const callBtn = el("button", {
         class: "call-btn-header",
-        text: this._callOngoing ? "Join call" : "📞",
+        text: this._callOngoing ? "Join call" : undefined,
+        "aria-label": this._callOngoing ? "Join call" : "Start a call",
         title: this._callOngoing ? "Join the ongoing call" : "Start a call",
       });
+      if (!this._callOngoing) callBtn.appendChild(icon("phone"));
       callBtn.addEventListener("click", () => {
         this.dispatchEvent(
           new CustomEvent("grungus:start-call", {
@@ -184,9 +193,10 @@ export class ChatView extends HTMLElement {
       if (!this._callOngoing) {
         const videoBtn = el("button", {
           class: "call-btn-header",
-          text: "🎥",
+          "aria-label": "Start a video call",
           title: "Start a video call",
         });
+        videoBtn.appendChild(icon("video"));
         videoBtn.addEventListener("click", () => {
           this.dispatchEvent(
             new CustomEvent("grungus:start-call", {
@@ -201,9 +211,10 @@ export class ChatView extends HTMLElement {
     if (room.isEncrypted) {
       const verifyBtn = el("button", {
         class: "call-btn-header",
-        text: "🛡",
+        "aria-label": "Verify devices",
         title: "Verify other members' devices (SAS)",
       });
+      verifyBtn.appendChild(icon("shield"));
       verifyBtn.addEventListener("click", () => {
         this.dispatchEvent(
           new CustomEvent("grungus:verify-devices", { bubbles: true })

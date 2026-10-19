@@ -1162,6 +1162,26 @@ export class E2eeCrypto {
     }
   }
 
+  /** Explicit reset only: fail closed on lookup errors and clear obsolete backup material. */
+  async deleteCurrentKeyBackup(): Promise<void> {
+    let version: KeyBackupVersion | null;
+    try {
+      version = await this.host.api<KeyBackupVersion>("GET", "/_matrix/client/v3/room_keys/version");
+    } catch (error) {
+      if ((error as { errcode?: string }).errcode !== "M_NOT_FOUND") throw error;
+      version = null;
+    }
+    if (version && !version.version) throw new Error("Homeserver returned an invalid backup version");
+    if (version?.version) {
+      await this.host.api("DELETE", `/_matrix/client/v3/room_keys/version/${encodeURIComponent(version.version)}`);
+    }
+    this._backup?.pk.free();
+    this._backup?.privateKey.fill(0);
+    this._backup = null;
+    this._backedUpSessions.clear();
+    await this.host.api("PUT", `/_matrix/client/v3/user/${encodeURIComponent(this.host.userId!)}/account_data/m.megolm_backup.v1`, { body: {} });
+  }
+
   /**
    * Create a server-side key backup secured by a passphrase. The private
    * key never leaves this device: the passphrase derives a curve25519 key
