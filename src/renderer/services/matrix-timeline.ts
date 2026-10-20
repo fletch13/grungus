@@ -106,7 +106,11 @@ export class MatrixTimeline {
             }
           : null;
 
+      const relation = content["m.relates_to"] as { rel_type?: string; event_id?: string } | undefined;
+      const aggregate = (ev.unsigned?.["m.relations"] as { "m.thread"?: { count?: number } } | undefined)?.["m.thread"];
       return {
+        threadRootId: relation?.rel_type === "m.thread" && typeof relation.event_id === "string" ? relation.event_id : undefined,
+        threadReplyCount: typeof aggregate?.count === "number" ? aggregate.count : undefined,
         kind: "message",
         id: ev.event_id ?? null,
         sender: ev.sender ?? "",

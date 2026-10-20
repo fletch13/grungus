@@ -466,7 +466,7 @@ export class MockHomeserver {
       return;
     }
 
-    if (parts[0] !== "_matrix" || parts[1] !== "client" || parts[2] !== "v3") {
+    if (parts[0] !== "_matrix" || parts[1] !== "client" || !["v3", "v1"].includes(parts[2] ?? "")) {
       this._err(res, 404, "M_UNRECOGNIZED", "Unknown endpoint");
       return;
     }
@@ -1214,6 +1214,31 @@ export class MockHomeserver {
       user.pendingLeaveSync.add(room.id);
       this._send(res, 200, {});
       return;
+    }
+
+    const threadsMatch = route.match(/^rooms\/([^/]+)\/threads$/);
+    const repliesMatch = route.match(/^rooms\/([^/]+)\/relations\/([^/]+)\/m.thread$/);
+    const eventMatch = route.match(/^rooms\/([^/]+)\/event\/([^/]+)$/);
+    if (req.method === "GET" && (threadsMatch || repliesMatch || eventMatch)) {
+      const match = (threadsMatch || repliesMatch || eventMatch)!;
+      const room = this.rooms.get(match[1]!);
+      if (!room) { this._err(res, 404, "M_NOT_FOUND", "Unknown room"); return; }
+      if (room.members.get(user.userId) !== "join") { this._err(res, 403, "M_FORBIDDEN", "Not in room"); return; }
+      if (eventMatch) {
+        const event = room.events.find(event => event.event_id === eventMatch[2]);
+        if (!event) this._err(res, 404, "M_NOT_FOUND", "Event not found"); else this._send(res, 200, event);
+        return;
+      }
+      const related = room.events.filter(event => (event.content["m.relates_to"] as { rel_type?: string })?.rel_type === "m.thread");
+      let events;
+      if (repliesMatch) events = related.filter(event => (event.content["m.relates_to"] as { event_id?: string }).event_id === repliesMatch[2]);
+      else {
+        const roots = new Set(related.map(event => (event.content["m.relates_to"] as { event_id?: string }).event_id));
+        events = room.events.filter(event => roots.has(event.event_id)).map(event => ({ ...event, unsigned: { ...event.unsigned, "m.relations": { "m.thread": { count: related.filter(reply => (reply.content["m.relates_to"] as { event_id?: string }).event_id === event.event_id).length } } } }));
+      }
+      const from = Number(url.searchParams.get("from") || 0);
+      const limit = Math.min(this.historyPageLimit, Number(url.searchParams.get("limit") || 30));
+      this._send(res, 200, { chunk: events.slice(from, from + limit), ...(from + limit < events.length ? { next_batch: String(from + limit) } : {}) }); return;
     }
 
     /* GET room state (e.g. the m.room.encryption probe in joinRoom) */

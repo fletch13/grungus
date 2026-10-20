@@ -101,9 +101,12 @@ export class MatrixMessaging {
     if (encrypted && !this.host.crypto) {
       throw new Error("Cannot send: E2EE is unavailable in this encrypted room");
     }
-    const payload = encrypted
+    const payload: Record<string, unknown> = encrypted
       ? await this.host.crypto!.encryptRoomMessage(roomId, content, type)
       : content;
+    const relation = content["m.relates_to"] as { rel_type?: string } | undefined;
+    // Thread routing must remain visible for homeserver thread indexes; the message body stays encrypted.
+    if (encrypted && relation?.rel_type === "m.thread") payload["m.relates_to"] = relation;
     const res = await this.host.api<{ event_id?: string }>(
       "PUT",
       `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/${encodeURIComponent(

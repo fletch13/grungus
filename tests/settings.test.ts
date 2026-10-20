@@ -238,3 +238,15 @@ test("custom backgrounds persist, reject unsafe values, and retain the prior set
   assert.equal(store.get("backgroundImage"), image);
   assert.equal(notified, false);
 });
+
+
+test("system theme and desktop-preview privacy preferences survive reloads", () => {
+  localStorage.clear();
+  const store = new SettingsStore();
+  store.set("theme", "system"); store.set("notificationPreviews", false); store.set("showTypingIndicator", false);
+  const restored = new SettingsStore();
+  assert.equal(restored.get("theme"), "system");
+  assert.equal(restored.get("notificationPreviews"), false);
+  assert.equal(restored.get("showTypingIndicator"), false);
+  localStorage.clear();
+});

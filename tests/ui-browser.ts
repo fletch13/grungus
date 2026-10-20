@@ -1,3 +1,6 @@
+import "../src/renderer/components/room-settings.ts";
+import { formatMessage } from "../src/renderer/services/message-format.ts";
+import { applyTheme } from "../src/renderer/services/appearance.ts";
 import { applyBackground, prepareBackground } from "../src/renderer/services/background.ts";
 import "../src/renderer/components/call-view.ts";
 import "../src/renderer/components/room-browser.ts";
@@ -275,11 +278,16 @@ async function run(): Promise<{ message: string }> {
     { deviceId: "SELF", displayName: "This laptop", lastSeenTs: null, lastSeenIp: null },
     { deviceId: "OTHER", displayName: "Old phone", lastSeenTs: null, lastSeenIp: null },
   ];
+  let renamedDevice = "";
+  let clearedMedia = 0;
   let deleteCalls = 0;
   let releaseDelete: (() => void) | undefined;
   const settingsClient = {
     deviceId: "SELF", userId: "@me:test", accessToken: "token",
     getDevices: async () => [...devices], getIgnoredUsers: () => [], getProfile: async () => ({}),
+    crypto: { getKeyBackupVersion: async () => ({ version: "1" }) },
+    setDeviceName: async (id: string, name: string) => { assert(id === "SELF", "Rename must target the selected session"); renamedDevice = name; devices[0]!.displayName = name; },
+    clearMediaCache: () => { clearedMedia++; },
     deleteDevices: async (ids: string[], password: string) => {
       deleteCalls++;
       assert(ids.length === 1 && ids[0] === "OTHER", "Session logout must target the selected device");
@@ -292,6 +300,11 @@ async function run(): Promise<{ message: string }> {
   sessionSettings.update(settingsClient, new SettingsStore(), null);
   sessionSettings.show("sessions");
   await tick();
+  clickByText(sessionSettings, "Rename");
+  const sessionName = sessionSettings.querySelector<HTMLInputElement>('[aria-label="Session name"]')!;
+  sessionName.value = "My workstation";
+  sessionSettings.querySelector<HTMLFormElement>('[aria-label="Rename this session"]')!.requestSubmit(); await tick();
+  assert(renamedDevice === "My workstation" && sessionSettings.textContent?.includes("Device renamed"), "Session renaming must work through an inline form");
   clickByText(sessionSettings, "Log out");
   let devicePassword = sessionSettings.querySelector<HTMLInputElement>('input[type="password"]')!;
   assert(devicePassword && document.activeElement === devicePassword, "Session logout must display and focus an inline password field");
@@ -321,7 +334,54 @@ async function run(): Promise<{ message: string }> {
   await tick();
   clickByText(sessionSettings, "Log out");
   assert(accountLogout, "Account logout must dispatch the application's shared logout action");
-  sessionSettings.hide(); sessionSettings.remove();
+  sessionSettings.show("security"); await tick();
+  assert(sessionSettings.textContent?.includes("A recovery backup is available"), "Security settings must show actual server backup availability");
+  let recoveryOpened = false;
+  let verificationOpened = false;
+  sessionSettings.addEventListener("grungus:open-backup", () => { recoveryOpened = true; });
+  sessionSettings.addEventListener("grungus:verify-session", () => { verificationOpened = true; });
+  clickByText(sessionSettings, "Manage recovery backup"); clickByText(sessionSettings, "Verify this session");
+  assert(recoveryOpened && verificationOpened, "Security actions must open the app's real recovery and verification flows");
+  const settingSearch = sessionSettings.querySelector<HTMLInputElement>('[aria-label="Search settings"]')!;
+  settingSearch.focus();
+  settingSearch.value = "microphone"; settingSearch.dispatchEvent(new Event("input"));
+  assert(document.activeElement?.getAttribute("aria-label") === "Search settings", "Settings search must preserve keyboard focus while filtering");
+  assert(sessionSettings.querySelector(".settings-search-result")?.textContent === "Voice & Video", "Settings search must find controls by keyword");
+  clickByText(sessionSettings, "Voice & Video"); await tick();
+  assert(sessionSettings.querySelector('[aria-label="Microphone"]') && sessionSettings.textContent?.includes("Test camera"), "Device settings must expose selectors and explicit previews");
+  const nativeGetUserMedia = navigator.mediaDevices.getUserMedia;
+  const previewCanvas = document.createElement("canvas"); previewCanvas.width = 160; previewCanvas.height = 90;
+  previewCanvas.getContext("2d")!.fillRect(0, 0, 160, 90);
+  const previewStream = previewCanvas.captureStream(1);
+  let previewRequests = 0;
+  navigator.mediaDevices.getUserMedia = async constraints => {
+    previewRequests++;
+    assert(constraints?.audio === false && !!constraints?.video, "Camera test must not capture microphone audio");
+    return previewStream;
+  };
+  try {
+    assert(previewRequests === 0, "Opening device settings must not capture devices automatically");
+    clickByText(sessionSettings, "Test camera"); await tick();
+    assert(Number(previewRequests) === 1 && !sessionSettings.querySelector<HTMLVideoElement>(".settings-camera-preview")!.hidden, "Camera preview must start only after an explicit click");
+    sessionSettings.show("advanced"); await tick();
+    assert(previewStream.getTracks().every(track => track.readyState === "ended"), "Leaving Voice & Video must stop every preview track");
+  } finally { navigator.mediaDevices.getUserMedia = nativeGetUserMedia; previewStream.getTracks().forEach(track => track.stop()); }
+
+  clickByText(sessionSettings, "Clear downloaded media");
+  assert(clearedMedia === 1 && settingsClient.accessToken === "token", "Clearing media must preserve the active session");
+  assert(!sessionSettings.textContent?.includes("Reset device data & log out"), "Advanced settings must not offer the broken destructive cache reset");
+  sessionSettings.show("notifications"); await tick();
+  assert(sessionSettings.querySelector('[aria-label="Show message previews in notifications"]'), "Notifications must offer a private-preview control");
+  sessionSettings.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  assert(sessionSettings.hidden, "Escape must close settings");
+  sessionSettings.remove();
+  applyTheme("system");
+  assert(document.body.classList.contains("theme-light") === matchMedia("(prefers-color-scheme: light)").matches, "System theme must follow the operating system");
+  applyTheme("dark");
+  const formatting = document.createElement("div");
+  formatting.append(formatMessage('**bold** *italic* `code` ~~old~~ [safe](https://example.org) <img src=x onerror=alert(1)> [unsafe](javascript:alert(1))'));
+  assert(formatting.querySelector("strong")?.textContent === "bold" && formatting.querySelector("code")?.textContent === "code", "Markdown must render supported formatting");
+  assert(formatting.querySelectorAll("a").length === 1 && !formatting.querySelector("img"), "Markdown must never interpret HTML or unsafe URL schemes");
 
   const callScreen = document.createElement("call-view");
   document.body.append(callScreen);
@@ -507,6 +567,19 @@ async function run(): Promise<{ message: string }> {
   room.roomType = null;
   chat.setRoom(room, client, "@me:test");
   assert(chat.querySelector('[aria-label="Start a call"]'), "Text rooms must retain their ordinary call controls");
+  chat.setTypingUsers(["Friend"]);
+  chat.applyPreferences({ enterToSend: true, sendTyping: true, showTimestamps: true, showTyping: false });
+  assert(chat.querySelector(".typing-bar")?.textContent === "", "Typing display preference must hide incoming indicators");
+  chat.applyPreferences({ enterToSend: true, sendTyping: true, showTimestamps: true, showTyping: true });
+  assert(chat.querySelector(".typing-bar")?.textContent?.includes("Friend"), "Re-enabling typing display must restore current indicator state");
+  const formattedMessage = document.createElement("message-item");
+  document.body.append(formattedMessage);
+  const formattedItem = { ...timeline[0]!, body: "**formatted**" };
+  formattedMessage.update(formattedItem, { client: null, room: null, renderMarkdown: true });
+  assert(formattedMessage.querySelector(".msg-body strong")?.textContent === "formatted", "Markdown preferences must apply to message rendering");
+  formattedMessage.update(formattedItem, { client: null, room: null, renderMarkdown: false });
+  assert(!formattedMessage.querySelector("strong") && formattedMessage.querySelector(".msg-body")?.textContent === "**formatted**", "Turning Markdown off must preserve literal message text");
+  formattedMessage.remove();
   const messageInput = chat.querySelector<HTMLTextAreaElement>("textarea")!;
   messageInput.value = "hello world";
   messageInput.setSelectionRange(6, 11);
@@ -620,6 +693,82 @@ async function run(): Promise<{ message: string }> {
   gifMessage.update({ ...timeline[0]!, body: "/gif https://evil.test/test.gif" }, { client: null, room: null });
   assert(!gifMessage.querySelector(".remote-gif") && gifMessage.textContent?.includes("/gif"), "Unsupported /gif URLs must render as text");
   gifMessage.remove();
+  const workspaceRoom = createRoomRecord("!workspace:test"); workspaceRoom.title = "Workspace room"; workspaceRoom.name = "Workspace room";
+  const threadRoot = { ...timeline[0]!, id: "$root", body: "Planning discussion", threadReplyCount: 1 };
+  const threadReply = { ...timeline[1]!, id: "$reply", body: "First thread reply", threadRootId: "$root" };
+  workspaceRoom.timeline = [threadRoot, threadReply];
+  let sentThread = "";
+  const workspaceClient = {
+    userId: "@me:test", avatarSrc: async () => null, getPresence: () => null,
+    getThreads: async () => ({ items: [threadRoot] }),
+    getThreadRoot: async () => threadRoot,
+    getThreadReplies: async () => ({ items: [threadReply] }),
+    sendThreadReply: async (id: string, rootId: string, body: string) => { assert(id === workspaceRoom.id && rootId === "$root", "Thread replies must target the selected room and root"); sentThread = body; return "$sent"; },
+  } as unknown as MatrixClient;
+  chat.setRoom(workspaceRoom, workspaceClient, "@me:test");
+  assert(chat.querySelectorAll('[role="tab"]').length === 3, "Room workspace must expose Chat, Threads, and Info tabs");
+  chat.querySelector<HTMLButtonElement>('[aria-label="Reply in thread"]')!.click(); await tick();
+  assert(chat.querySelector('[role="tab"][aria-selected="true"]')?.textContent === "Threads", "Reply in thread must open the Threads view");
+  assert(chat.querySelector<HTMLElement>(".composer-wrap")!.hidden && getComputedStyle(chat.querySelector(".chat-scroll")!).display === "none", "Thread mode must hide the main chat composer and timeline");
+  assert(chat.querySelector("room-details")!.textContent?.includes("First thread reply"), "Threads must show their root and replies");
+  const threadInput = chat.querySelector<HTMLTextAreaElement>('[aria-label="Thread reply"]')!;
+  threadInput.value = "New threaded answer"; threadInput.dispatchEvent(new Event("input"));
+  chat.querySelector<HTMLFormElement>(".thread-composer")!.requestSubmit(); await tick();
+  assert(sentThread === "New threaded answer", "Thread composer must send a real Matrix thread reply");
+  clickByText(chat.querySelector("room-details")!, "All threads"); await tick();
+  assert(chat.querySelector(".thread-summary")?.textContent?.includes("Planning discussion"), "Threads tab must list discoverable thread roots");
+  clickByText(chat, "Info");
+  assert(chat.querySelector("room-details")!.textContent?.includes(workspaceRoom.id), "Info must show the room's actual details");
+  let settingsRoomId = "";
+  chat.addEventListener("grungus:room-settings", event => { settingsRoomId = (event as CustomEvent<{ roomId: string }>).detail.roomId; });
+  clickByText(chat.querySelector("room-details")!, "Room settings");
+  assert(settingsRoomId === workspaceRoom.id, "Info must open settings for the selected room");
+  clickByText(chat, "Chat");
+  assert(!chat.querySelector<HTMLElement>(".composer-wrap")!.hidden && chat.querySelector<HTMLElement>("room-details")!.hidden, "Chat tab must restore the normal composer");
+
+  const roomSettings = document.createElement("room-settings"); roomSettings.hidden = true; document.body.append(roomSettings);
+  let permissionLevel = 100;
+  const writtenState: { roomId: string; type: string; content: Record<string, unknown> }[] = [];
+  const childRoom = createRoomRecord("!child:test"); childRoom.title = "Child room";
+  const managementClient = {
+    userId: "@me:test", getRoomPowerLevels: async () => ({ users: { "@me:test": permissionLevel } }),
+    api: async (_method: string, path: string) => path.includes("join_rules") ? { join_rule: "invite" } : { history_visibility: "shared" },
+    sendStateEvent: async (roomId: string, type: string, _key: string, content: Record<string, unknown>) => { writtenState.push({ roomId, type, content }); return "$state"; },
+    getRooms: () => [childRoom], getRoom: (id: string) => id === childRoom.id ? childRoom : null,
+    addToSpace: async (space: string, child: string) => { assert(space === "!space-management:test" && child === childRoom.id, "Add must target the selected space"); },
+    removeFromSpace: async (space: string, child: string) => { assert(space === "!space-management:test" && child === childRoom.id, "Remove must target the selected space"); },
+  } as unknown as MatrixClient;
+  roomSettings.show(workspaceRoom, managementClient); await tick();
+  roomSettings.querySelector<HTMLInputElement>('[aria-label="Name"]')!.value = "Renamed room";
+  roomSettings.querySelector<HTMLTextAreaElement>('[aria-label="Topic"]')!.value = "A shared topic";
+  roomSettings.querySelector<HTMLInputElement>('[aria-label="Enable encryption"]')!.checked = true;
+  roomSettings.querySelector("form")!.requestSubmit(); await tick();
+  assert(writtenState.some(event => event.type === "m.room.name" && event.content.name === "Renamed room") && writtenState.some(event => event.type === "m.room.encryption"), "Room settings must persist name/topic/encryption through Matrix state events");
+  roomSettings.hide(); roomSettings.show(workspaceRoom, managementClient); await tick();
+  permissionLevel = 0;
+  roomSettings.querySelector<HTMLInputElement>('[aria-label="Name"]')!.value = "Forbidden edit";
+  const previousWrites = writtenState.length;
+  roomSettings.querySelector("form")!.requestSubmit(); await tick();
+  assert(writtenState.length === previousWrites && roomSettings.textContent?.includes("permissions no longer allow"), "Saving must recheck permissions before sending state changes");
+  roomSettings.hide(); roomSettings.show(workspaceRoom, managementClient); await tick();
+  assert(roomSettings.querySelector<HTMLInputElement>('[aria-label="Name"]')?.disabled, "Read-only users must not be offered editable management controls");
+  roomSettings.hide(); permissionLevel = 100;
+  const managedSpace = createRoomRecord("!space-management:test"); managedSpace.isSpace = true; managedSpace.title = "Managed space";
+  roomSettings.show(managedSpace, managementClient); await tick();
+  clickByText(roomSettings, "Add room"); await tick();
+  assert(managedSpace.children.has(childRoom.id), "Space settings must add existing rooms after a successful server write");
+  clickByText(roomSettings, "Remove from space"); await tick();
+  assert(!managedSpace.children.has(childRoom.id), "Space settings must remove room links without deleting the room");
+  let createdRooms = 0;
+  managementClient.createRoom = async options => { createdRooms++; assert(options?.encrypted === true && options.parentSpaceId === managedSpace.id, "Creation must enable encryption and retain the selected space"); return "!created:test"; };
+  managementClient.addToSpace = async (space, child) => { assert(space === managedSpace.id && child === "!created:test", "New room must link to its selected space"); };
+  clickByText(roomSettings, "Create a new room"); await tick();
+  const creation = document.querySelector("room-creation")!;
+  assert(roomSettings.inert && creation.querySelector<HTMLInputElement>('[aria-label="Encrypt new room"]')!.checked, "Creation must be modal and encrypted by default");
+  creation.querySelector<HTMLInputElement>('[aria-label="New room name"]')!.value = "New lounge";
+  creation.querySelector("form")!.requestSubmit(); await tick();
+  assert(createdRooms === 1 && managedSpace.children.has("!created:test") && creation.hidden && !roomSettings.inert, "Successful creation must link once and restore the settings dialog");
+  roomSettings.hide(); roomSettings.remove();
   chat.remove();
   await Olm.init();
   const identity = new Olm.Account();
@@ -689,7 +838,10 @@ function showPreview(scene: string): void {
     [peer, "Sam Rivera", "Sounds good. See you there."],
   ];
   rooms[0]!.timeline = conversations.map(([sender, senderName, body], index) => ({ kind: "message", id: `$preview${index}`, sender: sender!, senderName: senderName!, body: body!, ts: time + index * 120000, msgtype: "m.text", media: null }));
-  const client = { avatarSrc: async () => null, mediaSrc: async () => null, getDevices: async () => [], getProfile: async () => ({ displayname: "Alex Morgan" }), getIgnoredUsers: () => [], getAccountData: () => null, userId: me } as unknown as MatrixClient;
+  const client = { getRoomPowerLevels: async () => ({ users: { [me]: 100 } }), api: async (_method: string, path: string) => path.includes("join_rules") ? { join_rule: "invite" } : { history_visibility: "shared" },
+    getRooms: () => rooms, getRoom: (id: string) => rooms.find(room => room.id === id) ?? null,
+    getThreads: async () => ({ items: [{ ...rooms[0]!.timeline[0]!, threadReplyCount: 2 }] }),
+    avatarSrc: async () => null, mediaSrc: async () => null, getDevices: async () => [], getProfile: async () => ({ displayname: "Alex Morgan" }), getIgnoredUsers: () => [], getAccountData: () => null, userId: me } as unknown as MatrixClient;
   const spaces = ["Studio", "Friends", "Open source"].map((title, index) => ({ ...rooms[0]!, id: `!space${index}:matrix.org`, title, isSpace: true }));
   shell.querySelector("space-rail")!.update(spaces, null, client);
   const sidebar = shell.querySelector("room-list")!;
@@ -703,6 +855,12 @@ function showPreview(scene: string): void {
     document.body.appendChild(settings);
     settings.update(client, new SettingsStore(), { userId: me, displayname: "Alex Morgan", avatarMxc: null });
     settings.show();
+  }
+  if (scene === "info" || scene === "threads") clickByText(shell.querySelector("chat-view")!, scene === "info" ? "Info" : "Threads");
+  if (scene === "room-settings" || scene === "space-settings") {
+    const manager = document.createElement("room-settings"); manager.hidden = true; document.body.append(manager);
+    const target = scene === "space-settings" ? { ...spaces[0]!, children: new Set([rooms[0]!.id]) } : rooms[0]!;
+    manager.show(target, client);
   }
   if (scene === "mobile") shell.classList.add("show-rooms");
 }

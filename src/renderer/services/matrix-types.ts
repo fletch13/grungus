@@ -83,6 +83,8 @@ export interface MediaInfo {
 }
 
 export interface MessageItem {
+  threadRootId?: string;
+  threadReplyCount?: number;
   kind: "message";
   id: string | null;
   sender: string;
@@ -310,6 +312,15 @@ export interface CreateRoomOptions {
   isPublic?: boolean;
   isSpace?: boolean;
   isVideo?: boolean;
+  /** Optional detailed creation settings; existing callers retain preset defaults. */
+  joinRule?: "public" | "invite" | "restricted";
+  parentSpaceId?: string;
+  historyVisibility?: "shared" | "joined" | "invited" | "world_readable";
+  aliasLocalpart?: string;
+  publish?: boolean;
+  avatarUrl?: string;
+  announcementOnly?: boolean;
+  membersCanInvite?: boolean;
   /** Enable megolm encryption in the room (initial m.room.encryption state). */
   encrypted?: boolean;
 }

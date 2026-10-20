@@ -105,6 +105,11 @@ export class RoomList extends HTMLElement {
       }
     });
     head.appendChild(addBtn);
+    if (space) {
+      const settings = el("button", { type: "button", class: "add-btn", "aria-label": "Space settings", title: "Space settings" }, icon("settings"));
+      settings.addEventListener("click", () => this.dispatchEvent(new CustomEvent("grungus:room-settings", { detail: { roomId: space.id }, bubbles: true })));
+      head.append(settings);
+    }
     /* new-space toggle (space management) */
     const spaceBtn = el("button", {
       class: "add-btn",

@@ -1,3 +1,6 @@
+import "./components/room-settings.ts";
+import { notificationContent } from "./services/notification-content.ts";
+import { applyTheme } from "./services/appearance.ts";
 import { applyBackground } from "./services/background.ts";
 import { selectCallBackend } from "./services/matrix-call-service.ts";
 import { isVideoRoom } from "./services/room-kind.ts";
@@ -437,6 +440,12 @@ function startShell(promptRecovery = false): void {
   const members = shell.querySelector("member-list");
   if (!rail || !roomList || !chat || !members) return;
 
+  const roomSettings = document.createElement("room-settings"); roomSettings.hidden = true; root.append(roomSettings);
+  shell.addEventListener("grungus:room-settings", event => {
+    const roomId = (event as CustomEvent<{ roomId: string }>).detail.roomId;
+    const room = active.getRoom(roomId); if (room) roomSettings.show(room, active);
+  });
+
   const currentSpace = (): Room | null =>
     state.spaceId ? active.getRoom(state.spaceId) : null;
 
@@ -620,7 +629,7 @@ function startShell(promptRecovery = false): void {
   /** apply appearance settings to the document (theme/font/compact). */
   const applyAppearance = (): void => {
     const all = settings.all;
-    document.body.classList.toggle("theme-light", all.theme === "light");
+    applyTheme(all.theme);
     applyBackground(all.backgroundImage);
     document.body.style.fontSize = `${all.fontScale * 15}px`;
     document.body.style.setProperty("--ui-font-scale", String(all.fontScale));
@@ -630,6 +639,9 @@ function startShell(promptRecovery = false): void {
       enterToSend: all.enterToSend,
       sendTyping: all.sendTypingNotifications,
       showTimestamps: all.showTimestamps,
+      renderMarkdown: all.renderMarkdown,
+      autoScroll: all.autoScroll,
+      showTyping: all.showTypingIndicator,
     });
   };
   applyAppearance();
@@ -680,7 +692,8 @@ function startShell(promptRecovery = false): void {
     const title = room?.name || "Grungus";
     const senderName = room?.members.get(sender)?.displayname ?? sender;
     try {
-      const n = new Notification(`${title} — ${senderName}`, { body: body.slice(0, 120) });
+      const content = notificationContent(all.notificationPreviews, title, senderName, body);
+      const n = new Notification(content.title, { body: content.body, silent: true });
       n.onclick = () => {
         window.focus();
         state.roomId = roomId;
@@ -698,7 +711,7 @@ function startShell(promptRecovery = false): void {
         osc.connect(gain).connect(ctx.destination);
         osc.start();
         osc.stop(ctx.currentTime + 0.25);
-        void ctx.close().catch(() => undefined);
+        osc.onended = () => { void ctx.close().catch(() => undefined); };
       }
     } catch {
       /* notifications unsupported/permission denied — silently skip */
@@ -729,9 +742,14 @@ function startShell(promptRecovery = false): void {
   } else {
     backupView.update(null, false);
   }
-  roomList.addEventListener("grungus:open-backup", () => {
+  const openBackup = (): void => {
     backupView.update(active.crypto, serverHasBackup);
     backupView.show();
+  };
+  roomList.addEventListener("grungus:open-backup", openBackup);
+  settingsView.addEventListener("grungus:open-backup", () => { settingsView.hide(); openBackup(); });
+  settingsView.addEventListener("grungus:verify-session", () => {
+    settingsView.hide(); roomList.dispatchEvent(new CustomEvent("grungus:verify-session"));
   });
   backupView.addEventListener(
     "grungus:backup-create",
@@ -1145,6 +1163,12 @@ function startShell(promptRecovery = false): void {
   root.appendChild(newDmView);
   let pendingDirectRoom: string | null = null;
   let pendingBrowseSpace: { roomId: string; spaceId: string | null } | null = null;
+  roomSettings.addEventListener("grungus:room-created", event => {
+    const { roomId, spaceId } = (event as CustomEvent<{ roomId: string; spaceId: string | null }>).detail;
+    state.spaceId = spaceId;
+    refreshSidebar();
+    if (active.getRoom(roomId)) selectRoom(roomId); else pendingBrowseSpace = { roomId, spaceId };
+  });
   const roomBrowser = document.createElement("room-browser");
   roomBrowser.hidden = true;
   root.appendChild(roomBrowser);
@@ -1461,7 +1485,8 @@ async function boot(): Promise<void> {
     } catch { /* Preserve the old preferences so migration can be retried on next launch. */ }
   }
   const appearance = new SettingsStore();
-  document.body.classList.toggle("theme-light", appearance.get("theme") === "light");
+  applyTheme(appearance.get("theme"));
+  matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => applyTheme(new SettingsStore().get("theme")));
   applyBackground(appearance.get("backgroundImage"));
   const bootParams = new URLSearchParams(location.search);
   if (bootParams.get("sso") === "1" && bootParams.get("loginToken")) {

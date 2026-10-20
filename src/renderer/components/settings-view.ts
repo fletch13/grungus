@@ -1,3 +1,4 @@
+import { VoiceActivityMonitor } from "../services/voice-activity.ts";
 import { prepareBackground } from "../services/background.ts";
 /*
  * Grungus — <settings-view>: the user settings overlay.
@@ -26,6 +27,7 @@ import type { UserInfo } from "./room-list.ts";
 type PanelId =
   | "account"
   | "sessions"
+  | "security"
   | "appearance"
   | "preferences"
   | "notifications"
@@ -54,10 +56,34 @@ export class SettingsView extends HTMLElement {
   private _backgroundBusy = false;
   private _avatarMxc: string | null = null;
   private _displayName = "";
+  private _query = "";
+  private _opener: HTMLElement | null = null;
+  private _loadSequence = 0;
+  private _backupStatus = "Not checked";
+  private _previewStream: MediaStream | null = null;
+  private _previewSequence = 0;
+  private _previewMonitor: VoiceActivityMonitor | null = null;
+  private _stopPreview(): void {
+    this._previewSequence++; this._previewStream?.getTracks().forEach(track => track.stop()); this._previewStream = null;
+    this._previewMonitor?.stop(); this._previewMonitor = null;
+  }
+  disconnectedCallback(): void { this._stopPreview(); this._loadSequence++; }
+  constructor() {
+    super();
+    this.addEventListener("keydown", event => {
+      if (event.key === "Escape") { event.preventDefault(); this.hide(); }
+      if (event.key === "Tab") {
+        const controls = [...this.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), a[href]')].filter(node => node.getClientRects().length);
+        const target = event.shiftKey ? controls.at(-1) : controls[0];
+        if (document.activeElement === (event.shiftKey ? controls[0] : controls.at(-1))) { event.preventDefault(); target?.focus(); }
+      }
+    });
+  }
 
   private static readonly NAV: { id: PanelId; label: string }[] = [
     { id: "account", label: "My Account" },
     { id: "sessions", label: "Sessions" },
+    { id: "security", label: "Security & Privacy" },
     { id: "appearance", label: "Appearance" },
     { id: "preferences", label: "Preferences" },
     { id: "notifications", label: "Notifications" },
@@ -66,6 +92,19 @@ export class SettingsView extends HTMLElement {
     { id: "advanced", label: "Advanced" },
     { id: "about", label: "Help & About" },
   ];
+
+  private static readonly KEYWORDS: Record<PanelId, string> = {
+    account: "profile display name avatar password logout",
+    sessions: "devices rename login active sessions last seen",
+    security: "security privacy encryption recovery backup verify session keys",
+    appearance: "theme system dark light font size compact background picture",
+    preferences: "typing read receipts markdown timestamps scrolling enter gifs klipy",
+    notifications: "notifications permission sound preview message desktop test",
+    voice: "microphone speaker camera audio video device test preview",
+    ignored: "ignored blocked users unignore",
+    advanced: "access token homeserver device cache clear media",
+    about: "version help about keyboard shortcuts",
+  };
 
   connectedCallback(): void {
     if (!this.hidden) this.classList.add("settings-overlay");
@@ -81,37 +120,45 @@ export class SettingsView extends HTMLElement {
   }
 
   show(panel: PanelId = "account"): void {
+    this._opener = document.activeElement as HTMLElement | null;
+    this._query = "";
     this.hidden = false;
     this.classList.add("settings-overlay");
     this._panel = panel;
     this._status = "";
     this._statusError = false;
     this._render();
+    this.querySelector<HTMLButtonElement>(".settings-close-btn")?.focus();
     void this._loadPanelData();
   }
 
   hide(): void {
     /* the overlay class carries display:flex — [hidden] loses to it */
+    this._stopPreview(); this._loadSequence++;
     this.classList.remove("settings-overlay");
     this.hidden = true;
     this.textContent = "";
+    this._opener?.focus();
   }
 
   private async _loadPanelData(): Promise<void> {
     const client = this._client;
     if (!client) return;
-    try {
-      this._devices = await client.getDevices();
-      this._ignored = client.getIgnoredUsers();
-      if (client.userId) {
-        const profile = await client.getProfile(client.userId);
-        this._avatarMxc = profile.avatar_url ?? this._avatarMxc;
-        this._displayName = profile.displayname ?? this._displayName;
-      }
-      this._render();
-    } catch (err) {
-      console.warn("[settings] panel data load failed:", err);
+    const sequence = ++this._loadSequence;
+    const [devices, profile, backup] = await Promise.allSettled([
+      client.getDevices(),
+      client.userId ? client.getProfile(client.userId) : Promise.resolve(null),
+      this._panel === "security" && client.crypto ? client.crypto.getKeyBackupVersion() : Promise.resolve(undefined),
+    ]);
+    if (sequence !== this._loadSequence || this.hidden || client !== this._client) return;
+    if (devices.status === "fulfilled") this._devices = devices.value;
+    this._ignored = client.getIgnoredUsers();
+    if (profile.status === "fulfilled" && profile.value) {
+      this._avatarMxc = profile.value.avatar_url ?? this._avatarMxc;
+      this._displayName = profile.value.displayname ?? this._displayName;
     }
+    if (this._panel === "security") this._backupStatus = !client.crypto ? "Encryption is unavailable for this session" : backup.status === "rejected" ? "Could not check the server backup" : backup.value ? "A recovery backup is available on the server" : "No recovery backup is configured";
+    this._render();
   }
 
   private _setStatus(text: string, isError = false): void {
@@ -121,17 +168,32 @@ export class SettingsView extends HTMLElement {
   }
 
   private _render(): void {
+    this._stopPreview();
+    const active = this.contains(document.activeElement) ? document.activeElement as HTMLElement : null;
+    const activeLabel = active?.getAttribute("aria-label");
+    const selection = active instanceof HTMLInputElement && ["text", "search", "password"].includes(active.type) ? [active.selectionStart, active.selectionEnd] : null;
+    const oldPanel = this.querySelector<HTMLElement>(".settings-panel");
+    const position = oldPanel?.dataset.panel === this._panel ? oldPanel.scrollTop : 0;
+    const drafts = new Map<string, string>();
+    if (oldPanel?.dataset.panel === this._panel) for (const input of oldPanel.querySelectorAll<HTMLInputElement>('input[type="text"], input[type="password"]')) {
+      const key = input.getAttribute("aria-label") || input.placeholder || input.id;
+      if (key) drafts.set(key, input.value);
+    }
     this.textContent = "";
     if (this.hidden) return;
 
-    const wrap = el("div", { class: "settings-frame" });
+    const wrap = el("div", { class: "settings-frame", role: "dialog", "aria-modal": "true", "aria-label": "Settings" });
 
     /* header */
     const header = el("div", { class: "settings-header" });
     header.appendChild(el("span", { class: "settings-title", text: "Settings" }));
     const close = el("button", { class: "overlay-close-btn settings-close-btn", text: "✕", title: "Close settings" });
+    close.setAttribute("aria-label", "Close settings");
     close.addEventListener("click", () => this.hide());
     header.appendChild(close);
+    const search = el("input", { class: "settings-input settings-search", type: "search", placeholder: "Search settings", "aria-label": "Search settings", value: this._query }) as HTMLInputElement;
+    search.addEventListener("input", () => { this._query = search.value; this._render(); });
+    header.append(search);
     wrap.appendChild(header);
 
     const body = el("div", { class: "settings-body" });
@@ -142,8 +204,10 @@ export class SettingsView extends HTMLElement {
       const btn = el("button", {
         class: "settings-nav-btn" + (this._panel === item.id ? " active" : ""),
         text: item.label,
+        "aria-current": this._panel === item.id && !this._query ? "page" : undefined,
       });
       btn.addEventListener("click", () => {
+        this._stopPreview(); this._query = "";
         this._panel = item.id;
         this._status = "";
         this._render();
@@ -154,13 +218,26 @@ export class SettingsView extends HTMLElement {
     body.appendChild(nav);
 
     /* panel */
-    const panel = el("div", { class: "settings-panel" });
-    switch (this._panel) {
+    const panel = el("div", { class: "settings-panel", dataset: { panel: this._panel } });
+    if (this._query.trim()) {
+      const query = this._query.trim().toLocaleLowerCase();
+      const matches = SettingsView.NAV.filter(item => `${item.label} ${SettingsView.KEYWORDS[item.id]}`.toLocaleLowerCase().includes(query));
+      panel.append(this._section("Search results", `${matches.length} matching sections`));
+      for (const item of matches) {
+        const result = el("button", { type: "button", class: "settings-search-result", text: item.label });
+        result.addEventListener("click", () => { this._query = ""; this._panel = item.id; this._render(); void this._loadPanelData(); });
+        panel.append(result);
+      }
+      if (!matches.length) panel.append(el("p", { text: "No settings found. Try another word." }));
+    } else switch (this._panel) {
       case "account":
         this._renderAccount(panel);
         break;
       case "sessions":
         this._renderSessions(panel);
+        break;
+      case "security":
+        this._renderSecurity(panel);
         break;
       case "appearance":
         this._renderAppearance(panel);
@@ -189,10 +266,20 @@ export class SettingsView extends HTMLElement {
 
     if (this._status) {
       wrap.appendChild(
-        el("div", { class: "settings-status" + (this._statusError ? " error" : ""), text: this._status })
+        el("div", { class: "settings-status" + (this._statusError ? " error" : ""), role: "status", "aria-live": "polite", text: this._status })
       );
     }
     this.appendChild(wrap);
+    panel.scrollTop = position;
+    for (const input of panel.querySelectorAll<HTMLInputElement>('input[type="text"], input[type="password"]')) {
+      const key = input.getAttribute("aria-label") || input.placeholder || input.id;
+      if (drafts.has(key)) input.value = drafts.get(key)!;
+    }
+    if (activeLabel) {
+      const control = [...this.querySelectorAll<HTMLElement>("[aria-label]")].find(node => node.getAttribute("aria-label") === activeLabel);
+      control?.focus();
+      if (selection && control instanceof HTMLInputElement) control.setSelectionRange(selection[0] ?? null, selection[1] ?? null);
+    }
   }
 
   /* ------------------------------ my account ----------------------------- */
@@ -212,7 +299,7 @@ export class SettingsView extends HTMLElement {
       class: "settings-input",
       type: "text",
       value: this._displayName,
-      placeholder: "Display name",
+      placeholder: "Display name", "aria-label": "Display name",
     }) as HTMLInputElement;
     nameRow.appendChild(nameInput);
     const saveName = el("button", { class: "call-btn", text: "Save" });
@@ -221,7 +308,7 @@ export class SettingsView extends HTMLElement {
       if (!value) return;
       void client
         .setDisplayName(value)
-        .then(() => this._setStatus("Display name saved."))
+        .then(() => { this._displayName = value; this._setStatus("Display name saved."); })
         .catch((err: unknown) =>
           this._setStatus(`Could not save: ${err instanceof Error ? err.message : "error"}`, true)
         );
@@ -279,8 +366,10 @@ export class SettingsView extends HTMLElement {
         this._setStatus("The new passwords do not match.", true);
         return;
       }
+      const current = currentPw.value; const replacement = newPw.value;
+      currentPw.value = ""; newPw.value = ""; newPw2.value = "";
       void client
-        .changePassword(currentPw.value, newPw.value, logoutBox.checked)
+        .changePassword(current, replacement, logoutBox.checked)
         .then(() => this._setStatus("Password changed."))
         .catch((err: unknown) =>
           this._setStatus(`Could not change: ${err instanceof Error ? err.message : "error"}`, true)
@@ -326,7 +415,7 @@ export class SettingsView extends HTMLElement {
           class: "device-meta",
           text:
             `${device.deviceId}` +
-            (device.lastSeenTs ? `  ·  ${new Date(device.lastSeenTs).toLocaleString()}` : ""),
+            (device.lastSeenTs ? `  ·  ${new Date(device.lastSeenTs).toLocaleString()}` : "") + (device.lastSeenIp ? `  ·  ${device.lastSeenIp}` : ""),
         })
       );
       row.appendChild(meta);
@@ -334,15 +423,19 @@ export class SettingsView extends HTMLElement {
       if (isCurrent) {
         const rename = el("button", { class: "call-btn", text: "Rename" });
         rename.addEventListener("click", () => {
-          const name = window.prompt("New name for this device", device.displayName ?? "");
-          if (!name) return;
-          void client
-            .setDeviceName(device.deviceId, name)
-            .then(() => this._loadPanelData())
-            .then(() => this._setStatus("Device renamed."))
-            .catch((err: unknown) =>
-              this._setStatus(`Rename failed: ${err instanceof Error ? err.message : "error"}`, true)
-            );
+          if (row.querySelector("form")) return;
+          this._loadSequence++;
+          const form = el("form", { class: "settings-row", "aria-label": "Rename this session" });
+          const input = el("input", { class: "settings-input", value: device.displayName ?? "", required: true, maxlength: "100", "aria-label": "Session name" }) as HTMLInputElement;
+          const save = el("button", { type: "submit", class: "call-btn", text: "Save session name" });
+          const cancel = el("button", { type: "button", class: "call-btn", text: "Cancel" });
+          cancel.addEventListener("click", () => { form.remove(); rename.focus(); });
+          form.addEventListener("submit", event => {
+            event.preventDefault(); const name = input.value.trim(); if (!name) return;
+            form.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach(control => { control.disabled = true; });
+            void client.setDeviceName(device.deviceId, name).then(() => this._loadPanelData()).then(() => this._setStatus("Device renamed.")).catch(error => this._setStatus(`Rename failed: ${error instanceof Error ? error.message : "unknown error"}`, true));
+          });
+          form.append(input, save, cancel); row.append(form); input.focus();
         });
         row.appendChild(rename);
       } else {
@@ -350,6 +443,7 @@ export class SettingsView extends HTMLElement {
         (kick as HTMLButtonElement).disabled = this._deviceLogoutBusy;
         kick.addEventListener("click", () => {
           if (row.querySelector("form") || this._deviceLogoutBusy) return;
+          this._loadSequence++;
           const form = el("form", { class: "device-logout-form", "aria-label": `Log out ${device.displayName ?? device.deviceId}` });
           const label = el("label", { text: "Account password" });
           const password = el("input", {
@@ -387,6 +481,24 @@ export class SettingsView extends HTMLElement {
     }
   }
 
+  private _renderSecurity(panel: HTMLElement): void {
+    const client = this._client;
+    panel.append(this._section("Security & Privacy", "Manage recovery and verify your other sessions."));
+    panel.append(this._staticRow("Encryption", client?.crypto ? "End-to-end encryption is available. Each conversation shows its own encryption status." : "Encryption is not available for this session."));
+    panel.append(this._staticRow("Recovery backup", this._backupStatus));
+    const backup = el("button", { type: "button", class: "call-btn", text: "Manage recovery backup", disabled: !client?.crypto });
+    backup.addEventListener("click", () => this._dispatch("grungus:open-backup"));
+    const verify = el("button", { type: "button", class: "call-btn", text: "Verify this session", disabled: !client?.crypto });
+    verify.addEventListener("click", () => this._dispatch("grungus:verify-session"));
+    const sessions = el("button", { type: "button", class: "call-btn", text: "Review sessions" });
+    sessions.addEventListener("click", () => { this._panel = "sessions"; this._render(); void this._loadPanelData(); });
+    panel.append(el("div", { class: "settings-row" }, backup, verify, sessions));
+    panel.append(el("p", { class: "settings-hint", text: "Recovery helps restore encrypted history. Verification confirms a device belongs to you; a server backup alone does not verify a session." }));
+    const settings = this._settings!;
+    panel.append(this._toggle("Read receipts", "Send read receipts", "sendReadReceipts", settings));
+    panel.append(this._toggle("Typing", "Send typing notifications", "sendTypingNotifications", settings));
+  }
+
   /* ------------------------------- appearance ----------------------------- */
 
   private _renderAppearance(panel: HTMLElement): void {
@@ -395,13 +507,13 @@ export class SettingsView extends HTMLElement {
 
     /* theme */
     const themeRow = el("div", { class: "settings-row" });
-    for (const theme of ["dark", "light"] as const) {
+    for (const theme of ["dark", "light", "system"] as const) {
       const radio = el("label", { class: "settings-check" });
       const box = el("input", { type: "radio", name: "theme", value: theme }) as HTMLInputElement;
       box.checked = settings.get("theme") === theme;
       box.addEventListener("change", () => settings.set("theme", theme));
       radio.appendChild(box);
-      radio.appendChild(el("span", { text: theme === "dark" ? "Dark" : "Light" }));
+      radio.appendChild(el("span", { text: theme === "dark" ? "Dark" : theme === "light" ? "Light" : "Use system theme" }));
       themeRow.appendChild(radio);
     }
     panel.appendChild(this._labeledRow("Theme", themeRow));
@@ -437,7 +549,7 @@ export class SettingsView extends HTMLElement {
 
     /* font size */
     const fontRow = el("div", { class: "settings-row" });
-    const slider = el("input", { type: "range", min: "85", max: "130", step: "5" }) as HTMLInputElement;
+    const slider = el("input", { type: "range", "aria-label": "Font size", min: "85", max: "130", step: "5" }) as HTMLInputElement;
     slider.value = String(Math.round(settings.get("fontScale") * 100));
     const fontLabel = el("span", { class: "settings-hint", text: `${slider.value}%` });
     slider.addEventListener("input", () => {
@@ -478,13 +590,14 @@ export class SettingsView extends HTMLElement {
         "Others see when you are typing. Turning it off hides nothing on your side."
       )
     );
+    panel.append(this._toggle("Typing", "Show other people’s typing indicators", "showTypingIndicator", settings));
     panel.appendChild(
       this._toggle(
         "Read receipts",
         "Send read receipts",
         "sendReadReceipts",
         settings,
-        "m.read receipts + the fully-read marker — others see when you have read a DM."
+        "Others can see when you have read messages."
       )
     );
     panel.appendChild(
@@ -492,7 +605,7 @@ export class SettingsView extends HTMLElement {
     );
     panel.appendChild(this._toggle("Messages", "Show message timestamps", "showTimestamps", settings));
     panel.appendChild(
-      this._toggle("Messages", "Render markdown formatting", "renderMarkdown", settings)
+      this._toggle("Messages", "Render markdown formatting", "renderMarkdown", settings, "Show bold, italic, code, strikethrough, and Markdown links in messages.")
     );
     panel.appendChild(
       this._toggle("Scrolling", "Auto-scroll to the newest message", "autoScroll", settings)
@@ -514,13 +627,27 @@ export class SettingsView extends HTMLElement {
       )
     );
     panel.appendChild(this._toggle("Sounds", "Play a sound with notifications", "notificationSound", settings));
+    panel.append(this._toggle("Privacy", "Show message previews in notifications", "notificationPreviews", settings, "Turn off to hide sender, room, and message text from desktop notifications."));
+    const supported = typeof Notification !== "undefined";
+    panel.append(this._staticRow("Desktop permission", supported ? Notification.permission : "Notifications are unavailable"));
+    const controls = el("div", { class: "settings-row" });
+    const permission = el("button", { type: "button", class: "call-btn", text: "Enable desktop permission", disabled: !supported || Notification.permission === "granted" });
+    permission.addEventListener("click", () => {
+      void Notification.requestPermission().then(value => this._setStatus(value === "granted" ? "Desktop notifications are allowed." : "Notifications are blocked. Enable them in your browser or operating system settings.", value !== "granted")).catch(() => this._setStatus("Could not request notification permission.", true));
+    });
+    const test = el("button", { type: "button", class: "call-btn", text: "Send test notification", disabled: !supported || Notification.permission !== "granted" });
+    test.addEventListener("click", () => {
+      try { new Notification("Grungus", { body: "Your desktop notifications are working.", silent: !settings.get("notificationSound") }); this._setStatus("Test notification sent."); }
+      catch { this._setStatus("Could not show a notification. Check system permissions.", true); }
+    });
+    controls.append(permission, test); panel.append(controls);
   }
 
   /* ------------------------------ voice & video --------------------------- */
 
   private _renderVoice(panel: HTMLElement): void {
     const settings = this._settings!;
-    panel.appendChild(this._section("Voice & Video", "Media devices Grungus uses in calls."));
+    panel.appendChild(this._section("Voice & Video", "Choose devices for your next call. Speaker changes also apply during an active call."));
 
     const groups: { kind: MediaDeviceKind; label: string; setting: "audioInput" | "audioOutput" | "videoInput" }[] = [
       { kind: "audioinput", label: "Microphone", setting: "audioInput" },
@@ -531,13 +658,45 @@ export class SettingsView extends HTMLElement {
        them asynchronously so a later re-render cannot orphan them */
     const selects: HTMLSelectElement[] = [];
     for (const group of groups) {
-      const select = el("select", { class: "settings-input" }) as HTMLSelectElement;
+      const select = el("select", { class: "settings-input", "aria-label": group.label }) as HTMLSelectElement;
       select.appendChild(el("option", { value: "", text: `System default (${group.label})` }));
       select.value = settings.get(group.setting);
       select.addEventListener("change", () => settings.set(group.setting, select.value));
       selects.push(select);
       panel.appendChild(this._labeledRow(group.label, select));
     }
+    if (!navigator.mediaDevices?.enumerateDevices) { panel.append(el("p", { class: "settings-hint", text: "Media devices are unavailable in this context." })); return; }
+    const refresh = el("button", { type: "button", class: "call-btn", text: "Refresh devices" });
+    refresh.addEventListener("click", () => this._render());
+    const microphone = el("button", { type: "button", class: "call-btn", text: "Test microphone" });
+    const camera = el("button", { type: "button", class: "call-btn", text: "Test camera" });
+    const stop = el("button", { type: "button", class: "call-btn", text: "Stop preview", hidden: true });
+    const status = el("p", { role: "status", class: "settings-hint", text: "Test devices here before joining a call. Nothing is sent to other users." });
+    const video = el("video", { class: "settings-camera-preview", autoplay: true, playsinline: true, hidden: true }) as HTMLVideoElement;
+    video.muted = true;
+    stop.addEventListener("click", () => { this._stopPreview(); video.srcObject = null; video.hidden = true; stop.hidden = true; microphone.removeAttribute("disabled"); camera.removeAttribute("disabled"); status.textContent = "Preview stopped."; });
+    const preview = async (kind: "microphone" | "camera"): Promise<void> => {
+      this._stopPreview(); const sequence = this._previewSequence;
+      microphone.setAttribute("disabled", ""); camera.setAttribute("disabled", ""); status.textContent = "Requesting device access…";
+      try {
+        const id = settings.get(kind === "microphone" ? "audioInput" : "videoInput");
+        const constraint = id ? { deviceId: { exact: id } } : true;
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: kind === "microphone" ? constraint : false, video: kind === "camera" ? constraint : false });
+        if (sequence !== this._previewSequence || this.hidden || !panel.isConnected) { stream.getTracks().forEach(track => track.stop()); return; }
+        this._previewStream = stream; stop.hidden = false;
+        if (kind === "camera") { video.hidden = false; video.srcObject = stream; await video.play(); status.textContent = "Camera preview stays on this device."; }
+        else {
+          this._previewMonitor = new VoiceActivityMonitor(active => { status.textContent = active.has("test") ? "Microphone activity detected" : "Listening — speak to test your microphone. Audio is not played back."; });
+          this._previewMonitor.setStreams([{ key: "test", stream }]);
+        }
+      } catch (error) {
+        if (sequence !== this._previewSequence) return;
+        this._stopPreview(); video.srcObject = null; video.hidden = true; stop.hidden = true;
+        microphone.removeAttribute("disabled"); camera.removeAttribute("disabled"); status.textContent = `Device test failed: ${error instanceof Error ? error.message : "unknown error"}`;
+      }
+    };
+    microphone.addEventListener("click", () => { void preview("microphone"); }); camera.addEventListener("click", () => { void preview("camera"); });
+    panel.append(el("div", { class: "settings-row" }, refresh, microphone, camera, stop), status, video);
     void navigator.mediaDevices
       .enumerateDevices()
       .then((devices) => {
@@ -552,7 +711,9 @@ export class SettingsView extends HTMLElement {
               })
             );
           }
-          select.value = settings.get(group.setting);
+          const selected = settings.get(group.setting);
+          if (selected && ![...select.options].some(option => option.value === selected)) select.append(el("option", { value: selected, text: "Saved device (unavailable)" }));
+          select.value = selected;
         }
         if (devices.every((d) => !d.label)) {
           panel.appendChild(
@@ -623,33 +784,13 @@ export class SettingsView extends HTMLElement {
     panel.appendChild(this._staticRow("Homeserver", client.baseUrl));
 
     const cacheRow = el("div", { class: "settings-row" });
-    const clear = el("button", {
-      class: "call-btn danger",
-      text: "Reset device data & log out",
-    });
+    const clear = el("button", { type: "button", class: "call-btn", text: "Clear downloaded media" });
     clear.addEventListener("click", () => {
-      /*
-       * The device's olm identity and the logged-in session are ONE unit:
-       * wiping the identity while keeping the session leaves a device the
-       * server still maps to the OLD keys (every self-share fails with
-       * OLM.BAD_MESSAGE_KEY_ID and the sender's own messages turn UTD).
-       * So this ALWAYS drops the session too — the next login mints a
-       * fresh device id with a matching identity.
-       */
-      for (const key of Object.keys(localStorage)) {
-        if (key.startsWith("grungus-crypto:")) localStorage.removeItem(key);
-      }
-      localStorage.removeItem("grungus-session");
-      location.reload();
+      client.clearMediaCache();
+      this._setStatus("Downloaded media cleared. Your session, preferences, and encryption keys were kept.");
     });
-    cacheRow.appendChild(clear);
-    panel.appendChild(
-      this._labeledRow(
-        "Reset device data",
-        cacheRow,
-        "Clears the device's encryption keys and logs you out. Log back in to get a fresh device (old rooms re-sync; encrypted history returns via key backup or forwarded keys)."
-      )
-    );
+    cacheRow.append(clear);
+    panel.append(this._labeledRow("Media cache", cacheRow, "Removes cached images and avatars. They download again when needed; you stay logged in."));
   }
 
   /* ------------------------------- help & about ---------------------------- */
@@ -657,6 +798,7 @@ export class SettingsView extends HTMLElement {
   private _renderAbout(panel: HTMLElement): void {
     panel.appendChild(this._section("Help & About", "Grungus — a Discord-style chat client for the Matrix network."));
     panel.appendChild(this._staticRow("App version", (window as unknown as { GRUNGUS_VERSION?: string }).GRUNGUS_VERSION ?? "dev"));
+    panel.append(this._section("Keyboard shortcuts"), this._staticRow("Send message", "Enter (or Ctrl/Cmd+Enter if Enter-to-send is off)"), this._staticRow("New line", "Shift+Enter"), this._staticRow("Close settings or pickers", "Escape"));
     panel.appendChild(this._staticRow("Electron/Chrome", `${navigator.userAgent}`));
     panel.appendChild(
       this._staticRow(
@@ -701,7 +843,7 @@ export class SettingsView extends HTMLElement {
     hint?: string
   ): HTMLElement {
     const row = el("div", { class: "settings-row" });
-    const check = el("input", { type: "checkbox" }) as HTMLInputElement;
+    const check = el("input", { type: "checkbox", "aria-label": text }) as HTMLInputElement;
     check.checked = Boolean(settings.get(key));
     check.addEventListener("change", () => {
       (settings.set as (k: keyof GrungusSettings, v: unknown) => void)(key, check.checked);

@@ -81,10 +81,10 @@ export function applyRelations(
 
   /* --- m.in_reply_to (reply context) --- */
   const inReply = content["m.relates_to"] as
-    | { "m.in_reply_to"?: { event_id?: string } }
+    | { "m.in_reply_to"?: { event_id?: string }; rel_type?: string; is_falling_back?: boolean }
     | undefined;
   const parentEventId = inReply?.["m.in_reply_to"]?.event_id;
-  if (parentEventId && item.kind === "message") {
+  if (parentEventId && item.kind === "message" && !(inReply?.rel_type === "m.thread" && inReply.is_falling_back)) {
     const parent = findTimelineMessage(room, parentEventId);
     if (parent) {
       item.replyTo = {

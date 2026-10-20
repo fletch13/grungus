@@ -1,3 +1,4 @@
+import "./room-details.ts";
 import { isVideoRoom } from "../services/room-kind.ts";
 /*
  * Grungus — <chat-view>: room header, message timeline, composer.
@@ -21,6 +22,21 @@ export class ChatView extends HTMLElement {
   private _lastItem: TimelineItem | null = null;
   private _noticeTimer: ReturnType<typeof setTimeout> | null = null;
   private _header!: HTMLElement;
+  private _tabs!: HTMLElement;
+  private _details!: import("./room-details.ts").RoomDetails;
+  private _composerWrap!: HTMLElement;
+  private _tab: "chat" | "threads" | "info" = "chat";
+  private selectTab(tab: "chat" | "threads" | "info"): void {
+    this._tab = tab;
+    this._scroll.hidden = tab !== "chat"; this._historyControls.hidden = tab !== "chat"; this._composerWrap.hidden = tab !== "chat";
+    this._tabs.replaceChildren();
+    for (const [id, title] of [["chat", "Chat"], ["threads", "Threads"], ["info", "Info"]] as const) {
+      const button = el("button", { type: "button", role: "tab", "aria-selected": String(tab === id), tabindex: tab === id ? "0" : "-1", "aria-controls": id === "chat" ? "room-chat-content" : "room-details-content", text: title });
+      button.addEventListener("click", () => this.selectTab(id)); this._tabs.append(button);
+    }
+    if (tab !== "chat" && this._room && this._client) this._details.activate(tab, this._room, this._client);
+    else this._details.close();
+  }
   private _scroll!: HTMLElement;
   private _historyControls!: HTMLElement;
   private _windowAnchor: string | null = null;
@@ -38,6 +54,10 @@ export class ChatView extends HTMLElement {
   private _enterToSend = true;
   private _sendTyping = true;
   private _showTimestamps = true;
+  private _renderMarkdown = true;
+  private _autoScroll = true;
+  private _showTyping = true;
+  private _typingUsers: string[] = [];
   /** the DM "Seen" indicator bar (below the timeline) */
   private _seenBar: HTMLElement | null = null;
   private _replyTarget: { eventId: string; sender: string; senderName: string; body: string } | null = null;
@@ -61,6 +81,7 @@ export class ChatView extends HTMLElement {
     );
 
     const wrap = el("div", { class: "composer-wrap" });
+    this._composerWrap = wrap;
     const composer = el("div", { class: "composer" });
     const attach = el("button", { class: "attach-btn", title: "Send an image", "aria-label": "Send an image" });
     attach.appendChild(icon("plus", 20));
@@ -145,7 +166,19 @@ export class ChatView extends HTMLElement {
       );
     });
 
+    this._tabs = el("nav", { class: "room-tabs", role: "tablist", "aria-label": "Room views", hidden: true });
+    this._tabs.addEventListener("keydown", event => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      const ids = ["chat", "threads", "info"] as const;
+      const index = ids.indexOf(this._tab);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? 2 : (index + (event.key === "ArrowRight" ? 1 : 2)) % 3;
+      event.preventDefault(); this.selectTab(ids[next]!); this._tabs.querySelector<HTMLElement>('[aria-selected="true"]')?.focus();
+    });
+    this._details = document.createElement("room-details"); this._details.id = "room-details-content"; this._details.hidden = true;
+    this._scroll.id = "room-chat-content";
     this.appendChild(this._header);
+    this.appendChild(this._tabs);
+    this.appendChild(this._details);
     this.appendChild(this._historyControls);
     this.appendChild(this._scroll);
     this.appendChild(wrap);
@@ -161,6 +194,9 @@ export class ChatView extends HTMLElement {
     this._meUserId = meUserId;
 
     this._renderHeader();
+    this._tabs.hidden = !room;
+    if (changedRoom) this._tab = "chat";
+    this.selectTab(this._tab);
     if (!room) {
       this._clearTimeline();
       this._historyControls.textContent = "";
@@ -171,7 +207,7 @@ export class ChatView extends HTMLElement {
     this._input.disabled = false;
     this._input.placeholder = `Message ${room.title}`;
     this._renderTimeline();
-    if (changedRoom || pinned) this._scrollToBottom();
+    if (changedRoom || (pinned && this._autoScroll)) this._scrollToBottom();
     else this._scroll.scrollTop = previousScroll;
     this.refreshSeenState();
   }
@@ -364,8 +400,9 @@ export class ChatView extends HTMLElement {
    */
   appendEvents(room: Room, events: RoomEvent[]): void {
     if (!this._room || room.id !== this._room.id) return;
+    this._details.update(room);
     if (events.length === 0) { this._renderHistoryControls(); return; }
-    const pinned = this._nearBottom() && this._windowAnchor === null;
+    const pinned = this._autoScroll && this._nearBottom() && this._windowAnchor === null;
     if (!pinned && !this._windowAnchor) this._windowAnchor = room.timeline[this._windowStart]?.id ?? null;
     const position = this._scroll.scrollTop;
     this._renderTimeline();
@@ -414,8 +451,10 @@ export class ChatView extends HTMLElement {
       room: this._room,
       meUserId: this._meUserId,
       showTimestamps: this._showTimestamps,
+      renderMarkdown: this._renderMarkdown,
     }, {
       onReply: (msg) => this._startReply(msg),
+      onThread: (msg) => { this.selectTab("threads"); void this._details.openThread(msg); },
       onReact: (msg, emoji) => {
         this.dispatchEvent(
           new CustomEvent("grungus:react", {
@@ -483,7 +522,9 @@ export class ChatView extends HTMLElement {
 
   /** Update the "X is typing…" bar from the room's ephemeral state. */
   setTypingUsers(users: string[]): void {
+    this._typingUsers = users;
     if (!this._typingBar) return;
+    if (!this._showTyping) { this._typingBar.textContent = ""; return; }
     this._typingBar.textContent =
       users.length === 0
         ? ""
@@ -538,11 +579,20 @@ export class ChatView extends HTMLElement {
     enterToSend: boolean;
     sendTyping: boolean;
     showTimestamps: boolean;
+    renderMarkdown?: boolean;
+    autoScroll?: boolean;
+    showTyping?: boolean;
   }): void {
-    const timestampsChanged = this._showTimestamps !== prefs.showTimestamps;
+    const timestampsChanged = this._showTimestamps !== prefs.showTimestamps || this._renderMarkdown !== (prefs.renderMarkdown ?? true);
+    const stopTyping = this._sendTyping && !prefs.sendTyping;
+    this._renderMarkdown = prefs.renderMarkdown ?? true;
+    this._autoScroll = prefs.autoScroll ?? true;
+    this._showTyping = prefs.showTyping ?? true;
     this._enterToSend = prefs.enterToSend;
     this._sendTyping = prefs.sendTyping;
     this._showTimestamps = prefs.showTimestamps;
+    if (stopTyping) this._typingStop();
+    this.setTypingUsers(this._typingUsers);
     if (timestampsChanged && this._room) this._renderTimeline();
   }
 

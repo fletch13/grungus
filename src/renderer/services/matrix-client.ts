@@ -1222,6 +1222,38 @@ export class MatrixClient {
    * Send a text message with a local echo. The echo is removed and replaced
    * by the server event when /sync delivers it.
    */
+  private threadItem(room: Room, event: MatrixEvent): import("./matrix-types.ts").MessageItem | null {
+    const item = event.type === "m.room.encrypted" ? this._timeline.decryptItem(room, event, true) : this._timeline.toItem(room, event, true);
+    return item?.kind === "message" ? item : null;
+  }
+  async getThreads(roomId: string, from?: string, signal?: AbortSignal): Promise<{ items: import("./matrix-types.ts").MessageItem[]; next?: string; unavailable?: number }> {
+    const room = this.getRoom(roomId); if (!room) throw new Error("Room is not loaded");
+    const page = await this.api<{ chunk?: MatrixEvent[]; next_batch?: string }>("GET", `/_matrix/client/v1/rooms/${encodeURIComponent(roomId)}/threads`, { query: { limit: 30, include: "all", from }, signal });
+    const decoded = (page.chunk ?? []).map(event => this.threadItem(room, event));
+    return { items: decoded.filter((item): item is import("./matrix-types.ts").MessageItem => !!item), next: page.next_batch, unavailable: decoded.filter(item => !item).length };
+  }
+  async getThreadReplies(roomId: string, rootId: string, from?: string, signal?: AbortSignal): Promise<{ items: import("./matrix-types.ts").MessageItem[]; next?: string; unavailable?: number }> {
+    const room = this.getRoom(roomId); if (!room) throw new Error("Room is not loaded");
+    const page = await this.api<{ chunk?: MatrixEvent[]; next_batch?: string }>("GET", `/_matrix/client/v1/rooms/${encodeURIComponent(roomId)}/relations/${encodeURIComponent(rootId)}/m.thread`, { query: { limit: 50, dir: "f", from }, signal });
+    const decoded = (page.chunk ?? []).map(event => this.threadItem(room, event));
+    return { items: decoded.filter((item): item is import("./matrix-types.ts").MessageItem => !!item), next: page.next_batch, unavailable: decoded.filter(item => !item).length };
+  }
+  async getThreadRoot(roomId: string, eventId: string): Promise<import("./matrix-types.ts").MessageItem | null> {
+    const room = this.getRoom(roomId); if (!room) throw new Error("Room is not loaded");
+    const local = room.timeline.find(item => item.kind === "message" && item.id === eventId);
+    if (local?.kind === "message") return local;
+    const event = await this.api<MatrixEvent>("GET", `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/event/${encodeURIComponent(eventId)}`);
+    return this.threadItem(room, event);
+  }
+  async sendThreadReply(roomId: string, rootId: string, body: string, lastReplyId = rootId): Promise<string | null> {
+    if (!body.trim()) throw new Error("Enter a thread reply");
+    return this.sendRoomEvent(roomId, "m.room.message", { msgtype: "m.text", body, "m.relates_to": { rel_type: "m.thread", event_id: rootId, is_falling_back: true, "m.in_reply_to": { event_id: lastReplyId } } });
+  }
+  async getRoomPowerLevels(roomId: string): Promise<import("./room-permissions.ts").RoomPowerLevels> {
+    try { return await this.api("GET", `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/state/m.room.power_levels`); }
+    catch (error) { if (error instanceof HttpError && error.errcode === "M_NOT_FOUND") return {}; throw error; }
+  }
+
   async sendMessage(roomId: string, body: string): Promise<string | null> {
     return this._messaging.sendMessage(roomId, body);
   }
@@ -1260,20 +1292,29 @@ export class MatrixClient {
     if (opts.topic) body.topic = opts.topic;
     if (opts.isSpace) body.creation_content = { type: "m.space" };
     else if (opts.isVideo) body.creation_content = { type: "org.matrix.msc3417.call" };
-    if (opts.encrypted) {
-      body.initial_state = [
-        {
-          type: "m.room.encryption",
-          state_key: "",
-          content: { algorithm: "m.megolm.v1.aes-sha2" },
-        },
-      ];
+    if (opts.aliasLocalpart) {
+      if (!/^[A-Za-z0-9._=-]+$/.test(opts.aliasLocalpart)) throw new Error("Room address can contain letters, numbers, dots, underscores, equals signs, and hyphens");
+      body.room_alias_name = opts.aliasLocalpart;
     }
-    /* MSC3401 calls: every member must be able to publish their call
-       membership state — grant m.call.member at power level 0 (the same
-       thing Element Call does for call rooms). */
+    if (opts.publish !== undefined) {
+      if (opts.publish && (opts.joinRule ?? (opts.isPublic ? "public" : "invite")) !== "public") throw new Error("Only public rooms can be published");
+      body.visibility = opts.publish ? "public" : "private";
+    }
+    const initial: { type: string; state_key: string; content: Record<string, unknown> }[] = [];
+    const state = (type: string, content: Record<string, unknown>) => initial.push({ type, state_key: "", content });
+    if (opts.encrypted) state("m.room.encryption", { algorithm: "m.megolm.v1.aes-sha2" });
+    if (opts.joinRule) {
+      if (opts.joinRule === "restricted" && !opts.parentSpaceId) throw new Error("Space-member access requires a parent space");
+      state("m.room.join_rules", { join_rule: opts.joinRule, ...(opts.joinRule === "restricted" ? { allow: [{ type: "m.room_membership", room_id: opts.parentSpaceId }] } : {}) });
+    }
+    if (opts.historyVisibility) state("m.room.history_visibility", { history_visibility: opts.historyVisibility });
+    if (opts.avatarUrl) state("m.room.avatar", { url: opts.avatarUrl });
+    if (opts.parentSpaceId) initial.push({ type: "m.space.parent", state_key: opts.parentSpaceId, content: { canonical: true, via: [this.userId?.slice(this.userId.indexOf(":") + 1) || new URL(this.baseUrl).hostname] } });
+    if (initial.length) body.initial_state = initial;
     body.power_level_content_override = {
-      events: { "m.call.member": 0 },
+      events: { "m.call.member": 0, "org.matrix.msc3401.call.member": 0 },
+      ...(opts.announcementOnly !== undefined ? { events_default: opts.announcementOnly ? 50 : 0 } : {}),
+      ...(opts.membersCanInvite !== undefined ? { invite: opts.membersCanInvite ? 0 : 50 } : {}),
     };
     const res = await this.api<{ room_id?: string }>(
       "POST",

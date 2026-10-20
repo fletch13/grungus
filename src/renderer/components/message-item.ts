@@ -1,3 +1,4 @@
+import { formatMessage } from "../services/message-format.ts";
 /*
  * Grungus — <message-item>: one chat message, Discord-style.
  * Handles grouped rendering (consecutive messages from the same sender),
@@ -18,10 +19,12 @@ export interface MessageItemOptions {
   meUserId?: string | null;
   /** user preference: hide the per-message timestamp */
   showTimestamps?: boolean;
+  renderMarkdown?: boolean;
 }
 
 export interface MessageActions {
   onReply?: (item: MessageItem) => void;
+  onThread?: (item: MessageItem) => void;
   onReact?: (item: MessageItem, emoji: string) => void;
   onEdit?: (item: MessageItem) => void;
 }
@@ -56,6 +59,10 @@ export class MessageItemElement extends HTMLElement {
       const replyBtn = el("button", { class: "msg-toolbar-btn", title: "Reply", text: "↩" });
       replyBtn.addEventListener("click", () => actions.onReply?.(item));
       toolbar.appendChild(replyBtn);
+    }
+    if (actions.onThread && item.id && !item.pending && !item.failed) {
+      const thread = el("button", { type: "button", class: "msg-toolbar-btn", text: "Thread", "aria-label": "Reply in thread", title: "Reply in thread" });
+      thread.addEventListener("click", () => actions.onThread?.(item)); toolbar.append(thread);
     }
     /* quick reactions */
     for (const emoji of actions.onReact && item.id && !item.pending && !item.failed ? QUICK_REACTIONS.slice(0, 3) : []) {
@@ -143,7 +150,7 @@ export class MessageItemElement extends HTMLElement {
     if (media && media.mxc) {
       main.appendChild(this._buildMedia(item, media.mxc, client));
     } else {
-      main.appendChild(this._buildBody(item));
+      main.appendChild(this._buildBody(item, opts.renderMarkdown !== false));
     }
 
     /* reactions (emoji chips with counts) */
@@ -211,7 +218,7 @@ export class MessageItemElement extends HTMLElement {
     return holder;
   }
 
-  private _buildBody(item: MessageItem): HTMLElement {
+  private _buildBody(item: MessageItem, markdown: boolean): HTMLElement {
     const body = el("div", { class: "msg-body" });
     if (item.msgtype === "m.emote") {
       body.textContent = `* ${item.senderName} ${item.body}`;
@@ -220,7 +227,8 @@ export class MessageItemElement extends HTMLElement {
       body.textContent = item.body;
       body.style.color = "var(--text-muted)";
     } else {
-      body.textContent = item.body;
+      if (markdown) body.append(formatMessage(item.body));
+      else body.textContent = item.body;
     }
     const gifUrl = item.msgtype === "m.text" ? gifMessageUrl(item.body) : null;
     if (gifUrl) {

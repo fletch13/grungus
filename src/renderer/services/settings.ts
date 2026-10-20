@@ -5,7 +5,7 @@ import { isBackgroundImage } from "./background.ts";
  * features it names (typing notifications, read receipts, theme, …).
  */
 
-export type ThemeName = "dark" | "light";
+export type ThemeName = "dark" | "light" | "system";
 
 /** All user-facing settings, Element-style. Defaults mirror Element's. */
 export interface GrungusSettings {
@@ -39,6 +39,7 @@ export interface GrungusSettings {
   desktopNotifications: boolean;
   /** play a short sound with a desktop notification */
   notificationSound: boolean;
+  notificationPreviews: boolean;
 
   /* Voice & Video — selected media device ids ("" = system default) */
   audioInput: string;
@@ -67,6 +68,7 @@ export const DEFAULT_SETTINGS: GrungusSettings = {
   autoScroll: true,
   desktopNotifications: true,
   notificationSound: true,
+  notificationPreviews: true,
   audioInput: "",
   audioOutput: "",
   videoInput: "",
@@ -83,7 +85,9 @@ function coerce(raw: Partial<GrungusSettings> | null): GrungusSettings {
     const value = raw[key];
     if (value !== undefined && typeof value === typeof DEFAULT_SETTINGS[key]) {
       /* keep numbers sane */
-      if (key === "backgroundImage") {
+      if (key === "theme") {
+        if (["dark", "light", "system"].includes(String(value))) out.theme = value as ThemeName;
+      } else if (key === "backgroundImage") {
         out.backgroundImage = isBackgroundImage(value) ? value : "";
       } else if (key === "fontScale") {
         const scale = Number(value);
