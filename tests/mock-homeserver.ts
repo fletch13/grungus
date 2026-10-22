@@ -1217,7 +1217,7 @@ export class MockHomeserver {
     }
 
     const threadsMatch = route.match(/^rooms\/([^/]+)\/threads$/);
-    const repliesMatch = route.match(/^rooms\/([^/]+)\/relations\/([^/]+)\/m.thread$/);
+    const repliesMatch = route.match(/^rooms\/([^/]+)\/relations\/([^/]+)\/(m.thread|m.reference)$/);
     const eventMatch = route.match(/^rooms\/([^/]+)\/event\/([^/]+)$/);
     if (req.method === "GET" && (threadsMatch || repliesMatch || eventMatch)) {
       const match = (threadsMatch || repliesMatch || eventMatch)!;
@@ -1229,7 +1229,7 @@ export class MockHomeserver {
         if (!event) this._err(res, 404, "M_NOT_FOUND", "Event not found"); else this._send(res, 200, event);
         return;
       }
-      const related = room.events.filter(event => (event.content["m.relates_to"] as { rel_type?: string })?.rel_type === "m.thread");
+      const related = room.events.filter(event => (event.content["m.relates_to"] as { rel_type?: string })?.rel_type === (repliesMatch?.[3] ?? "m.thread"));
       let events;
       if (repliesMatch) events = related.filter(event => (event.content["m.relates_to"] as { event_id?: string }).event_id === repliesMatch[2]);
       else {

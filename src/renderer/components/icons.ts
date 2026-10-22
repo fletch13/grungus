@@ -1,5 +1,6 @@
 /** Small shared stroke icons, rendered as SVG nodes without HTML interpolation. */
 const paths = {
+  crown: ["m3 6 4 4 5-7 5 7 4-4-2 12H5Z", "M5 21h14"],
   mic: ["M9 5a3 3 0 0 1 6 0v7a3 3 0 0 1-6 0Z", "M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"],
   screen: ["M3 4h18v13H3Z", "M12 17v4M8 21h8"],
   home: ["m3 10 9-7 9 7", "M5 9v11h14V9", "M9 20v-7h6v7"],

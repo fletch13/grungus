@@ -1,3 +1,5 @@
+import type { TimelineItem } from "./matrix-types.ts";
+import { RoomFeatures } from "./room-features.ts";
 /*
  * Grungus — Matrix client facade and sync orchestration (TypeScript).
  *
@@ -99,6 +101,7 @@ export class MatrixClient {
   private _syncRunning = false;
   private _stopped = true;
   /** account data by event type (cross-signing keys, etc.) */
+  readonly features = new RoomFeatures(this);
   private _accountData = new Map<string, Record<string, unknown>>();
   private _syncAbort: AbortController | null = null;
   private _backoffMs = 0;
@@ -152,6 +155,8 @@ export class MatrixClient {
       get crypto() { return client.crypto; },
       get onCallEvent() { return client.onCallEvent?.bind(client) ?? null; },
       getRoom: roomId => this.getRoom(roomId),
+      recordPollEvent: (roomId, item) => this.features.recordPollEvent(roomId, item),
+      redactPollEvent: (roomId, eventId) => this.features.redactPollEvent(roomId, eventId),
       handleMediaKeys: (roomId, event) => this._rtc.handleRoomKeys(roomId, event),
       notify: update => this.emit("room", update),
       notifyRooms: () => this.emit("rooms", this.getRooms()),
@@ -680,13 +685,45 @@ export class MatrixClient {
     return Object.keys(content.ignored_users as Record<string, unknown>);
   }
 
-  /** Stop ignoring a user (rewrites m.ignored_user_list without them). */
-  async unignoreUser(userId: string): Promise<void> {
-    const remaining: Record<string, unknown> = {};
-    for (const id of this.getIgnoredUsers()) {
-      if (id !== userId) remaining[id] = {};
-    }
-    await this.setAccountData("m.ignored_user_list", { ignored_users: remaining });
+  getUserNickname(userId: string): string | null {
+    const value = this.getAccountData("org.grungus.user_nicknames")?.[userId];
+    return typeof value === "string" && value.trim() ? value : null;
+  }
+
+  private _userPreferenceWrite: Promise<unknown> = Promise.resolve();
+  private updateUserPreference(type: string, change: (data: Record<string, unknown>) => Record<string, unknown>): Promise<void> {
+    const operation = this._userPreferenceWrite.catch(() => {}).then(async () => {
+      if (!this.userId) throw new Error("Sign in to change user settings");
+      let data: Record<string, unknown>;
+      try { data = await this.api("GET", `${CLIENT_PREFIX}/user/${encodeURIComponent(this.userId)}/account_data/${encodeURIComponent(type)}`); }
+      catch (error) { if (!(error instanceof HttpError) || error.errcode !== "M_NOT_FOUND") throw error; data = {}; }
+      await this.setAccountData(type, change(data));
+    });
+    this._userPreferenceWrite = operation; return operation;
+  }
+
+  async setUserNickname(userId: string, nickname: string): Promise<void> {
+    if (!/^@[^:\s]+:[^\s]+$/.test(userId)) throw new Error("Invalid Matrix user ID");
+    const name = nickname.trim(); if (name.length > 100) throw new Error("Nicknames must be 100 characters or fewer");
+    await this.updateUserPreference("org.grungus.user_nicknames", data => {
+      const result = { ...data }; if (name) result[userId] = name; else delete result[userId]; return result;
+    });
+  }
+
+  async ignoreUser(userId: string): Promise<void> { await this.setUserIgnored(userId, true); }
+  async unignoreUser(userId: string): Promise<void> { await this.setUserIgnored(userId, false); }
+  private async setUserIgnored(userId: string, ignored: boolean): Promise<void> {
+    if (!/^@[^:\s]+:[^\s]+$/.test(userId) || userId === this.userId) throw new Error("Choose another Matrix user");
+    await this.updateUserPreference("m.ignored_user_list", data => {
+      const users = data.ignored_users && typeof data.ignored_users === "object" && !Array.isArray(data.ignored_users) ? { ...data.ignored_users as Record<string, unknown> } : {};
+      if (ignored) users[userId] = {}; else delete users[userId];
+      return { ...data, ignored_users: users };
+    });
+  }
+
+  private refreshUserPreferences(): void {
+    for (const room of this.rooms.values()) this.emit("room", { room, newEvents: [], redraw: true });
+    this.emit("rooms", this.getRooms());
   }
 
   /* ----------------------------- account data ---------------------------- */
@@ -704,6 +741,7 @@ export class MatrixClient {
       { body: content }
     );
     this._accountData.set(type, content);
+    if (["org.grungus.user_nicknames", "m.ignored_user_list"].includes(type)) this.refreshUserPreferences();
     if (type === "m.direct") {
       for (const room of this.rooms.values()) {
         resolveRoomMeta(room, this.userId, content);
@@ -786,6 +824,9 @@ export class MatrixClient {
     return room;
   }
 
+  /** Load initial history on selection when sync supplied no chat messages. */
+  ensureRoomHistory(roomId: string): Promise<void> { return this._history.ensureRoomHistory(roomId); }
+
   /** Page backward without changing current room state or replaying historical calls. */
   async loadOlderMessages(roomId: string): Promise<void> {
     return this._history.loadOlderMessages(roomId);
@@ -819,8 +860,10 @@ export class MatrixClient {
 
     /* account data (cross-signing keys, etc.) */
     let directMapChanged = false;
+    let userPreferencesChanged = false;
     for (const ev of data.account_data?.events ?? []) {
       if (ev.type && ev.content && typeof ev.content === "object") {
+        if (["org.grungus.user_nicknames", "m.ignored_user_list"].includes(ev.type) && JSON.stringify(this.getAccountData(ev.type)) !== JSON.stringify(ev.content)) userPreferencesChanged = true;
         this._accountData.set(ev.type, ev.content);
         if (ev.type === "m.direct") directMapChanged = true;
       }
@@ -1060,6 +1103,7 @@ export class MatrixClient {
       }
     }
 
+    if (userPreferencesChanged) this.refreshUserPreferences();
     for (const update of changedRooms) {
       this.emit("room", update);
     }
@@ -1222,9 +1266,41 @@ export class MatrixClient {
    * Send a text message with a local echo. The echo is removed and replaced
    * by the server event when /sync delivers it.
    */
+  decodeMessageEvent(roomId: string, event: MatrixEvent): import("./matrix-types.ts").MessageItem | null {
+    const room = this.getRoom(roomId); return room ? this.threadItem(room, event) : null;
+  }
   private threadItem(room: Room, event: MatrixEvent): import("./matrix-types.ts").MessageItem | null {
     const item = event.type === "m.room.encrypted" ? this._timeline.decryptItem(room, event, true) : this._timeline.toItem(room, event, true);
     return item?.kind === "message" ? item : null;
+  }
+  private contextItems(roomId: string, events: MatrixEvent[]): TimelineItem[] {
+    const room = this.getRoom(roomId); if (!room) throw new Error("Room is not loaded");
+    const decoded = events.map(raw => {
+      let event = raw;
+      if (raw.type === "m.room.encrypted" && this.crypto) {
+        const plain = this.crypto.decryptRoomEvent(raw, room.id);
+        if (plain) event = { ...raw, type: plain.type, content: plain.content };
+      }
+      const item = this.decodeMessageEvent(roomId, event);
+      return { event, item };
+    });
+    const contextRoom = { ...room, timeline: decoded.filter(({ event, item }) => {
+      const relation = event.content?.["m.relates_to"] as { rel_type?: string } | undefined;
+      return item && relation?.rel_type !== "m.replace" && !/^(?:m|org.matrix.msc3381)\.poll\.(?:response|end)$/.test(event.type);
+    }).map(({ item }) => item!) };
+    for (const { event, item } of decoded) applyRelations(contextRoom, event, item);
+    return contextRoom.timeline;
+  }
+  async getMessageContext(roomId: string, eventId: string): Promise<{ items: TimelineItem[]; before?: string; after?: string }> {
+    const page = await this.api<{ event?: MatrixEvent; events_before?: MatrixEvent[]; events_after?: MatrixEvent[]; start?: string; end?: string }>("GET", `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/context/${encodeURIComponent(eventId)}`, { query: { limit: 60 } });
+    if (!page.event) throw new Error("Message is unavailable");
+    const items = this.contextItems(roomId, [...(page.events_before ?? []).reverse(), page.event, ...(page.events_after ?? [])]);
+    return { items, before: page.start, after: page.end };
+  }
+  async getContextPage(roomId: string, from: string, dir: "b" | "f"): Promise<{ items: TimelineItem[]; next?: string }> {
+    const page = await this.api<{ chunk?: MatrixEvent[]; end?: string }>("GET", `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/messages`, { query: { from, dir, limit: 80 } });
+    const events = page.chunk ?? []; if (dir === "b") events.reverse();
+    return { items: this.contextItems(roomId, events), next: page.end !== from ? page.end : undefined };
   }
   async getThreads(roomId: string, from?: string, signal?: AbortSignal): Promise<{ items: import("./matrix-types.ts").MessageItem[]; next?: string; unavailable?: number }> {
     const room = this.getRoom(roomId); if (!room) throw new Error("Room is not loaded");

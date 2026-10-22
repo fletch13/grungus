@@ -13,6 +13,46 @@ export class SpaceRail extends HTMLElement {
   private _client: MatrixClient | null = null;
   private _sig = "";
 
+  private _menu: HTMLElement | null = null;
+  private _menuOpener: HTMLElement | null = null;
+  private _outside = (event: PointerEvent) => { if (!this._menu?.contains(event.target as Node)) this._closeMenu(false); };
+  disconnectedCallback(): void { this._closeMenu(false); }
+  private _closeMenu(restore = true): void {
+    this._menu?.remove(); this._menu = null;
+    document.removeEventListener("pointerdown", this._outside, true);
+    this._menuOpener?.setAttribute("aria-expanded", "false");
+    if (restore) this._menuOpener?.focus(); this._menuOpener = null;
+  }
+  private _openMenu(space: Room, opener: HTMLElement, x: number, y: number): void {
+    this._closeMenu(false); this._menuOpener = opener; opener.setAttribute("aria-expanded", "true");
+    const menu = el("div", { class: "space-context-menu", role: "menu", "aria-label": `${space.title} actions` });
+    this._menu = menu;
+    menu.append(el("div", { class: "space-menu-title", text: space.title, role: "presentation" }));
+    for (const [action, label] of [["settings", "Space settings"], ["invite", "Invite people"], ["create-room", "Create a room"], ["browse", "Browse space rooms"], ["create-space", "Create a space"], ["new-dm", "New direct message"]]) {
+      const button = el("button", { type: "button", role: "menuitem", text: label });
+      button.addEventListener("click", () => {
+        this._closeMenu();
+        this.dispatchEvent(new CustomEvent("grungus:space-action", { detail: { spaceId: space.id, action }, bubbles: true }));
+      }); menu.append(button);
+    }
+    menu.addEventListener("keydown", event => {
+      const items = [...menu.querySelectorAll<HTMLElement>('[role="menuitem"]')];
+      const index = items.indexOf(document.activeElement as HTMLElement);
+      if (event.key === "Escape" || event.key === "Tab") { if (event.key === "Escape") event.preventDefault(); this._closeMenu(); }
+      else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+        event.preventDefault();
+        const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+        items[next]?.focus();
+      }
+    });
+    document.body.append(menu);
+    const bounds = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(x, innerWidth - bounds.width - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(y, innerHeight - bounds.height - 8))}px`;
+    menu.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    document.addEventListener("pointerdown", this._outside, true);
+  }
+
   connectedCallback(): void {
     this._render();
   }
@@ -24,7 +64,7 @@ export class SpaceRail extends HTMLElement {
       spaces
         .map((space) => [space.id, space.title, space.avatarMxc ?? ""].join(":"))
         .join(",");
-    if (sig === this._sig) return;
+    if (sig === this._sig && client === this._client) return;
     this._sig = sig;
     this._spaces = spaces;
     this._selectedId = selectedId;
@@ -35,6 +75,7 @@ export class SpaceRail extends HTMLElement {
   private _render(): void {
     const spaces = this._spaces;
     const client = this._client;
+    this._closeMenu(false);
     this.textContent = "";
     this.setAttribute("role", "navigation");
     this.setAttribute("aria-label", "Spaces");
@@ -70,6 +111,13 @@ export class SpaceRail extends HTMLElement {
       });
       btn.appendChild(av);
       btn.addEventListener("click", () => this._select(space.id));
+      btn.setAttribute("aria-haspopup", "menu"); btn.setAttribute("aria-expanded", "false");
+      btn.addEventListener("contextmenu", event => { event.preventDefault(); this._openMenu(space, btn, event.clientX, event.clientY); });
+      btn.addEventListener("keydown", event => {
+        if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+          event.preventDefault(); const rect = btn.getBoundingClientRect(); this._openMenu(space, btn, rect.right + 8, rect.top);
+        }
+      });
       this.appendChild(btn);
     }
   }

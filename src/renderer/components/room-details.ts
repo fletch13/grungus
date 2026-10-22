@@ -1,3 +1,4 @@
+import { bindUserTile, userLabel } from "./user-menu.ts";
 import { el } from "./ui.ts";
 import type { MatrixClient, Room, MessageItem } from "../services/matrix-client.ts";
 import "./message-item.ts";
@@ -107,9 +108,10 @@ export class RoomDetails extends HTMLElement {
         }
       }
       for (const root of [...roots.values()].sort((a, b) => b.ts - a.ts)) {
+        if (this.client.getIgnoredUsers?.().includes(root.sender)) continue;
         const localCount = messages.filter(item => item.threadRootId === root.id).length;
         const button = el("button", { type: "button", class: "thread-summary", "aria-label": `Open thread: ${root.body.slice(0, 60)}` },
-          el("strong", { text: root.senderName }), el("p", { text: root.body }),
+          el("strong", { text: userLabel(this.client, root.sender, root.senderName) }), el("p", { text: root.body }),
           el("small", { text: `${Math.max(localCount, root.threadReplyCount ?? 0)} replies` }));
         button.addEventListener("click", () => { void this.openThread(root); }); this.append(button);
       }
@@ -131,7 +133,8 @@ export class RoomDetails extends HTMLElement {
     this.append(el("h3", { text: "Members" }));
     for (const member of room.members.values()) if (["join", "invite"].includes(member.membership)) {
       const av = document.createElement("g-avatar"); av.update({ name: member.displayname || member.userId, userId: member.userId, size: 32, presence: this.client.getPresence?.(member.userId), load: this.client.avatarSrc(member.avatarMxc, 32) });
-      this.append(el("div", { class: "room-info-member" }, av, el("span", { text: `${member.displayname || member.userId} · ${member.userId}${member.membership === "invite" ? " (invited)" : ""}` })));
+      const row = el("div", { class: "room-info-member" }, av, el("span", { text: `${userLabel(this.client, member.userId, member.displayname || member.userId)} · ${member.userId}${member.membership === "invite" ? " (invited)" : ""}` }));
+      bindUserTile(row, this.client, member.userId, member.displayname || member.userId); this.append(row);
     }
   }
 }

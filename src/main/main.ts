@@ -1,3 +1,4 @@
+import { installYoutubeEmbedHeaders } from "./youtube-embed.ts";
 /*
  * Grungus — Electron main process (TypeScript).
  *
@@ -226,6 +227,8 @@ function createWindow(): BrowserWindow {
     }
   );
 
+  installYoutubeEmbedHeaders(win.webContents);
+
   /* Production assets use a secure standard scheme; development uses local Vite. */
   void win.loadURL(rendererUrl());
 
@@ -240,7 +243,7 @@ function createWindow(): BrowserWindow {
           const deadline = Date.now() + 8000;
           const check = () => {
             const login = document.querySelector('login-view .login-card');
-            if (login && getComputedStyle(document.querySelector('login-view')).display === 'grid') return resolve(true);
+            if (login && getComputedStyle(document.querySelector('login-view')).display === 'grid' && document.querySelector('#startup-screen')?.hidden && !document.querySelector('#root')?.inert) return resolve(true);
             if (Date.now() > deadline) return reject(new Error('Vite renderer did not initialize'));
             setTimeout(check, 50);
           };

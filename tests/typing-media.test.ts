@@ -157,4 +157,12 @@ test("media: upload, send, receive metadata, download round-trip", async (t) => 
   const roundTrip = new Uint8Array(await res.arrayBuffer());
   assert.equal(roundTrip.length, bytes.length);
   assert.deepEqual([...roundTrip], [...bytes], "bytes survive the round trip");
+  for (const [name, mimeType, msgtype] of [["Schicksalsschlag.webm", "video/webm", "m.video"], ["no-mime.webm", "", "m.video"], ["voice.ogg", "audio/ogg", "m.audio"], ["notes.pdf", "application/pdf", "m.file"]]) {
+    await a.uploadAndSendMedia(roomId, name!, mimeType!, bytes);
+    await waitFor(() => b.getRoom(roomId)!.timeline.some(entry => entry.kind === "message" && entry.body === name), 5000, `receive ${name}`);
+    const received = b.getRoom(roomId)!.timeline.find(entry => entry.kind === "message" && entry.body === name) as MessageItem;
+    assert.equal(received.msgtype, msgtype); assert.equal(received.media?.name, name); assert.equal(received.media?.mimetype, mimeType || "video/webm");
+    assert.ok(received.media?.mxc, "Attachments must retain downloadable media metadata instead of a text placeholder");
+  }
+
 });

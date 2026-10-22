@@ -45,6 +45,9 @@ export function applyStateEvent(room: Room, ev: MatrixEvent): void {
       room.isSpace = content.type === "m.space";
       room.creator = ev.sender ?? null;
       break;
+    case "m.room.power_levels":
+      room.powerLevels = { ...content };
+      break;
     case "m.room.name":
       room.name = typeof content.name === "string" ? content.name : null;
       break;

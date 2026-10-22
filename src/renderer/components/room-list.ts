@@ -1,3 +1,7 @@
+import { RoomOrder } from "../services/room-order.ts";
+import { recentDirectRooms } from "../services/recent-dms.ts";
+import { bindUserTile, userLabel } from "./user-menu.ts";
+import { showSpaceInvite } from "./space-invite.ts";
 import { isVideoRoom } from "../services/room-kind.ts";
 /*
  * Grungus — <room-list>: sidebar with rooms, direct messages, the local
@@ -23,6 +27,8 @@ export interface UserInfo {
 
 export class RoomList extends HTMLElement {
   private _rooms: Room[] = [];
+  private _organization = new RoomOrder("", null);
+  private _dragRoom: string | null = null;
   private _profileAvatars = new Map<string, { expires: number; load: Promise<string | null> }>();
   private _spaces: Room[] = [];
   private _invites: InvitedRoom[] = [];
@@ -32,10 +38,38 @@ export class RoomList extends HTMLElement {
   private _query = "";
   private _showForm = false;
   private _showSpaceForm = false;
-  /** every joined non-DM room (for the space add-room picker) */
-  private _allRooms: Room[] = [];
   private _user: UserInfo | null = null;
   private _connection: ConnectionState = "connecting";
+
+  private _expiryTimer: ReturnType<typeof setTimeout> | null = null;
+  disconnectedCallback(): void { this._closeRoomMenu(false); if (this._expiryTimer) clearTimeout(this._expiryTimer); this._expiryTimer = null; }
+
+  private _roomMenu: HTMLElement | null = null;
+  private _roomMenuOpener: HTMLElement | null = null;
+  private _outsideRoomMenu = (event: PointerEvent) => { if (!this._roomMenu?.contains(event.target as Node)) this._closeRoomMenu(false); };
+  private _closeRoomMenu(restore = true): void {
+    this._roomMenu?.remove(); this._roomMenu = null;
+    document.removeEventListener("pointerdown", this._outsideRoomMenu, true);
+    if (restore) this._roomMenuOpener?.focus(); this._roomMenuOpener = null;
+  }
+  private _openRoomMenu(space: Room, opener: HTMLElement, x: number, y: number): void {
+    this._closeRoomMenu(false); this._roomMenuOpener = opener;
+    const menu = el("div", { class: "space-context-menu", role: "menu", "aria-label": "Space room actions" });
+    const create = el("button", { type: "button", role: "menuitem", text: "Create a room" });
+    create.addEventListener("click", () => {
+      this._closeRoomMenu();
+      this.dispatchEvent(new CustomEvent("grungus:space-action", { detail: { spaceId: space.id, action: "create-room" }, bubbles: true }));
+    });
+    menu.append(create); this._roomMenu = menu; document.body.append(menu);
+    const bounds = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(x, innerWidth - bounds.width - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(y, innerHeight - bounds.height - 8))}px`;
+    menu.addEventListener("keydown", event => {
+      if (event.key === "Escape" || event.key === "Tab") { if (event.key === "Escape") event.preventDefault(); this._closeRoomMenu(); }
+      if (["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) { event.preventDefault(); create.focus(); }
+    });
+    document.addEventListener("pointerdown", this._outsideRoomMenu, true); create.focus();
+  }
 
   connectedCallback(): void {
     this._render();
@@ -47,7 +81,7 @@ export class RoomList extends HTMLElement {
     selectedRoomId: string | null,
     spaceId: string | null,
     client: MatrixClient | null,
-    allRooms?: Room[]
+    _allRooms?: Room[]
   ): void {
     this._rooms = rooms;
     this._spaces = spaces;
@@ -55,7 +89,7 @@ export class RoomList extends HTMLElement {
     this._spaceId = spaceId;
     if (this._client !== client) this._profileAvatars.clear();
     this._client = client;
-    this._allRooms = allRooms ?? rooms;
+    this._organization = new RoomOrder(client?.userId ?? "", spaceId);
     this._render();
   }
 
@@ -74,11 +108,22 @@ export class RoomList extends HTMLElement {
     this._renderFooter();
   }
 
+  showCreateSpace(): void {
+    this._showSpaceForm = true; this._showForm = false; this._render();
+    this.querySelector<HTMLInputElement>(".new-space-form input")?.focus();
+  }
+
   private _currentSpace(): Room | null {
     return this._spaces.find((space) => space.id === this._spaceId) ?? null;
   }
 
   private _render(): void {
+    this._closeRoomMenu(false);
+    if (this._expiryTimer) clearTimeout(this._expiryTimer);
+    this._expiryTimer = null;
+    const now = Date.now();
+    const nextExpiry = Math.min(...this._rooms.filter(isVideoRoom).flatMap(room => room.rtcMemberships.map(member => member.expiresTs)).filter(time => Number.isFinite(time) && time > now));
+    if (Number.isFinite(nextExpiry)) this._expiryTimer = setTimeout(() => { this._expiryTimer = null; if (this.isConnected) this._render(); }, Math.min(nextExpiry - now + 10, 2147483647));
     const space = this._currentSpace();
     const restoreSearchFocus = document.activeElement?.id === "room-filter";
     this.textContent = "";
@@ -104,8 +149,10 @@ export class RoomList extends HTMLElement {
         input?.focus();
       }
     });
-    head.appendChild(addBtn);
+    if (!space) head.appendChild(addBtn);
     if (space) {
+      const invite = el("button", { type: "button", class: "add-btn", "aria-label": "Invite to space", title: "Invite to space" }, icon("plus"));
+      invite.addEventListener("click", () => { if (this._client) showSpaceInvite(space, this._client); }); head.append(invite);
       const settings = el("button", { type: "button", class: "add-btn", "aria-label": "Space settings", title: "Space settings" }, icon("settings"));
       settings.addEventListener("click", () => this.dispatchEvent(new CustomEvent("grungus:room-settings", { detail: { roomId: space.id }, bubbles: true })));
       head.append(settings);
@@ -127,19 +174,14 @@ export class RoomList extends HTMLElement {
         input?.focus();
       }
     });
-    head.appendChild(spaceBtn);
+    if (!space) head.appendChild(spaceBtn);
     const newDm = el("button", { type: "button", class: "add-btn", title: "New direct message", "aria-label": "New direct message" }, icon("bubble"));
     newDm.addEventListener("click", () => this.dispatchEvent(new CustomEvent("grungus:new-dm", { bubbles: true })));
-    head.appendChild(newDm);
+    if (!space) head.appendChild(newDm);
     const browse = el("button", { type: "button", class: "add-btn", title: space ? "Browse space rooms" : "Explore rooms", "aria-label": space ? "Browse space rooms" : "Explore rooms" }, icon("search"));
     browse.addEventListener("click", () => this.dispatchEvent(new CustomEvent("grungus:explore-rooms", { bubbles: true })));
-    head.appendChild(browse);
+    if (!space) head.appendChild(browse);
     this.appendChild(head);
-    if (space) {
-      const discover = el("button", { type: "button", class: "call-btn space-browse-rooms", text: "Browse rooms in this space" });
-      discover.addEventListener("click", () => this.dispatchEvent(new CustomEvent("grungus:explore-rooms", { bubbles: true })));
-      this.appendChild(discover);
-    }
     const search = el("input", { id: "room-filter", type: "search", placeholder: "Find a conversation", "aria-label": "Filter rooms", value: this._query }) as HTMLInputElement;
     search.addEventListener("input", () => { this._query = search.value; this._filterRooms(); });
     this.appendChild(el("div", { class: "room-search" }, icon("search", 16), search));
@@ -221,75 +263,28 @@ export class RoomList extends HTMLElement {
 
     /* scrollable room sections */
     const scroll = el("div", { class: "room-scroll" });
-
-    /* space management: add/remove children (when a space is selected) */
-    if (space && this._client) {
-      const mgmt = el("div", { class: "space-manage" });
-      mgmt.appendChild(el("div", { class: "sidebar-section", text: "Space rooms" }));
-
-      /* current children with remove buttons */
-      const children = this._rooms.filter((room) => space.children.has(room.id));
-      for (const child of children) {
-        const row = el("div", { class: "space-child-row" });
-        row.appendChild(el("span", { class: "space-child-name", text: child.title }));
-        const rm = el("button", {
-          class: "space-child-remove",
-          title: `Remove ${child.title} from this space`,
-          text: "✕",
-        });
-        rm.addEventListener("click", () => {
-          this.dispatchEvent(
-            new CustomEvent("grungus:remove-from-space", {
-              detail: { spaceId: space.id, roomId: child.id },
-              bubbles: true,
-            })
-          );
-        });
-        row.appendChild(rm);
-        mgmt.appendChild(row);
-      }
-      if (children.length === 0) {
-        mgmt.appendChild(
-          el("div", { class: "empty-state", text: "No rooms in this space yet." })
-        );
-      }
-
-      /* add-room picker: joined rooms that are not yet children */
-      const candidates = this._allRooms.filter(
-        (room) => !room.isSpace && !room.isDirect && !space.children.has(room.id)
-      );
-      if (candidates.length > 0) {
-        const picker = el("div", { class: "space-add-row" });
-        const select = document.createElement("select");
-        select.className = "space-add-select";
-        for (const cand of candidates) {
-          const opt = document.createElement("option");
-          opt.value = cand.id;
-          opt.textContent = cand.title;
-          select.appendChild(opt);
+    if (space) {
+      scroll.tabIndex = 0; scroll.setAttribute("aria-label", "Space rooms");
+      scroll.addEventListener("contextmenu", event => {
+        const target = event.target as HTMLElement;
+        if (target.closest(".sidebar-room, .invite-row, button, input, a")) return;
+        event.preventDefault(); this._openRoomMenu(space, scroll, event.clientX, event.clientY);
+      });
+      scroll.addEventListener("keydown", event => {
+        if (event.target === scroll && (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10"))) {
+          event.preventDefault(); const rect = scroll.getBoundingClientRect(); this._openRoomMenu(space, scroll, rect.left + 12, rect.top + 12);
         }
-        const add = el("button", { text: "Add", class: "space-add-btn" });
-        add.addEventListener("click", () => {
-          const roomId = select.value;
-          if (!roomId) return;
-          this.dispatchEvent(
-            new CustomEvent("grungus:add-to-space", {
-              detail: { spaceId: space.id, roomId },
-              bubbles: true,
-            })
-          );
-        });
-        picker.appendChild(select);
-        picker.appendChild(add);
-        mgmt.appendChild(picker);
-      }
-      scroll.appendChild(mgmt);
+      });
     }
+
 
     this._renderInvites(scroll);
 
-    const roomsSection = this._rooms.filter((room) => !room.isDirect);
-    const dmSection = this._rooms.filter((room) => room.isDirect);
+    const favorites = this._organization.favorites;
+    this._renderSection(scroll, "Favorites", this._rooms.filter(room => favorites.includes(room.id)));
+    const roomsSection = this._rooms.filter((room) => !room.isDirect && !favorites.includes(room.id));
+    const recentIds = new Set(recentDirectRooms(this._rooms).map(room => room.id));
+    const dmSection = this._rooms.filter((room) => room.isDirect && !recentIds.has(room.id) && !favorites.includes(room.id));
 
     if (space) {
       this._renderSection(scroll, "Text rooms", roomsSection.filter(room => !isVideoRoom(room)));
@@ -319,15 +314,53 @@ export class RoomList extends HTMLElement {
   private _filterRooms(): void {
     const query = this._query.trim().toLocaleLowerCase();
     const titles = new Map(this._rooms.map(room => [room.id, room.title.toLocaleLowerCase()]));
-    for (const row of this.querySelectorAll<HTMLElement>(".room-row")) {
-      row.classList.toggle("hidden", !!query && !titles.get(row.dataset.roomId ?? "")?.includes(query));
+    for (const row of this.querySelectorAll<HTMLElement>(".sidebar-room")) {
+      const hidden = !!query && !titles.get(row.dataset.roomId ?? "")?.includes(query);
+      row.classList.toggle("hidden", hidden);
+      row.querySelector(".room-row")?.classList.toggle("hidden", hidden);
     }
   }
 
   private _renderSection(container: HTMLElement, label: string, rooms: Room[]): void {
     if (rooms.length === 0) return;
     container.appendChild(el("div", { class: "sidebar-section", text: label }));
-    for (const room of rooms) container.appendChild(this._buildRoomRow(room));
+    const ordered = this._organization.sorted(rooms);
+    for (const [index, room] of ordered.entries()) {
+      const group = el("div", { class: "sidebar-room", dataset: { roomId: room.id } });
+      group.append(this._buildRoomRow(room));
+      group.draggable = true;
+      group.addEventListener("dragstart", event => { this._dragRoom = room.id; event.dataTransfer?.setData("text/plain", room.id); if (event.dataTransfer) event.dataTransfer.effectAllowed = "move"; });
+      group.addEventListener("dragend", () => { this._dragRoom = null; });
+      group.addEventListener("dragover", event => { if (ordered.some(item => item.id === this._dragRoom)) { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = "move"; } });
+      group.addEventListener("drop", event => { event.preventDefault(); if (this._dragRoom && ordered.some(item => item.id === this._dragRoom)) { this._organization.move(this._dragRoom, room.id, this._rooms); this._dragRoom = null; this._render(); } });
+      const actions = el("div", { class: "room-order-actions" });
+      for (const [offset, text] of [[-1, "Move up"], [1, "Move down"]] as const) {
+        const target = ordered[index + offset];
+        const move = el("button", { type: "button", text: offset < 0 ? "↑" : "↓", "aria-label": `${text}: ${room.title}`, disabled: !target });
+        move.addEventListener("click", () => { if (!target) return; if (offset < 0) this._organization.move(room.id, target.id, this._rooms); else this._organization.move(target.id, room.id, this._rooms); this._render(); [...this.querySelectorAll<HTMLButtonElement>(".room-order-actions button")].find(button => button.getAttribute("aria-label") === `${text}: ${room.title}`)?.focus(); }); actions.append(move);
+      }
+      group.append(actions);
+      if (isVideoRoom(room)) group.append(this._buildParticipants(room));
+      container.append(group);
+    }
+  }
+
+  private _buildParticipants(room: Room): HTMLElement {
+    const list = el("ul", { class: "sidebar-participants", "aria-label": `In call in ${room.title}` });
+    const activeUsers = new Set(room.rtcMemberships.filter(member => member.expiresTs > Date.now()).map(member => member.sender));
+    const members = [...activeUsers].map(userId => room.members.get(userId) ?? { userId, displayname: null, avatarMxc: null, membership: "join" })
+      .filter(member => member.membership === "join")
+      .sort((a, b) => (a.displayname || a.userId).localeCompare(b.displayname || b.userId));
+    for (const member of members) {
+      const avatar = document.createElement("g-avatar");
+      avatar.update({ name: member.displayname || member.userId, userId: member.userId, size: 20,
+        load: this._client ? this._client.avatarSrc(member.avatarMxc, 20) : null });
+      const row = el("li", { class: "sidebar-participant", title: member.userId }, avatar,
+        el("span", { class: "sidebar-participant-name", text: userLabel(this._client, member.userId, member.displayname || mxidLocalpart(member.userId)) }));
+      bindUserTile(row, this._client, member.userId, member.displayname || member.userId); list.append(row);
+    }
+    if (!members.length) list.hidden = true;
+    return list;
   }
 
   /** Pending-invite rows with accept/decline buttons. */
@@ -409,12 +442,13 @@ export class RoomList extends HTMLElement {
       size: 32,
       load: peer ? this._peerAvatar(peer.userId, peer.avatarMxc) : this._client ? this._client.avatarSrc(room.avatarMxc, 32) : null,
     });
+    if (peer) bindUserTile(av, this._client, peer.userId, peer.displayname || peer.userId);
     row.appendChild(av);
     if (!room.isDirect) row.appendChild(el("span", { class: "room-kind-icon", title: isVideoRoom(room) ? "Video room" : "Text room", "aria-label": isVideoRoom(room) ? "Video room" : "Text room" }, icon(isVideoRoom(room) ? "video" : "hash", 16)));
     row.appendChild(
       el("span", {
         class: "room-name",
-        text: room.title,
+        text: peer ? userLabel(this._client, peer.userId, room.title) : room.title,
       })
     );
     if (room.unread > 0) {
@@ -452,6 +486,9 @@ export class RoomList extends HTMLElement {
         })
       );
     });
+    const favorite = this._organization.favorites.includes(room.id);
+    const star = el("button", { type: "button", class: "room-favorite", text: favorite ? "★" : "☆", "aria-label": `${favorite ? "Remove favorite" : "Favorite"}: ${room.title}`, "aria-pressed": String(favorite), title: favorite ? "Remove from favorites" : "Add to favorites" });
+    star.addEventListener("click", event => { event.stopPropagation(); this._organization.toggle(room.id); this._render(); }); row.append(star);
     row.appendChild(del);
     row.addEventListener("keydown", event => { if (event.target === row && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); row.click(); } });
     row.addEventListener("click", () => {

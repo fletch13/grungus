@@ -1,3 +1,6 @@
+import { PushToTalk } from "../services/push-to-talk.ts";
+import { SettingsStore } from "../services/settings.ts";
+import { bindUserTile } from "./user-menu.ts";
 import { VoiceActivityMonitor } from "../services/voice-activity.ts";
 /*
  * Grungus — <call-view>: full-screen call overlay.
@@ -28,6 +31,26 @@ export interface CallController {
 
 export class CallView extends HTMLElement {
   private _state: CallUiState | null = null;
+  private _deafened = false;
+  private _mutedBeforeDeafen = false;
+  private _peerVolumes = new Map<string, number>();
+  private _peerMuted = new Set<string>();
+  private _applyPeerAudio(): void {
+    for (const [key, video] of this._videos) {
+      if (key === "local" || key === "screen-local") { video.muted = true; continue; }
+      const peer = key.startsWith("screen-") ? key.slice(7) : key;
+      video.volume = this._peerVolumes.get(peer) ?? 1;
+      video.muted = this._deafened || this._peerMuted.has(peer);
+    }
+  }
+  private _ptt = new PushToTalk();
+  private _pttEnabled = false;
+  private _pttKey = "Space";
+  private _configurePtt(): void {
+    const manager = this._manager;
+    if (!this._state?.active || !manager) { this._ptt.stop(); return; }
+    this._ptt.configure(this._pttEnabled, this._pttKey, muted => manager.setMuted(this._deafened || muted));
+  }
   private _client: MatrixClient | null = null;
   private _speakers = new Set<string>();
   private _voiceActivity = new VoiceActivityMonitor(active => { this._speakers = active; this._applySpeaking(); });
@@ -124,6 +147,7 @@ export class CallView extends HTMLElement {
   };
   setAudioInput(deviceId: string): void { this._audioInput = deviceId; }
   disconnectedCallback(): void {
+    this._ptt.stop();
     this._refreshSequence++;
     this._clearMediaListeners(); this._voiceActivity.stop(); this._speakers.clear();
     navigator.mediaDevices?.removeEventListener("devicechange", this._refreshDevices);
@@ -141,6 +165,12 @@ export class CallView extends HTMLElement {
     if (state.roomId !== this._state?.roomId) { this._featuredKey = null; this._cameraKeys.clear(); }
     this._state = state;
     this._manager = manager;
+    if (starting) {
+      this._deafened = false; this._peerVolumes.clear(); this._peerMuted.clear();
+      const settings = new SettingsStore(); this._pttEnabled = settings.get("pushToTalk"); this._pttKey = settings.get("pushToTalkKey");
+      this._configurePtt();
+    }
+    if (!state.active) this._ptt.stop();
     this._render();
     if (starting) { this._deviceError = ""; void this._refreshDevices(); }
   }
@@ -203,25 +233,42 @@ export class CallView extends HTMLElement {
     if (!cameras.some(participant => participant.key === this._featuredKey)) this._featuredKey = cameras[0]?.key ?? null;
     this._cameraKeys = new Set(cameras.map(participant => participant.key));
     const featured = cameras.find(participant => participant.key === this._featuredKey);
-    const remoteSharer = state.participants.find(participant => participant.sharing && this._hasVideo(participant.screenStream));
     const localUser = this._client?.userId ?? state.localKey ?? "You";
-    const stage = remoteSharer ? { key: `screen-${remoteSharer.key}`, name: `${remoteSharer.name}’s screen`, stream: remoteSharer.screenStream, status: remoteSharer.connectionState, userId: remoteSharer.userId, speakerKey: remoteSharer.key, screen: true }
-      : state.localSharing && this._hasVideo(manager.localScreenStream ?? null) ? { key: "screen-local", name: "Your screen", stream: manager.localScreenStream!, status: "local", userId: localUser, speakerKey: "local", screen: true }
-      : featured ? { key: featured.key, name: featured.name, stream: featured.stream, status: featured.connectionState, userId: featured.userId, speakerKey: featured.key, screen: false } : null;
-    const layout = el("div", { class: `call-layout${stage ? " has-stage" : ""}` });
-    if (stage) layout.append(el("section", { class: "call-stage", "aria-label": stage.screen ? "Shared screen" : "Featured video" },
-      this._buildTile(stage.key, stage.name, stage.stream, stage.status, false, stage.screen ? "presentation" : "featured-video", stage.userId)));
-    if (stage) layout.querySelector<HTMLElement>(".call-tile")!.dataset.speakerKey = stage.speakerKey;
+    const stages = state.participants.filter(participant => participant.sharing && this._hasVideo(participant.screenStream)).map(participant => ({
+      key: `screen-${participant.key}`, name: `${participant.name}’s screen`, stream: participant.screenStream,
+      status: participant.connectionState, userId: participant.userId, speakerKey: participant.key, screen: true,
+    }));
+    if (state.localSharing && this._hasVideo(manager.localScreenStream ?? null)) stages.push({ key: "screen-local", name: "Your screen", stream: manager.localScreenStream!, status: "local", userId: localUser, speakerKey: "local", screen: true });
+    const orderedCameras = [...cameras].sort((a, b) => Number(b.key === featured?.key) - Number(a.key === featured?.key));
+    for (const participant of orderedCameras) stages.push({ key: participant.key, name: participant.name, stream: participant.stream, status: participant.connectionState, userId: participant.userId, speakerKey: participant.key, screen: false });
+    const layout = el("div", { class: `call-layout${stages.length ? " has-stage" : ""}` });
+    if (stages.length) {
+      const stageGrid = el("section", { class: `call-stage${stages.length > 1 ? " multiple-streams" : ""}`, "aria-label": "Call streams" });
+      for (const stage of stages) {
+        const tile = this._buildTile(stage.key, stage.name, stage.stream, stage.status, false, stage.screen ? "presentation" : "featured-video", stage.userId);
+        tile.dataset.speakerKey = stage.speakerKey;
+        tile.setAttribute("aria-label", stage.screen ? "Shared screen" : `${stage.name} video`);
+        stageGrid.append(tile);
+      }
+      layout.append(stageGrid);
+    }
     const grid = el("div", { class: "call-grid", "aria-label": "Call participants" });
     grid.appendChild(this._buildTile("local", "You", manager.localStream, "local", state.localMuted, "", localUser));
     for (const participant of state.participants) {
-      const onStage = stage?.key === participant.key;
+      const onStage = cameras.some(camera => camera.key === participant.key);
       const tile = this._buildTile(onStage ? `preview-${participant.key}` : participant.key,
         participant.name, onStage ? null : participant.stream, participant.connectionState, false, onStage ? "on-stage" : "", participant.userId, !onStage);
+      const audio = el("div", { class: "call-peer-audio" });
+      const volume = el("input", { type: "range", min: "0", max: "100", step: "1", value: String(Math.round((this._peerVolumes.get(participant.key) ?? 1) * 100)), "aria-label": `Volume for ${participant.name}` }) as HTMLInputElement;
+      const level = el("output", { text: `${volume.value}%` });
+      volume.addEventListener("input", () => { this._peerVolumes.set(participant.key, Number(volume.value) / 100); level.textContent = `${volume.value}%`; this._applyPeerAudio(); });
+      const mutePeer = el("button", { type: "button", class: "call-btn", text: this._peerMuted.has(participant.key) ? "Unmute locally" : "Mute locally", "aria-pressed": String(this._peerMuted.has(participant.key)), "aria-label": `Mute ${participant.name} locally` });
+      mutePeer.addEventListener("click", () => { if (this._peerMuted.has(participant.key)) this._peerMuted.delete(participant.key); else this._peerMuted.add(participant.key); this._applyPeerAudio(); mutePeer.textContent = this._peerMuted.has(participant.key) ? "Unmute locally" : "Mute locally"; mutePeer.setAttribute("aria-pressed", String(this._peerMuted.has(participant.key))); });
+      audio.append(el("label", {}, "Volume", volume), level, mutePeer); tile.append(audio);
       tile.dataset.participantKey = participant.key;
       tile.dataset.speakerKey = participant.key;
-      if (this._hasVideo(participant.stream) && !stage?.screen) {
-        const focus = el("button", { type: "button", class: "call-focus-video", "aria-label": `Feature ${participant.name} video`, "aria-pressed": String(onStage), title: "Show video in the centre" }, icon("video", 16));
+      if (this._hasVideo(participant.stream) ) {
+        const focus = el("button", { type: "button", class: "call-focus-video", "aria-label": `Feature ${participant.name} video`, "aria-pressed": String(participant.key === featured?.key), title: "Show this video first" }, icon("video", 16));
         focus.addEventListener("click", () => { this._featuredKey = participant.key; this._render(); });
         tile.append(focus);
       }
@@ -244,6 +291,15 @@ export class CallView extends HTMLElement {
     refresh.addEventListener("click", () => { void this._refreshDevices(); });
     devicePanel.append(refresh);
     if (this._deviceError) devicePanel.append(el("p", { class: "call-device-error", role: "alert", text: this._deviceError }));
+    const ptt = el("input", { type: "checkbox", "aria-label": "Push to talk" }) as HTMLInputElement; ptt.checked = this._pttEnabled;
+    ptt.addEventListener("change", () => {
+      this._pttEnabled = ptt.checked; new SettingsStore().set("pushToTalk", ptt.checked); this._configurePtt(); this._render();
+    });
+    const key = el("select", { class: "call-device-select", "aria-label": "Push-to-talk key" }) as HTMLSelectElement;
+    for (const code of ["Space", ...Array.from({ length: 26 }, (_, i) => `Key${String.fromCharCode(65 + i)}`), ...Array.from({ length: 12 }, (_, i) => `F${i + 1}`)]) key.append(el("option", { value: code, text: code.startsWith("Key") ? code.slice(3) : code }));
+    key.value = this._pttKey;
+    key.addEventListener("change", () => { this._pttKey = key.value; new SettingsStore().set("pushToTalkKey", key.value); this._configurePtt(); });
+    devicePanel.append(el("label", {}, ptt, " Push to talk"), key, el("small", { class: "settings-hint", text: "Hold the selected key while Grungus is focused. Typing fields do not transmit audio." }));
     this.append(devicePanel);
 
     const footer = el("div", { class: "call-footer" });
@@ -251,6 +307,7 @@ export class CallView extends HTMLElement {
       "button",
       { class: "call-btn" + (state.localMuted ? " muted" : ""), text: state.localMuted ? "Unmute" : "Mute" }
     );
+    (mute as HTMLButtonElement).disabled = this._pttEnabled || this._deafened;
     mute.addEventListener("click", () => {
       manager.setMuted(!state.localMuted);
     });
@@ -274,6 +331,12 @@ export class CallView extends HTMLElement {
     share.prepend(icon("screen", 20));
     hangUp.prepend(icon("phone", 20));
     footer.appendChild(mute);
+    const deafen = el("button", { type: "button", class: "call-btn", text: this._deafened ? "Undeafen" : "Deafen", "aria-pressed": String(this._deafened), "aria-label": "Deafen" });
+    deafen.addEventListener("click", () => {
+      if (!this._deafened) this._mutedBeforeDeafen = state.localMuted;
+      this._deafened = !this._deafened;
+      manager.setMuted(this._deafened || this._pttEnabled || this._mutedBeforeDeafen); this._applyPeerAudio(); this._render();
+    }); footer.append(deafen);
     if (manager.setCameraEnabled) {
       const enabled = manager.localCameraEnabled === true;
       const camera = el("button", { type: "button", class: "call-btn" + (enabled ? " sharing" : ""), text: enabled ? "Turn camera off" : "Turn camera on", "aria-label": enabled ? "Turn camera off" : "Turn camera on", "aria-pressed": String(enabled), disabled: this._switching }, icon("video", 20));
@@ -289,8 +352,9 @@ export class CallView extends HTMLElement {
     footer.appendChild(hangUp);
     this.appendChild(footer);
     if (focused) [...this.querySelectorAll<HTMLElement>("[aria-label]")].find(node => node.getAttribute("aria-label") === focused)?.focus();
+    this._applyPeerAudio();
     this._watchSpeaking();
-    const activeKeys = new Set(["local", ...state.participants.map(p => p.key), ...(stage ? [stage.key] : [])]);
+    const activeKeys = new Set(["local", ...state.participants.map(p => p.key), ...stages.map(stage => stage.key)]);
     for (const [key, video] of this._videos) if (!activeKeys.has(key)) { video.srcObject = null; this._videos.delete(key); }
   }
 
@@ -327,7 +391,11 @@ export class CallView extends HTMLElement {
     userId = name,
     showMedia = true
   ): HTMLElement {
+    const resolvedUser = this._userId(userId);
+    const nickname = this._client?.getUserNickname?.(resolvedUser);
+    if (nickname) name = extraClass === "presentation" ? `${nickname}’s screen` : nickname;
     const tile = el("div", { class: ("call-tile " + extraClass).trim(), dataset: { speakerKey: key } });
+    bindUserTile(tile, this._client, resolvedUser, name);
     tile.append(el("span", { class: "call-speaking-indicator", hidden: true, "aria-label": "Speaking", text: "Speaking" }));
 
     if (showMedia) {

@@ -1,3 +1,6 @@
+import "./room-tools.ts";
+import { userLabel } from "./user-menu.ts";
+import { mxidLocalpart } from "../services/matrix-identifiers.ts";
 import "./room-details.ts";
 import { isVideoRoom } from "../services/room-kind.ts";
 /*
@@ -13,11 +16,59 @@ import { el, formatDay, sameDay } from "./ui.ts";
 import type { MatrixClient, MessageItem, Room, RoomEvent, TimelineItem } from "../services/matrix-client.ts";
 
 export class ChatView extends HTMLElement {
+  private _mentionMenu: HTMLElement | null = null;
+  private _mentionIndex = 0;
+  private _context: { items: TimelineItem[]; before?: string; after?: string } | null = null;
+  private _jumpGeneration = 0;
+  private closeMentions(): void { this._mentionMenu?.remove(); this._mentionMenu = null; this._input?.removeAttribute("aria-activedescendant"); this._input?.removeAttribute("aria-controls"); this._input?.setAttribute("aria-expanded", "false"); }
+  private completeMentions(): void {
+    this.closeMentions();
+    const input = this._input, room = this._room, client = this._client;
+    if (!room || !client || input.selectionStart !== input.selectionEnd) return;
+    const match = /(?:^|\s)@([^\s@]*)$/.exec(input.value.slice(0, input.selectionStart));
+    if (!match) return;
+    const query = match[1]!.toLocaleLowerCase(), end = input.selectionStart, start = end - match[1]!.length - 1;
+    const users = [...room.members.values()].filter(member => member.membership === "join" && !client.getIgnoredUsers().includes(member.userId))
+      .filter(member => `${userLabel(client, member.userId, member.displayname || member.userId)} ${member.userId}`.toLocaleLowerCase().includes(query)).slice(0, 8);
+    if (!users.length) return;
+    const menu = el("div", { id: "mention-suggestions", class: "mention-suggestions", role: "listbox", "aria-label": "Mention a member" });
+    this._mentionMenu = menu; this._mentionIndex = 0;
+    users.forEach((member, index) => {
+      const button = el("button", { type: "button", role: "option", id: `mention-option-${index}`, "aria-selected": String(index === 0), text: `${userLabel(client, member.userId, member.displayname || member.userId)} · ${member.userId}` });
+      button.addEventListener("pointerdown", event => event.preventDefault());
+      button.addEventListener("click", () => { input.setRangeText(`${member.userId} `, start, end, "end"); this.closeMentions(); this._autosize(); input.focus(); }); menu.append(button);
+    });
+    this._composerWrap.append(menu); input.setAttribute("aria-controls", menu.id); input.setAttribute("aria-expanded", "true"); input.setAttribute("aria-autocomplete", "list"); input.setAttribute("aria-activedescendant", "mention-option-0");
+  }
+  private async jumpToMessage(eventId: string): Promise<void> {
+    const room = this._room, client = this._client; if (!room || !client) return;
+    const generation = ++this._jumpGeneration;
+    try {
+      let items = room.timeline;
+      if (!items.some(item => item.id === eventId)) {
+        const context = await client.getMessageContext(room.id, eventId);
+        if (generation !== this._jumpGeneration || room !== this._room) return;
+        this._context = context; items = context.items;
+      } else this._context = null;
+      const index = items.findIndex(item => item.id === eventId);
+      if (index < 0) throw new Error("Message unavailable or cannot be decrypted");
+      this.selectTab("chat"); this._windowAnchor = items[Math.max(0, index - 35)]?.id ?? null; this._renderTimeline();
+      const node = [...this._scroll.querySelectorAll<HTMLElement>("[data-event-id]")].find(node => node.dataset.eventId === eventId);
+      node?.scrollIntoView({ block: "center", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" }); node?.classList.add("message-jump-target");
+      if (node) { node.tabIndex = -1; node.focus({ preventScroll: true }); setTimeout(() => node.classList.remove("message-jump-target"), 3000); }
+    } catch (error) { if (generation === this._jumpGeneration) this.setNotice(`Could not open message: ${error instanceof Error ? error.message : "unknown error"}`); }
+  }
   private _gifPicker!: import("./gif-picker.ts").GifPicker;
   setKlipyApiKey(key: string): void { this._gifPicker.setApiKey(key); }
   private _emojiPicker!: import("./emoji-picker.ts").EmojiPicker;
   private _room: Room | null = null;
   private _client: MatrixClient | null = null;
+  private _roomTools: import("./room-tools.ts").RoomTools | null = null;
+  private openTools(mode: "search" | "pins" | "polls" | "media", root?: MessageItem): void {
+    if (!this._room || !this._client) return;
+    if (!this._roomTools) { this._roomTools = document.createElement("room-tools"); this._roomTools.hidden = true; this.append(this._roomTools); }
+    this._roomTools.show(this._room, this._client, mode, root);
+  }
   private _meUserId: string | null = null;
   private _lastItem: TimelineItem | null = null;
   private _noticeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -64,6 +115,11 @@ export class ChatView extends HTMLElement {
   private _replyBar: HTMLElement | null = null;
   private _editTarget: MessageItem | null = null;
 
+  constructor() {
+    super();
+    this.addEventListener("grungus:jump-message", event => { if (this._roomTools && !this._roomTools.hidden) this._roomTools.hide(); void this.jumpToMessage((event as CustomEvent<{ eventId: string }>).detail.eventId); });
+    this.addEventListener("grungus:open-poll", event => this.openTools("polls", (event as CustomEvent<{ root: MessageItem }>).detail.root));
+  }
   connectedCallback(): void {
     this._renderSkeleton();
   }
@@ -83,11 +139,13 @@ export class ChatView extends HTMLElement {
     const wrap = el("div", { class: "composer-wrap" });
     this._composerWrap = wrap;
     const composer = el("div", { class: "composer" });
-    const attach = el("button", { class: "attach-btn", title: "Send an image", "aria-label": "Send an image" });
+    const attach = el("button", { class: "attach-btn", title: "Send an attachment", "aria-label": "Send an attachment" });
     attach.appendChild(icon("plus", 20));
     const fileInput = el("input", {
       type: "file",
-      accept: "image/*,image/gif",
+      accept: "*/*",
+      multiple: true,
+      "aria-label": "Choose attachments",
       class: "hidden-file-input",
     }) as HTMLInputElement;
     this._typingBar = el("div", { class: "typing-bar" });
@@ -139,6 +197,13 @@ export class ChatView extends HTMLElement {
     wrap.appendChild(this._hint);
 
     this._input.addEventListener("keydown", (event) => {
+      if (event.isComposing) return;
+      if (this._mentionMenu) {
+        const options = [...this._mentionMenu.querySelectorAll<HTMLButtonElement>("button")];
+        if (["ArrowDown", "ArrowUp"].includes(event.key)) { event.preventDefault(); this._mentionIndex = (this._mentionIndex + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length; options.forEach((option, index) => option.setAttribute("aria-selected", String(index === this._mentionIndex))); this._input.setAttribute("aria-activedescendant", `mention-option-${this._mentionIndex}`); options[this._mentionIndex]?.scrollIntoView({ block: "nearest" }); return; }
+        if (["Enter", "Tab"].includes(event.key)) { event.preventDefault(); options[this._mentionIndex]?.click(); return; }
+        if (event.key === "Escape") { event.preventDefault(); this.closeMentions(); return; }
+      }
       const wantsSend = this._enterToSend
         ? event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.metaKey
         : event.key === "Enter" && (event.ctrlKey || event.metaKey);
@@ -150,20 +215,32 @@ export class ChatView extends HTMLElement {
     });
     this._input.addEventListener("input", () => {
       this._autosize();
+      this.completeMentions();
       this._typingPulse();
     });
 
-    attach.addEventListener("click", () => fileInput.click());
+    this._input.addEventListener("blur", () => this.closeMentions());
+    this._input.addEventListener("click", () => this.completeMentions());
+
+    const sendFiles = (files: File[]) => {
+      if (!this._room || this._input.disabled) return;
+      const roomId = this._room.id;
+      for (const file of files) this.dispatchEvent(new CustomEvent("grungus:send-media", { detail: { roomId, file }, bubbles: true }));
+    };
+    attach.addEventListener("click", () => { if (this._room && !this._input.disabled) fileInput.click(); });
     fileInput.addEventListener("change", () => {
-      const file = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
-      fileInput.value = "";
-      if (!file || !this._room) return;
-      this.dispatchEvent(
-        new CustomEvent("grungus:send-media", {
-          detail: { roomId: this._room.id, file },
-          bubbles: true,
-        })
-      );
+      const files = [...(fileInput.files ?? [])]; fileInput.value = ""; sendFiles(files);
+    });
+    wrap.addEventListener("dragover", event => {
+      if (event.dataTransfer?.types.includes("Files")) event.preventDefault();
+    });
+    wrap.addEventListener("drop", event => {
+      if (!event.dataTransfer?.files.length) return;
+      event.preventDefault(); sendFiles([...event.dataTransfer.files]);
+    });
+    this._input.addEventListener("paste", event => {
+      if (!event.clipboardData?.files.length) return;
+      event.preventDefault(); sendFiles([...event.clipboardData.files]);
     });
 
     this._tabs = el("nav", { class: "room-tabs", role: "tablist", "aria-label": "Room views", hidden: true });
@@ -188,10 +265,12 @@ export class ChatView extends HTMLElement {
     const changedRoom = room?.id !== this._room?.id;
     const previousScroll = this._scroll.scrollTop;
     const pinned = this._windowAnchor === null && this._nearBottom();
-    if (changedRoom) { this._windowAnchor = null; this._emojiPicker.close(false); this._gifPicker.close(false); }
+    if (changedRoom) this._roomTools?.hide();
+    if (changedRoom) { this._context = null; this._jumpGeneration++; this.closeMentions(); this._roomTools?.hide(); this._windowAnchor = null; this._emojiPicker.close(false); this._gifPicker.close(false); }
     this._room = room;
     this._client = client;
     this._meUserId = meUserId;
+    this.setTypingUsers(room?.typingUsers ?? []);
 
     this._renderHeader();
     this._tabs.hidden = !room;
@@ -210,6 +289,15 @@ export class ChatView extends HTMLElement {
     if (changedRoom || (pinned && this._autoScroll)) this._scrollToBottom();
     else this._scroll.scrollTop = previousScroll;
     this.refreshSeenState();
+    if (changedRoom && client?.ensureRoomHistory && !room.timeline.some(item => item.kind === "message")) {
+      void client.ensureRoomHistory(room.id).then(() => {
+        if (this._room !== room || this._client !== client || !this.isConnected) return;
+        this._renderTimeline();
+        if (this._windowAnchor === null && this._autoScroll) this._scrollToBottom();
+      }).catch(error => {
+        if (this._room === room && this._client === client && this.isConnected) this.setNotice(`Could not load room history: ${error instanceof Error ? error.message : "unknown error"}. Use Latest messages to retry.`);
+      });
+    }
   }
 
   clearRoom(): void {
@@ -256,6 +344,10 @@ export class ChatView extends HTMLElement {
 
     /* call controls */
     const controls = el("div", { class: "header-call-controls" });
+    for (const [mode, label, glyph] of [["search", "Search messages", "⌕"], ["pins", "Pinned messages", "⌖"], ["polls", "Polls", "▥"], ["media", "Room media gallery", "▧"]] as const) {
+      const button = el("button", { type: "button", class: "call-btn-header", "aria-label": label, title: label, text: glyph });
+      button.addEventListener("click", () => this.openTools(mode)); controls.append(button);
+    }
     if (this._callConnecting) {
       controls.append(el("button", { class: "call-btn-header", disabled: true, text: "Connecting…", "aria-label": "Connecting to call" }));
     } else if (this._callJoined) {
@@ -346,10 +438,11 @@ export class ChatView extends HTMLElement {
     }
     this._scroll.textContent = "";
     this._lastItem = null;
-    const anchor = this._windowAnchor ? room.timeline.findIndex(item => item.id === this._windowAnchor) : -1;
-    this._windowStart = this._windowAnchor ? Math.max(0, anchor) : Math.max(0, room.timeline.length - 100);
-    const end = Math.min(room.timeline.length, this._windowStart + 100);
-    for (const item of room.timeline.slice(this._windowStart, end)) this._appendItem(item);
+    const timeline = this._context?.items ?? room.timeline;
+    const anchor = this._windowAnchor ? timeline.findIndex(item => item.id === this._windowAnchor) : -1;
+    this._windowStart = this._context ? 0 : this._windowAnchor ? Math.max(0, anchor) : Math.max(0, timeline.length - 100);
+    const end = this._context ? timeline.length : Math.min(timeline.length, this._windowStart + 100);
+    for (const item of timeline.slice(this._windowStart, end)) this._appendItem(item);
     this._renderHistoryControls();
   }
 
@@ -357,6 +450,22 @@ export class ChatView extends HTMLElement {
     const room = this._room;
     this._historyControls.textContent = "";
     if (!room) return;
+    if (this._context) {
+      const context = this._context;
+      for (const direction of ["before", "after"] as const) {
+        const button = el("button", { text: direction === "before" ? "Earlier messages" : "Newer messages", disabled: !context[direction] }) as HTMLButtonElement;
+        button.addEventListener("click", () => { button.disabled = true; void this._client!.getContextPage(room.id, context[direction]!, direction === "before" ? "b" : "f").then(page => {
+          if (this._context !== context || this._room !== room) return;
+          const known = new Set(context.items.map(item => item.id)); const added = page.items.filter(item => !known.has(item.id));
+          context.items = direction === "before" ? [...added, ...context.items].slice(0, 1000) : [...context.items, ...added].slice(-1000);
+          context[direction] = page.next; this._windowAnchor = context.items[0]?.id ?? null; this._renderTimeline();
+        }).catch(error => { button.disabled = false; this.setNotice(error.message); }); }); this._historyControls.append(button);
+      }
+      const latest = el("button", { text: "Latest messages" }); latest.addEventListener("click", () => { void (async () => {
+        if (room.atLiveEdge === false) await this._client?.loadLatestMessages(room.id);
+        if (this._room !== room) return; this._context = null; this._windowAnchor = null; this._renderTimeline(); this._scrollToBottom();
+      })().catch(error => this.setNotice(error.message)); }); this._historyControls.append(latest); return;
+    }
     const older = el("button", { text: room.historyLoading ? "Loading…" : "Earlier messages", disabled: room.historyLoading || (this._windowStart === 0 && !room.historyCursor) });
     older.addEventListener("click", () => {
       void (async () => {
@@ -401,6 +510,7 @@ export class ChatView extends HTMLElement {
   appendEvents(room: Room, events: RoomEvent[]): void {
     if (!this._room || room.id !== this._room.id) return;
     this._details.update(room);
+    if (this._context) { this._renderTimeline(); return; }
     if (events.length === 0) { this._renderHistoryControls(); return; }
     const pinned = this._autoScroll && this._nearBottom() && this._windowAnchor === null;
     if (!pinned && !this._windowAnchor) this._windowAnchor = room.timeline[this._windowStart]?.id ?? null;
@@ -445,6 +555,7 @@ export class ChatView extends HTMLElement {
       item.ts - last.ts < 7 * 60 * 1000;
 
     const node = document.createElement("message-item");
+    if (item.id) node.dataset.eventId = item.id;
     node.update(item, {
       grouped,
       client: this._client,
@@ -525,12 +636,14 @@ export class ChatView extends HTMLElement {
     this._typingUsers = users;
     if (!this._typingBar) return;
     if (!this._showTyping) { this._typingBar.textContent = ""; return; }
+    const names = [...new Set(users)].filter(userId => userId !== this._meUserId && !this._client?.getIgnoredUsers?.().includes(userId))
+      .map(userId => userLabel(this._client, userId, this._room?.members.get(userId)?.displayname || (userId.startsWith("@") ? mxidLocalpart(userId) : userId)));
     this._typingBar.textContent =
-      users.length === 0
+      names.length === 0
         ? ""
-        : users.length === 1
-          ? `${users[0]} is typing…`
-          : `${users.slice(0, 2).join(", ")}${users.length > 2 ? " and others" : ""} are typing…`;
+        : names.length === 1
+          ? `${names[0]} is typing…`
+          : `${names.slice(0, 2).join(", ")}${names.length > 2 ? " and others" : ""} are typing…`;
   }
 
   /**
@@ -620,6 +733,7 @@ export class ChatView extends HTMLElement {
   }
 
   private _submit(): void {
+    this.closeMentions();
     const body = this._input.value;
     if (!body.trim() || !this._room) return;
 

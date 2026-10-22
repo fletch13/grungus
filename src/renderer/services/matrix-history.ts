@@ -54,6 +54,7 @@ export class MatrixHistory {
   }
 
   dropRoom(roomId: string): void {
+    this.initialLoads.delete(roomId);
     this._latestHistoryCursor.delete(roomId);
     this._historyEpoch.delete(roomId);
     this._historyArrivals.delete(roomId);
@@ -67,6 +68,31 @@ export class MatrixHistory {
     if (!deferred) { deferred = new Map(); this._historyRelations.set(room.id, deferred); }
     deferred.set(event.event_id, { event, item });
     while (deferred.size > TIMELINE_LIMIT) deferred.delete(deferred.keys().next().value!);
+  }
+
+  private initialHistory = new WeakMap<Room, number>();
+  private initialLoads = new Map<string, Promise<void>>();
+  /** Hydrate a selected room whose initial sync contained no visible chat messages. */
+  ensureRoomHistory(roomId: string): Promise<void> {
+    const room = this.host.getRoom(roomId);
+    if (!room || room.isSpace || room.timeline.some(item => item.kind === "message")) return Promise.resolve();
+    const running = this.initialLoads.get(roomId); if (running) return running;
+    const epoch = this._historyEpoch.get(roomId) ?? 0;
+    if (room.historyLoading || this.initialHistory.get(room) === epoch) return Promise.resolve();
+    const load = (async () => {
+      // Skip a few pages of non-message events without scanning unbounded history.
+      for (let page = 0; page < 5; page++) {
+        if (this.host.getRoom(roomId) !== room || (this._historyEpoch.get(roomId) ?? 0) !== epoch || room.timeline.some(item => item.kind === "message")) return;
+        if (room.historyCursor) await this.loadOlderMessages(roomId);
+        else if (page === 0) await this.loadLatestMessages(roomId);
+        else break;
+        if (!room.historyCursor) break;
+      }
+      if (this.host.getRoom(roomId) === room && (this._historyEpoch.get(roomId) ?? 0) === epoch) this.initialHistory.set(room, epoch);
+    })();
+    this.initialLoads.set(roomId, load);
+    void load.finally(() => { if (this.initialLoads.get(roomId) === load) this.initialLoads.delete(roomId); }).catch(() => {});
+    return load;
   }
 
   async loadOlderMessages(roomId: string): Promise<void> {
@@ -117,7 +143,7 @@ export class MatrixHistory {
           ? this.host.timeline.decryptItem(room, event, true)
           : this.host.timeline.toItem(room, event, true);
         const relation = event.content?.["m.relates_to"] as { rel_type?: string } | undefined;
-        if (item && relation?.rel_type !== "m.replace") added.push(item);
+        if (item && relation?.rel_type !== "m.replace" && !/^(?:m|org.matrix.msc3381)\.poll\.(?:response|end)$/.test(event.type)) added.push(item);
         relations.push({ event, item });
       }
       room.timeline.unshift(...added);

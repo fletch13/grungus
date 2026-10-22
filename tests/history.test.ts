@@ -99,3 +99,36 @@ test("large timelines stay bounded and older windows can return to live messages
   await client.loadLatestMessages(roomId);
   assert.equal(client.getRoom(roomId)!.atLiveEdge, true);
 });
+
+test("opening a room with only reaction events in initial sync automatically hydrates older chat", async t => {
+  const hs = new MockHomeserver(); hs.timelineLimit = 1; hs.historyPageLimit = 1; await hs.listen(); t.after(() => hs.close());
+  hs.registerUser("initial-history", "pw");
+  const writer = new MatrixClient({ baseUrl: hs.baseUrl! }); await writer.loginWithPassword({ username: "initial-history", password: "pw" });
+  const roomId = await writer.createRoom({ name: "Quiet space room" }); writer.startSync(); t.after(() => writer.stopSync());
+  await waitFor(() => !!writer.getRoom(roomId));
+  const id = await writer.sendMessage(roomId, "Message from before startup");
+  for (const emoji of ["👍", "🎉", "❤️"]) await writer.sendReaction(roomId, id!, emoji);
+  const client = new MatrixClient({ baseUrl: hs.baseUrl! }); await client.loginWithPassword({ username: "initial-history", password: "pw" });
+  client.startSync(); t.after(() => client.stopSync()); await waitFor(() => !!client.getRoom(roomId));
+  assert.equal(messages(client, roomId).length, 0, "The regression fixture must start without visible messages");
+  let requests = 0; const api = client.api.bind(client);
+  client.api = (async (method: string, path: string, options: any) => { if (path.endsWith("/messages")) requests++; return api(method, path, options); }) as typeof client.api;
+  await Promise.all([client.ensureRoomHistory(roomId), client.ensureRoomHistory(roomId), client.ensureRoomHistory(roomId)]);
+  assert.equal(messages(client, roomId)[0]?.body, "Message from before startup");
+  assert.equal(requests, 3, "Concurrent selection updates must share one paginated history load");
+  assert.ok(messages(client, roomId)[0]?.reactions?.has("❤️"), "Relations received before backfilling must apply to recovered messages");
+  await client.ensureRoomHistory(roomId); assert.equal(requests, 3, "Loaded chats must not reload on every selection");
+});
+
+test("automatic initial history retries failures and does not repeatedly fetch empty rooms", async t => {
+  const hs = new MockHomeserver(); await hs.listen(); t.after(() => hs.close()); hs.registerUser("empty-history", "pw");
+  const client = new MatrixClient({ baseUrl: hs.baseUrl! }); await client.loginWithPassword({ username: "empty-history", password: "pw" });
+  const id = await client.createRoom({ name: "Empty room" }); client.startSync(); t.after(() => client.stopSync()); await waitFor(() => !!client.getRoom(id));
+  hs.failHistory = true;
+  await assert.rejects(client.ensureRoomHistory(id)); assert.equal(client.getRoom(id)!.historyLoading, false);
+  hs.failHistory = false; await client.ensureRoomHistory(id);
+  let requests = 0; const api = client.api.bind(client);
+  client.api = (async (method: string, path: string, options: any) => { if (path.endsWith("/messages")) requests++; return api(method, path, options); }) as typeof client.api;
+  await client.ensureRoomHistory(id); await client.ensureRoomHistory(id);
+  assert.equal(requests, 0, "Successfully checked empty rooms must not trigger an automatic request loop");
+});

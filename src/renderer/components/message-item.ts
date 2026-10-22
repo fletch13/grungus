@@ -1,4 +1,9 @@
-import { formatMessage } from "../services/message-format.ts";
+import { mentionedUsers } from "../services/mentions.ts";
+import "./message-poll.ts";
+import { youtubeVideos } from "../services/youtube.ts";
+import { bindUserTile, userLabel } from "./user-menu.ts";
+import { attachmentMimeType } from "../services/media-type.ts";
+import { formatMessage, emojiOnlyCount } from "../services/message-format.ts";
 /*
  * Grungus — <message-item>: one chat message, Discord-style.
  * Handles grouped rendering (consecutive messages from the same sender),
@@ -47,11 +52,16 @@ export class MessageItemElement extends HTMLElement {
     if (!item) return;
     this._reactionPicker?.remove(); this._reactionPicker = null;
     const client = opts.client;
+    this.hidden = client?.getIgnoredUsers?.().includes(item.sender) ?? false;
+    if (this.hidden) { this.replaceChildren(); return; }
 
     this.textContent = "";
     this.classList.toggle("grouped", opts.grouped === true);
     this.classList.toggle("pending", item.pending === true);
     this.classList.toggle("failed", item.failed === true);
+    const me = opts.meUserId ?? client?.userId;
+    const mentionsMe = !!me && (item.mentions?.includes(me) || item.roomMention || mentionedUsers(item.body, [me]).length > 0);
+    this.classList.toggle("mentions-me", !!mentionsMe);
 
     /* hover toolbar (reply / react / edit) */
     const toolbar = el("div", { class: "msg-toolbar" });
@@ -91,6 +101,14 @@ export class MessageItemElement extends HTMLElement {
       editBtn.addEventListener("click", () => actions.onEdit?.(item));
       toolbar.appendChild(editBtn);
     }
+    if (client?.features && opts.room && item.id && !item.pending) {
+      const pin = el("button", { type: "button", class: "msg-toolbar-btn", title: "Pin or unpin message", "aria-label": "Pin or unpin message", text: "⌖" }) as HTMLButtonElement;
+      pin.addEventListener("click", () => {
+        pin.disabled = true;
+        void client.features.pins(opts.room!.id).then(async ids => { const pinned = !ids.includes(item.id!); await client.features.pin(opts.room!, item.id!, pinned); pin.title = pinned ? "Message pinned" : "Message unpinned"; })
+          .catch(error => { this.append(el("p", { role: "status", class: "msg-error", text: error.message })); }).finally(() => { pin.disabled = false; });
+      }); toolbar.append(pin);
+    }
     this.appendChild(toolbar);
 
     /* avatar column (kept for alignment when grouped) */
@@ -109,6 +127,7 @@ export class MessageItemElement extends HTMLElement {
               )
             : null,
       });
+      bindUserTile(av, client, item.sender, item.senderName || item.sender);
       avatarCol.appendChild(av);
     }
     this.appendChild(avatarCol);
@@ -119,9 +138,10 @@ export class MessageItemElement extends HTMLElement {
       const head = el("div", { class: "msg-head" });
       const author = el("span", {
         class: "msg-author",
-        text: item.senderName || "unknown",
+        text: userLabel(client, item.sender, item.senderName || "unknown"),
       });
 
+      bindUserTile(author, client, item.sender, item.senderName || item.sender);
       head.appendChild(author);
       if (opts.showTimestamps !== false) {
         head.appendChild(el("span", { class: "msg-time", text: formatTime(item.ts) }));
@@ -131,26 +151,32 @@ export class MessageItemElement extends HTMLElement {
 
     /* reply context (quoted parent) */
     if (item.replyTo) {
-      const quote = el("div", { class: "msg-reply" });
+      const quote = el("button", { type: "button", class: "msg-reply", title: "Jump to original message" });
+      quote.addEventListener("click", () => { this.dispatchEvent(new CustomEvent("grungus:jump-message", { bubbles: true, detail: { eventId: item.replyTo!.eventId } })); });
       const line = el("div", { class: "msg-reply-line" });
       quote.appendChild(line);
       const replyBody = el("div", { class: "msg-reply-body" });
       replyBody.appendChild(
-        el("span", { class: "msg-reply-sender", text: item.replyTo.senderName })
+        el("span", { class: "msg-reply-sender", text: userLabel(client, item.replyTo.sender, item.replyTo.senderName) })
       );
       replyBody.appendChild(
-        el("span", { class: "msg-reply-text", text: item.replyTo.body })
+        el("span", { class: "msg-reply-text", text: client?.getIgnoredUsers?.().includes(item.replyTo.sender) ? "Blocked message" : item.replyTo.body })
       );
       quote.appendChild(replyBody);
       main.appendChild(quote);
     }
 
-    /* media (images, GIFs, stickers) — renders instead of the body text */
-    const media = item.media;
-    if (media && media.mxc) {
-      main.appendChild(this._buildMedia(item, media.mxc, client));
+    if (item.pollEvent && /poll.start$/.test(item.pollEvent.type) && client && opts.room) {
+      const poll = document.createElement("message-poll"); poll.update(item, opts.room, client); main.append(poll);
     } else {
-      main.appendChild(this._buildBody(item, opts.renderMarkdown !== false));
+      /* Attachments replace ordinary body text. */
+      const media = item.media;
+      if (media?.mxc) main.appendChild(this._buildMedia(item, media.mxc, client));
+      else {
+        const body = this._buildBody(item, opts.renderMarkdown !== false);
+        this.highlightMentions(body, item, opts);
+        main.appendChild(body);
+      }
     }
 
     /* reactions (emoji chips with counts) */
@@ -187,31 +213,83 @@ export class MessageItemElement extends HTMLElement {
     this.appendChild(main);
   }
 
+  private highlightMentions(body: HTMLElement, item: MessageItem, opts: MessageItemOptions): void {
+    const client = opts.client;
+    const ids = new Set([...(item.mentions ?? []), ...(opts.room?.members.keys() ?? []), ...(opts.meUserId ? [opts.meUserId] : [])]);
+    const candidates = mentionedUsers(item.body, ids).map(id => ({ token: id, id, identity: true }));
+    for (const id of item.mentions ?? []) {
+      const name = opts.room?.members.get(id)?.displayname;
+      if (name) for (const token of [name, `@${name}`]) candidates.push({ token, id, identity: false });
+    }
+    candidates.sort((a, b) => b.token.length - a.token.length);
+    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    const nodes: Text[] = [];
+    while (walker.nextNode()) {
+      const node = walker.currentNode as Text;
+      if (!node.parentElement?.closest("a,code,pre,button,iframe,.youtube-embed")) nodes.push(node);
+    }
+    for (const node of nodes) {
+      const text = node.textContent ?? "";
+      const spans: { start: number; end: number; id: string }[] = [];
+      for (const { token, id, identity } of candidates) {
+        let start = text.indexOf(token);
+        while (start >= 0) {
+          const before = text[start - 1], after = text[start + token.length];
+          const matches = identity ? mentionedUsers(text.slice(Math.max(0, start - 1), start + token.length + 2), [id]).length > 0 : (!before || !/[\p{L}\p{N}_@]/u.test(before)) && (!after || !/[\p{L}\p{N}_]/u.test(after));
+          if (matches && !spans.some(span => start < span.end && start + token.length > span.start)) spans.push({ start, end: start + token.length, id });
+          start = text.indexOf(token, start + token.length);
+        }
+      }
+      if (item.roomMention) for (const match of text.matchAll(/(?:^|\s)(@room)(?=$|[\s.,!?])/g)) {
+        const start = match.index! + match[0].indexOf("@room"); spans.push({ start, end: start + 5, id: "@room" });
+      }
+      if (!spans.length) continue;
+      const fragment = document.createDocumentFragment(); let position = 0;
+      for (const span of spans.sort((a, b) => a.start - b.start)) {
+        fragment.append(document.createTextNode(text.slice(position, span.start)));
+        const member = opts.room?.members.get(span.id);
+        const label = span.id === "@room" ? "room" : userLabel(client, span.id, member?.displayname || span.id.slice(1, span.id.indexOf(":")));
+        const pill = el("span", { class: `message-mention${span.id === (opts.meUserId ?? client?.userId) || span.id === "@room" ? " mine" : ""}`, title: span.id, text: label.startsWith("@") ? label : `@${label}` });
+        if (span.id !== "@room") bindUserTile(pill, client, span.id, member?.displayname || span.id);
+        fragment.append(pill); position = span.end;
+      }
+      fragment.append(document.createTextNode(text.slice(position))); node.replaceWith(fragment);
+    }
+  }
+
   private _buildMedia(item: MessageItem, mxc: string, client: MatrixClient | null): HTMLElement {
     const holder = el("div", { class: "msg-media" });
-    const loading = el("span", { class: "msg-media-loading", text: "loading image…" });
+    const mimeType = attachmentMimeType(item.media?.name || item.body, item.media?.mimetype);
+    const kind = item.msgtype === "m.video" || mimeType.startsWith("video/") ? "video"
+      : item.msgtype === "m.audio" || mimeType.startsWith("audio/") ? "audio"
+      : item.msgtype === "m.file" ? "file" : "image";
+    const loading = el("span", { class: "msg-media-loading", text: `Loading ${kind}…` });
     holder.appendChild(loading);
-
     if (client) {
       const load = async (): Promise<void> => {
         holder.replaceChildren(loading);
-        const src = await client.mediaSrc(mxc, item.media?.file, item.media?.mimetype ?? "application/octet-stream");
+        let src: string | null = null;
+        try { src = await client.mediaSrc(mxc, item.media?.file, mimeType); } catch { /* Offer retry after download or decryption failure. */ }
         if (!this.isConnected || !this.contains(holder)) return;
-        holder.textContent = "";
-        if (!src) {
-          const retry = el("button", { class: "msg-media-retry", text: "Image unavailable — retry" });
-          retry.addEventListener("click", () => { void load(); });
-          holder.appendChild(retry);
-          return;
+        holder.replaceChildren();
+        const retry = () => {
+          const button = el("button", { class: "msg-media-retry", text: `${kind[0]!.toUpperCase()}${kind.slice(1)} unavailable — retry` });
+          button.addEventListener("click", () => { void load(); }); return button;
+        };
+        if (!src) { holder.append(retry()); return; }
+        const name = item.media?.name || item.body || "attachment";
+        if (kind === "image") {
+          const img = document.createElement("img"); img.className = "msg-media-img"; img.alt = name; img.title = name; img.src = src;
+          img.addEventListener("error", () => img.replaceWith(retry())); holder.append(img);
+        } else if (kind === "video" || kind === "audio") {
+          const player = document.createElement(kind); player.className = "msg-media-player"; player.controls = true; player.preload = "metadata";
+          if (player instanceof HTMLVideoElement) player.playsInline = true;
+          player.src = src;
+          player.addEventListener("error", () => player.replaceWith(el("span", { class: "settings-hint", text: "This media format could not be played. Download it to open in another player." })));
+          holder.append(player);
         }
-        const img = document.createElement("img");
-        img.className = "msg-media-img";
-        img.alt = item.media?.name ?? "image";
-        img.title = img.alt;
-        img.src = src;
-        holder.appendChild(img);
-        const caption = item.media?.name;
-        if (caption && caption !== item.body) holder.appendChild(el("div", { class: "msg-media-caption", text: caption }));
+        const download = el("a", { class: "msg-media-download", href: src, download: name, text: `Download ${name}` });
+        holder.append(download);
       };
       void load();
     }
@@ -220,6 +298,7 @@ export class MessageItemElement extends HTMLElement {
 
   private _buildBody(item: MessageItem, markdown: boolean): HTMLElement {
     const body = el("div", { class: "msg-body" });
+    if (item.msgtype === "m.text" && emojiOnlyCount(item.body)) body.classList.add("msg-big-emoji");
     if (item.msgtype === "m.emote") {
       body.textContent = `* ${item.senderName} ${item.body}`;
       body.style.fontStyle = "italic";
@@ -244,6 +323,12 @@ export class MessageItemElement extends HTMLElement {
       retry.addEventListener("click", load);
       load();
       body.append(media, link);
+    }
+    if (item.msgtype === "m.text") for (const video of youtubeVideos(item.body)) {
+      const frame = el("iframe", { class: "youtube-player", src: video.embedUrl, title: "YouTube video player", loading: "lazy", referrerpolicy: "strict-origin-when-cross-origin", allow: "autoplay; encrypted-media; picture-in-picture; fullscreen", allowfullscreen: true, sandbox: "allow-scripts allow-same-origin allow-presentation" });
+      const reload = el("button", { type: "button", class: "msg-media-retry", text: "Reload YouTube player" });
+      reload.addEventListener("click", () => { frame.setAttribute("src", video.embedUrl); });
+      body.append(el("div", { class: "youtube-embed" }, frame, el("div", { class: "youtube-player-actions" }, reload, el("a", { href: video.watchUrl, target: "_blank", rel: "noopener noreferrer", text: "Open on YouTube" }))));
     }
     /* "(edited)" indicator for m.replace'd messages */
     if (item.edited) {

@@ -86,7 +86,10 @@ export class MatrixMedia {
     return this._mediaCache.get(cacheKey, async signal => {
       const res = await this._downloadMedia(path, signal);
       if (!res.ok) return null;
-      if (!file) return res.blob();
+      if (!file) {
+        const blob = await res.blob();
+        return mimeType !== "application/octet-stream" ? new Blob([blob], { type: mimeType }) : blob;
+      }
       const bytes = new Uint8Array(await res.arrayBuffer());
       return new Blob([await decryptAttachment(bytes, file)], { type: mimeType });
     });

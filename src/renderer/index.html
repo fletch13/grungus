@@ -11,13 +11,23 @@
   -->
   <meta
     http-equiv="Content-Security-Policy"
-    content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data: https://static.klipy.com https://static1.klipy.com https://static2.klipy.com; connect-src *; worker-src 'self' blob:; object-src 'none'; base-uri 'self'"
+    content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data: https://static.klipy.com https://static1.klipy.com https://static2.klipy.com; media-src 'self' blob:; frame-src https://www.youtube-nocookie.com; connect-src *; worker-src 'self' blob:; object-src 'none'; base-uri 'self'"
   />
   <title>Grungus</title>
   <link rel="stylesheet" href="/styles/theme.css" />
 </head>
 <body>
-  <div id="root"></div>
+  <section id="startup-screen" class="startup-screen" aria-label="Starting Grungus">
+    <div class="startup-card">
+      <div class="startup-logo" aria-hidden="true">G<span></span></div>
+      <h1>Grungus</h1>
+      <p class="startup-tagline">Your people. Your space.</p>
+      <div class="startup-progress" aria-hidden="true"><span></span></div>
+      <p class="startup-status" data-startup-status role="status" aria-live="polite">Starting Grungus…</p>
+      <button type="button" class="startup-action" hidden>Try again</button>
+    </div>
+  </section>
+  <div id="root" inert></div>
   <script type="module" src="/index.ts"></script>
 </body>
 </html>

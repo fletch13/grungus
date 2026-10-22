@@ -7,6 +7,7 @@ export function applyRelations(
   item: TimelineItem | null
 ): boolean {
   const content = ev.content ?? {};
+  if (/^(?:m|org.matrix.msc3381)\.poll\.(?:response|end)$/.test(ev.type)) return true;
 
   /* --- m.reaction (annotation) --- */
   if (ev.type === "m.reaction" && content["m.relates_to"]) {
@@ -67,11 +68,14 @@ export function applyRelations(
   if (rel?.rel_type === "m.replace" && rel.event_id) {
     const target = findTimelineMessage(room, rel.event_id);
     const newContent = content["m.new_content"] as
-      | { body?: string; msgtype?: string }
+      | { body?: string; msgtype?: string; "m.mentions"?: { user_ids?: unknown; room?: boolean } }
       | undefined;
     if (target && target.sender === ev.sender && newContent?.body !== undefined &&
         (target.editTs ?? 0) <= (ev.origin_server_ts ?? 0)) {
       target.body = newContent.body;
+      const mentions = newContent["m.mentions"];
+      target.mentions = Array.isArray(mentions?.user_ids) ? mentions.user_ids.filter((id): id is string => typeof id === "string") : [];
+      target.roomMention = mentions?.room === true;
       target.edited = true;
       target.editTs = ev.origin_server_ts ?? Date.now();
     }

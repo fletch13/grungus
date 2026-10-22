@@ -1,7 +1,8 @@
+import { parsePoll } from "./room-features.ts";
 /** Incoming timeline conversion, deferred decryption, and echo reconciliation. */
 import type { E2eeCrypto } from "./e2ee.ts";
 import type { EncryptedFile } from "./attachments.ts";
-import type { Room, MatrixEvent, TimelineItem, RoomUpdate } from "./matrix-types.ts";
+import type { Room, MatrixEvent, TimelineItem, RoomUpdate, MessageItem } from "./matrix-types.ts";
 import { displayNameFor } from "./matrix-rooms.ts";
 import { mxidLocalpart } from "./matrix-identifiers.ts";
 export interface TimelineHost {
@@ -9,6 +10,8 @@ export interface TimelineHost {
   readonly crypto: E2eeCrypto | null;
   readonly onCallEvent: ((roomId: string, event: MatrixEvent) => void) | null;
   getRoom(roomId: string): Room | null;
+  recordPollEvent?(roomId: string, item: MessageItem): void;
+  redactPollEvent?(roomId: string, eventId: string): void;
   handleMediaKeys(roomId: string, event: MatrixEvent): void;
   notify(update: RoomUpdate): void;
   notifyRooms(): void;
@@ -44,10 +47,19 @@ export class MatrixTimeline {
 
   toItem(room: Room, ev: MatrixEvent, historical = false): TimelineItem | null {
     if (!ev || !ev.type) return null;
+    const redacted = ev.type === "m.room.redaction" ? ev.redacts ?? ev.content?.redacts : ev.unsigned?.redacted_because ? ev.event_id : null;
+    if (typeof redacted === "string") this.host.redactPollEvent?.(room.id, redacted);
     const ts = ev.origin_server_ts ?? Date.now();
     const senderName = displayNameFor(room, ev.sender ?? null, this.host.userId);
     const content = ev.content ?? {};
 
+    if (/^(?:m|org.matrix.msc3381)\.poll\.(?:start|response|end)$/.test(ev.type)) {
+      const poll = parsePoll(content);
+      const item: MessageItem = { kind: "message", id: ev.event_id ?? null, sender: ev.sender, senderName, ts, msgtype: ev.type,
+        body: poll?.question ?? "Poll update", media: null, pollEvent: { type: ev.type, content } };
+      this.host.recordPollEvent?.(room.id, item);
+      return item;
+    }
     /* Element's media-key events are call machinery, not timeline items */
     if (ev.type === "io.element.call.encryption_keys") {
       if (!historical) this.host.handleMediaKeys(room.id, ev);
@@ -91,10 +103,10 @@ export class MatrixTimeline {
 
       const otherAttachment =
         msgtype === "m.file" || msgtype === "m.audio" || msgtype === "m.video";
-      const text = otherAttachment ? `[attachment] ${body}` : body;
+      const text = body;
 
       const media =
-        url && (isSticker || msgtype === "m.image")
+        url && (isSticker || msgtype === "m.image" || otherAttachment)
           ? {
               mxc: url,
               file,
@@ -102,7 +114,7 @@ export class MatrixTimeline {
               width: typeof info.w === "number" ? info.w : null,
               height: typeof info.h === "number" ? info.h : null,
               size: typeof info.size === "number" ? info.size : null,
-              name: body || null,
+              name: typeof content.filename === "string" ? content.filename : body || null,
             }
           : null;
 
@@ -118,6 +130,8 @@ export class MatrixTimeline {
         ts,
         msgtype,
         body: text,
+        mentions: Array.isArray((content["m.mentions"] as any)?.user_ids) ? (content["m.mentions"] as any).user_ids.filter((id: unknown) => typeof id === "string") : [],
+        roomMention: (content["m.mentions"] as any)?.room === true,
         media,
       };
     }
@@ -232,9 +246,14 @@ export class MatrixTimeline {
       const idx = room.timeline.findIndex(
         (entry) => entry.kind === "system" && entry.id === eventId
       );
-      if (idx >= 0) room.timeline[idx] = item;
+      if (idx >= 0) {
+        if (/^(?:m|org.matrix.msc3381)\.poll\.(?:response|end)$/.test(inner.type)) room.timeline.splice(idx, 1);
+        else room.timeline[idx] = item;
+      }
 
-      const ts = ev.origin_server_ts ?? Date.now();
+      const redacted = ev.type === "m.room.redaction" ? ev.redacts ?? ev.content?.redacts : ev.unsigned?.redacted_because ? ev.event_id : null;
+    if (typeof redacted === "string") this.host.redactPollEvent?.(room.id, redacted);
+    const ts = ev.origin_server_ts ?? Date.now();
       if (ts > room.lastActivityTs) room.lastActivityTs = ts;
     }
     if (changed) {

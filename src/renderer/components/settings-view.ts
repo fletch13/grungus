@@ -649,6 +649,11 @@ export class SettingsView extends HTMLElement {
     const settings = this._settings!;
     panel.appendChild(this._section("Voice & Video", "Choose devices for your next call. Speaker changes also apply during an active call."));
 
+    panel.append(this._toggle("Input mode", "Enable push-to-talk for new calls", "pushToTalk", settings, "Hold the configured key while Grungus is focused. Release or focus loss mutes your microphone."));
+    const pttKey = el("select", { class: "settings-input", "aria-label": "Default push-to-talk key" }) as HTMLSelectElement;
+    for (const code of ["Space", ...Array.from({ length: 26 }, (_, i) => `Key${String.fromCharCode(65 + i)}`), ...Array.from({ length: 12 }, (_, i) => `F${i + 1}`)]) pttKey.append(el("option", { value: code, text: code.startsWith("Key") ? code.slice(3) : code }));
+    pttKey.value = settings.get("pushToTalkKey"); pttKey.addEventListener("change", () => settings.set("pushToTalkKey", pttKey.value)); panel.append(pttKey);
+
     const groups: { kind: MediaDeviceKind; label: string; setting: "audioInput" | "audioOutput" | "videoInput" }[] = [
       { kind: "audioinput", label: "Microphone", setting: "audioInput" },
       { kind: "audiooutput", label: "Speaker", setting: "audioOutput" },

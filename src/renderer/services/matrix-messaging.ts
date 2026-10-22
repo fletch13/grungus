@@ -1,3 +1,5 @@
+import { mentionedUsers } from "./mentions.ts";
+import { attachmentMimeType } from "./media-type.ts";
 /** Outgoing messages, encryption decisions, local echoes, and transaction IDs. */
 import { encryptAttachment } from "./attachments.ts";
 import type { E2eeCrypto } from "./e2ee.ts";
@@ -61,8 +63,9 @@ export class MatrixMessaging {
         ? await this.host.crypto!.encryptRoomMessage(roomId, {
             msgtype: "m.text",
             body: text,
+            "m.mentions": { user_ids: mentionedUsers(text, room?.members.keys() ?? []) },
           })
-        : { msgtype: "m.text", body: text };
+        : { msgtype: "m.text", body: text, "m.mentions": { user_ids: mentionedUsers(text, room?.members.keys() ?? []) } };
       const res = await this.host.api<{ event_id?: string }>(
         "PUT",
         `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/${sendType}/${encodeURIComponent(txnId)}`,
@@ -101,12 +104,20 @@ export class MatrixMessaging {
     if (encrypted && !this.host.crypto) {
       throw new Error("Cannot send: E2EE is unavailable in this encrypted room");
     }
+    if (type === "m.room.message") {
+      const relation = content["m.relates_to"] as Record<string, unknown> | undefined;
+      const text = String(content.body ?? "");
+      const mentionText = relation?.["m.in_reply_to"] && text.startsWith("> ") ? text.slice(text.indexOf("\n\n") + 2) : text;
+      content = { ...content, "m.mentions": content["m.mentions"] ?? { user_ids: mentionedUsers(mentionText, room?.members.keys() ?? []) } };
+      const replacement = content["m.new_content"] as Record<string, unknown> | undefined;
+      if (replacement) content["m.new_content"] = { ...replacement, "m.mentions": { user_ids: mentionedUsers(String(replacement.body ?? ""), room?.members.keys() ?? []) } };
+    }
     const payload: Record<string, unknown> = encrypted
       ? await this.host.crypto!.encryptRoomMessage(roomId, content, type)
       : content;
     const relation = content["m.relates_to"] as { rel_type?: string } | undefined;
     // Thread routing must remain visible for homeserver thread indexes; the message body stays encrypted.
-    if (encrypted && relation?.rel_type === "m.thread") payload["m.relates_to"] = relation;
+    if (encrypted && (relation?.rel_type === "m.thread" || relation?.rel_type === "m.reference")) payload["m.relates_to"] = relation;
     const res = await this.host.api<{ event_id?: string }>(
       "PUT",
       `${CLIENT_PREFIX}/rooms/${encodeURIComponent(roomId)}/send/${encodeURIComponent(
@@ -148,6 +159,7 @@ export class MatrixMessaging {
   }
 
   async uploadAndSendMedia(roomId: string, name: string, mimeType: string, bytes: Uint8Array, dimensions: { width?: number; height?: number } = {}): Promise<string | null> {
+    mimeType = attachmentMimeType(name, mimeType);
     const encrypted = this.host.encryptionForRoom(roomId);
     if (encrypted === undefined) throw new Error("Cannot send: room state not loaded yet (still syncing)");
     if (encrypted && !this.host.crypto) throw new Error("Cannot send: E2EE is unavailable in this encrypted room");
@@ -161,6 +173,7 @@ export class MatrixMessaging {
     roomId: string,
 media: MediaMessage
   ): Promise<string | null> {
+    media = { ...media, mimeType: attachmentMimeType(media.name, media.mimeType) };
     const txnId = `gr.${Date.now()}.${++this._txnCounter}`;
     const room = this.host.getRoom(roomId);
     const encrypted = this.host.encryptionForRoom(roomId);
@@ -174,8 +187,9 @@ media: MediaMessage
     if (media.width != null) info.w = media.width;
     if (media.height != null) info.h = media.height;
     if (media.size != null) info.size = media.size;
+    const msgtype = media.mimeType.startsWith("video/") ? "m.video" : media.mimeType.startsWith("audio/") ? "m.audio" : media.mimeType.startsWith("image/") ? "m.image" : "m.file";
     const content: Record<string, unknown> = {
-      msgtype: "m.image",
+      msgtype,
       body: media.name,
       ...(media.file ? { file: media.file } : { url: media.mxc }),
       info,
@@ -193,7 +207,7 @@ media: MediaMessage
       sender: this.host.userId ?? "",
       senderName: "You",
       ts: Date.now(),
-      msgtype: "m.image",
+      msgtype,
       body: media.name,
       media: {
         mxc: media.mxc,

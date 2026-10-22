@@ -42,6 +42,8 @@ export interface GrungusSettings {
   notificationPreviews: boolean;
 
   /* Voice & Video — selected media device ids ("" = system default) */
+  pushToTalk: boolean;
+  pushToTalkKey: string;
   audioInput: string;
   audioOutput: string;
   videoInput: string;
@@ -69,6 +71,8 @@ export const DEFAULT_SETTINGS: GrungusSettings = {
   desktopNotifications: true,
   notificationSound: true,
   notificationPreviews: true,
+  pushToTalk: false,
+  pushToTalkKey: "Space",
   audioInput: "",
   audioOutput: "",
   videoInput: "",
@@ -89,6 +93,8 @@ function coerce(raw: Partial<GrungusSettings> | null): GrungusSettings {
         if (["dark", "light", "system"].includes(String(value))) out.theme = value as ThemeName;
       } else if (key === "backgroundImage") {
         out.backgroundImage = isBackgroundImage(value) ? value : "";
+      } else if (key === "pushToTalkKey") {
+        if (/^(Space|Key[A-Z]|Digit[0-9]|F(?:[1-9]|1[0-2])|Backquote|CapsLock)$/.test(String(value))) out.pushToTalkKey = String(value);
       } else if (key === "fontScale") {
         const scale = Number(value);
         out.fontScale = Math.min(1.4, Math.max(0.8, scale));

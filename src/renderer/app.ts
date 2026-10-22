@@ -1,3 +1,5 @@
+import { startupScreen } from "./services/startup-screen.ts";
+import { showSpaceInvite } from "./components/space-invite.ts";
 import "./components/room-settings.ts";
 import { notificationContent } from "./services/notification-content.ts";
 import { applyTheme } from "./services/appearance.ts";
@@ -132,6 +134,7 @@ function showLogin(): void {
     void handleRegisterSubmit((event as CustomEvent<RegisterDetail>).detail, view);
   });
   root.appendChild(view);
+  startupScreen.finish();
 }
 
 /* The resolved homeserver + flows of the in-progress login. */
@@ -429,6 +432,7 @@ function logout(): void {
 function startShell(promptRecovery = false): void {
   const active = client;
   if (!root || !active) return;
+  startupScreen.show("Loading your conversations…", true);
   root.textContent = "";
 
   const shell = document.createElement("app-shell");
@@ -436,9 +440,10 @@ function startShell(promptRecovery = false): void {
 
   const rail = shell.querySelector("space-rail");
   const roomList = shell.querySelector("room-list");
+  const recentDms = shell.querySelector("recent-dms");
   const chat = shell.querySelector("chat-view");
   const members = shell.querySelector("member-list");
-  if (!rail || !roomList || !chat || !members) return;
+  if (!rail || !roomList || !recentDms || !chat || !members) return;
 
   const roomSettings = document.createElement("room-settings"); roomSettings.hidden = true; root.append(roomSettings);
   shell.addEventListener("grungus:room-settings", event => {
@@ -457,6 +462,7 @@ function startShell(promptRecovery = false): void {
   };
 
   const refreshSidebar = (): void => {
+    recentDms.update(active.getRooms(), state.roomId, active);
     rail.update(active.getSpaces(), state.spaceId, active);
     roomList.update(
       roomsForSpace(),
@@ -683,12 +689,14 @@ function startShell(promptRecovery = false): void {
 
   /* notification plumbing: OS notifications for new messages in
      unfocused rooms, respecting the two settings toggles */
-  const notifyForMessage = (roomId: string, sender: string, body: string): void => {
+  const notifyForMessage = (roomId: string, sender: string, body: string, mentions?: string[], roomMention?: boolean): void => {
+    if (active.getIgnoredUsers().includes(sender)) return;
     if (document.hasFocus()) return;
     if (sender === active.userId) return;
     const all = settings.all;
     if (!all.desktopNotifications) return;
     const room = active.getRoom(roomId);
+    if (room && !active.features.shouldNotify(room, sender, body, mentions, roomMention)) return;
     const title = room?.name || "Grungus";
     const senderName = room?.members.get(sender)?.displayname ?? sender;
     try {
@@ -1042,10 +1050,10 @@ function startShell(promptRecovery = false): void {
     void (async () => {
       try {
         const bytes = new Uint8Array(await detail.file.arrayBuffer());
-        await active.uploadAndSendMedia(detail.roomId, detail.file.name, detail.file.type || "image/png", bytes);
+        await active.uploadAndSendMedia(detail.roomId, detail.file.name, detail.file.type || "application/octet-stream", bytes);
       } catch (err) {
         chat.setNotice(
-          `Could not send image: ${err instanceof Error ? err.message : "unknown error"}`
+          `Could not send attachment: ${err instanceof Error ? err.message : "unknown error"}`
         );
       }
     })();
@@ -1091,7 +1099,7 @@ function startShell(promptRecovery = false): void {
         ? true
         : callMode === "livekit" && lkManager.connected
     );
-    members.update(room, active, active.userId);
+    members.update(room, active, active.userId, state.spaceId ? active.getRoom(state.spaceId) : null);
     shell.setMembersVisible(true);
     refreshSidebar();
   };
@@ -1110,6 +1118,11 @@ function startShell(promptRecovery = false): void {
       refreshSidebar();
     }
   };
+
+  recentDms.addEventListener("grungus:select-room", event => {
+    state.spaceId = null;
+    selectRoom((event as CustomEvent<{ roomId: string }>).detail.roomId);
+  });
 
   rail.addEventListener("grungus:select-space", (event) => {
     selectSpace((event as CustomEvent<{ spaceId: string | null }>).detail.spaceId);
@@ -1173,6 +1186,19 @@ function startShell(promptRecovery = false): void {
   roomBrowser.hidden = true;
   root.appendChild(roomBrowser);
   roomList.addEventListener("grungus:explore-rooms", () => roomBrowser.show(active, currentSpace()));
+  const spaceRoomCreator = document.createElement("room-creation"); spaceRoomCreator.hidden = true; root.append(spaceRoomCreator);
+  spaceRoomCreator.addEventListener("room-created", event => roomSettings.dispatchEvent(new CustomEvent("grungus:room-created", { detail: (event as CustomEvent).detail })));
+  shell.addEventListener("grungus:space-action", event => {
+    const { spaceId, action } = (event as CustomEvent<{ spaceId: string; action: string }>).detail;
+    const space = active.getRoom(spaceId); if (!space?.isSpace) return;
+    selectSpace(spaceId);
+    if (action === "settings") roomSettings.show(space, active);
+    else if (action === "invite") showSpaceInvite(space, active);
+    else if (action === "create-room") spaceRoomCreator.show(space, active);
+    else if (action === "browse") roomBrowser.show(active, space);
+    else if (action === "create-space") roomList.showCreateSpace();
+    else if (action === "new-dm") newDmView.show(active);
+  });
   roomBrowser.addEventListener("grungus:room-joined", event => {
     const { roomId, spaceId } = (event as CustomEvent<{ roomId: string; spaceId: string | null }>).detail;
     state.spaceId = spaceId;
@@ -1274,6 +1300,7 @@ function startShell(promptRecovery = false): void {
 
   active.on("room", (update) => {
     if (!client) return;
+    if (update.room.id === state.spaceId && state.roomId) members.update(client.getRoom(state.roomId), client, client.userId, update.room);
     if (pendingBrowseSpace?.roomId === update.room.id) {
       state.spaceId = pendingBrowseSpace.spaceId;
       pendingBrowseSpace = null;
@@ -1322,7 +1349,7 @@ function startShell(promptRecovery = false): void {
       } else {
         chat.appendEvents(update.room, update.newEvents);
       }
-      members.update(update.room, client, client.userId);
+      members.update(update.room, client, client.userId, state.spaceId ? client.getRoom(state.spaceId) : null);
       chat.setCallState(
         ongoing,
         currentCallRoomId === update.room.id && (callMode === "livekit" ? lkManager.connected : callMode === "p2p" ? p2pManager.active : callManager.active)
@@ -1345,7 +1372,7 @@ function startShell(promptRecovery = false): void {
           const body = "body" in ev && typeof (ev as { body?: unknown }).body === "string"
             ? (ev as { body: string }).body
             : "";
-          if (sender && body) notifyForMessage(update.room.id, sender, body);
+          if (sender && body) notifyForMessage(update.room.id, sender, body, ev.mentions, ev.roomMention);
         }
       }
       /* receipts changed (someone read our messages) — re-render the
@@ -1409,7 +1436,7 @@ function startShell(promptRecovery = false): void {
 
   active.on("presence", () => {
     refreshSidebar();
-    members.update(state.roomId ? active.getRoom(state.roomId) : null, active, active.userId);
+    members.update(state.roomId ? active.getRoom(state.roomId) : null, active, active.userId, state.spaceId ? active.getRoom(state.spaceId) : null);
   });
 
   active.on("connection", (connState) => {
@@ -1428,6 +1455,7 @@ function startShell(promptRecovery = false): void {
       if (first) selectRoom(first.id);
     }
     refreshSidebar();
+    startupScreen.finish();
   });
 
   /* user footer */
@@ -1484,6 +1512,7 @@ async function boot(): Promise<void> {
       localStorage.setItem("grungus-settings-migrated", "1");
     } catch { /* Preserve the old preferences so migration can be retried on next launch. */ }
   }
+  startupScreen.show("Restoring your session…");
   const appearance = new SettingsStore();
   applyTheme(appearance.get("theme"));
   matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => applyTheme(new SettingsStore().get("theme")));
@@ -1506,11 +1535,12 @@ async function boot(): Promise<void> {
            layer needs the token's device id, not a stale client-generated
            one from an old store */
         client.deviceId = saved.deviceId ?? null;
+        startupScreen.show("Checking your session…");
         return client
           .whoami()
           .then(() => {
             const active = client;
-            if (active) return attachCrypto(active);
+            if (active) { startupScreen.show("Preparing encrypted conversations…"); return attachCrypto(active); }
             return undefined;
           })
           .then(() => {
@@ -1530,4 +1560,4 @@ async function boot(): Promise<void> {
     });
 }
 
-void boot();
+void boot().catch(error => { console.error("[grungus] startup failed:", error); startupScreen.fail(); });

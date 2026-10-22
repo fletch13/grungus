@@ -1,3 +1,4 @@
+import { roomManagement } from "./room-management.ts";
 import "./room-creation.ts";
 import { el } from "./ui.ts";
 import type { MatrixClient, Room } from "../services/matrix-client.ts";
@@ -84,6 +85,7 @@ export class RoomSettings extends HTMLElement {
       })().catch(error => { this.status.textContent = `${saved ? `${saved} changes saved before an error. ` : ""}Could not save: ${error instanceof Error ? error.message : "unknown error"}`; }).finally(() => { this.saving = false; this.setBusy(false); });
     });
     card.append(form);
+    roomManagement(card, room, client, this.power);
     if (room.isSpace) this.childrenSettings(card, access, history);
     this.append(card); close.focus();
   }
@@ -108,24 +110,20 @@ export class RoomSettings extends HTMLElement {
     });
     card.append(create);
 
-    const change = (roomId: string, add: boolean): void => {
+    const removeChild = (roomId: string): void => {
       if (this.busy) return; this.saving = true; this.setBusy(true);
       void (async () => {
         await this.authorized("m.space.child", room, client);
-        if (add) await client.addToSpace(room.id, roomId); else await client.removeFromSpace(room.id, roomId);
-        if (add) room.children.add(roomId); else room.children.delete(roomId);
+        await client.removeFromSpace(room.id, roomId);
+        room.children.delete(roomId);
         this.busy = false; if (!this.hidden) this.render(access, history);
       })().catch(error => { this.status.textContent = `Could not change space rooms: ${error instanceof Error ? error.message : "unknown error"}`; }).finally(() => { this.saving = false; this.setBusy(false); });
     };
     for (const id of this.room.children) {
       const remove = el("button", { type: "button", class: "call-btn", text: "Remove from space", disabled: !canEdit, "data-editable": canEdit });
-      remove.addEventListener("click", () => change(id, false));
+      remove.addEventListener("click", () => removeChild(id));
       card.append(el("div", { class: "room-info-row" }, el("span", { text: this.client.getRoom(id)?.title || id }), remove));
     }
-    const select = el("select", { class: "settings-input", "aria-label": "Add room to space", disabled: !canEdit, "data-editable": canEdit }) as HTMLSelectElement;
-    for (const room of this.client.getRooms().filter(room => !room.isDirect && !room.isSpace && !this.room.children.has(room.id))) select.append(el("option", { value: room.id, text: room.title }));
-    const add = el("button", { type: "button", class: "call-btn", text: "Add room", disabled: !canEdit || !select.options.length, "data-editable": canEdit && !!select.options.length });
-    add.addEventListener("click", () => { if (select.value) change(select.value, true); }); card.append(el("div", { class: "settings-row" }, select, add));
     card.append(el("p", { class: "settings-hint", text: "Removing a room from a space does not delete the room or remove its members." }));
   }
 }

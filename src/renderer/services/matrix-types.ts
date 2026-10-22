@@ -83,6 +83,9 @@ export interface MediaInfo {
 }
 
 export interface MessageItem {
+  pollEvent?: { type: string; content: Record<string, unknown> };
+  mentions?: string[];
+  roomMention?: boolean;
   threadRootId?: string;
   threadReplyCount?: number;
   kind: "message";
@@ -174,6 +177,8 @@ export interface Room {
   avatarMxc: string | null;
   isSpace: boolean;
   creator: string | null;
+  /** Current room/space permissions from sync, independent of child rooms. */
+  powerLevels?: import("./room-permissions.ts").RoomPowerLevels;
   joinRule: string | null;
   isEncrypted: boolean;
   encryptionAlgorithm: string | null;
