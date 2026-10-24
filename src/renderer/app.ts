@@ -34,10 +34,12 @@ import { CallManager, type CallUiState } from "./services/calls.ts";
 import { IncomingCall } from "./components/incoming-call.ts";
 import { LkCallManager, type LkCallState } from "./services/calls-livekit.ts";
 import { P2PCallManager } from "./services/calls-p2p.ts";
+import { discoverOAuth, beginDeviceLogin, pollDeviceLogin, type OAuthMetadata, type OAuthSession } from "./services/oauth.ts";
 import { VerificationManager, type SasUiState } from "./services/sas.ts";
 import { CrossSigning } from "./services/cross-signing.ts";
 
 export interface SavedSession {
+  oauth?: OAuthSession | null;
   baseUrl: string;
   userId: string | null;
   accessToken: string;
@@ -45,6 +47,7 @@ export interface SavedSession {
 }
 
 export interface GrungusPlatform {
+  openAuthBrowser?(url: string): Promise<void>;
   isElectron: boolean;
   loadLegacySettings?(): Promise<string | null>;
   saveSession(session: SavedSession): Promise<boolean>;
@@ -118,6 +121,8 @@ function showLogin(): void {
   if (!root) return;
   root.textContent = "";
   const view = el("login-view") as LoginView;
+  view.addEventListener("grungus:oauth", () => { void handleOAuthLogin(view); });
+  view.addEventListener("grungus:oauth-cancel", () => { oauthAbort?.abort(); oauthMetadata = null; });
   view.addEventListener("grungus:server-chosen", (event) => {
     handleServerChosen((event as CustomEvent<{ homeserver: string }>).detail, view);
   });
@@ -139,6 +144,44 @@ function showLogin(): void {
 
 /* The resolved homeserver + flows of the in-progress login. */
 let loginBaseUrl: string | null = null;
+let oauthMetadata: OAuthMetadata | null = null;
+let oauthAbort: AbortController | null = null;
+
+async function handleOAuthLogin(view: LoginView): Promise<void> {
+  if (!oauthMetadata || !loginBaseUrl) return;
+  oauthAbort?.abort();
+  const controller = new AbortController();
+  oauthAbort = controller;
+  const metadata = oauthMetadata;
+  const baseUrl = loginBaseUrl;
+  view.setBusy(true);
+  try {
+    const { clientId, deviceId, authorization } = await beginDeviceLogin(metadata, controller.signal);
+    controller.signal.throwIfAborted();
+    const url = authorization.verification_uri_complete ?? authorization.verification_uri;
+    view.showDeviceAuthorization(url, authorization.user_code);
+    // A link stays available if the browser cannot open automatically.
+    await window.grungusPlatform?.openAuthBrowser?.(url).catch(() => {});
+    const tokens = await pollDeviceLogin(metadata, clientId, authorization, controller.signal);
+    controller.signal.throwIfAborted();
+    const active = new MatrixClient({ baseUrl, accessToken: tokens.access_token });
+    active.deviceId = deviceId;
+    active.oauth = { clientId, tokenEndpoint: metadata.token_endpoint, revocationEndpoint: metadata.revocation_endpoint,
+      refreshToken: tokens.refresh_token, expiresAt: Date.now() + tokens.expires_in * 1000 };
+    await active.whoami();
+    controller.signal.throwIfAborted();
+    await finishLogin(baseUrl, active);
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    view.setBusy(false);
+    view.setStatus(`Browser sign-in failed: ${error instanceof Error ? error.message : "unknown error"}`, true);
+  }
+}
+
+function persistSession(active: MatrixClient): Promise<void> {
+  return storage.saveSession({ baseUrl: active.baseUrl, userId: active.userId, accessToken: active.accessToken ?? "",
+    deviceId: active.deviceId, oauth: active.oauth }).then(() => {});
+}
 
 async function handleServerChosen(
   detail: { homeserver: string },
@@ -149,13 +192,15 @@ async function handleServerChosen(
   try {
     loginBaseUrl = await MatrixClient.resolveBaseUrl(detail.homeserver);
     const probe = new MatrixClient({ baseUrl: loginBaseUrl });
+    oauthMetadata = await discoverOAuth(loginBaseUrl);
+    if (oauthMetadata) { view.showOAuth(); return; }
     const flows = await probe.loginFlows();
     view.setBusy(false);
     view.showFlows(loginBaseUrl, flows);
   } catch (err) {
     view.setBusy(false);
     view.setStatus(
-      `Could not reach the homeserver: ${err instanceof Error ? err.message : "unknown error"}`,
+      `Could not prepare sign-in: ${err instanceof Error ? err.message : "unknown error"}`,
       true
     );
   }
@@ -253,12 +298,14 @@ async function handleSsoLogin(idpId: string, view: LoginView): Promise<void> {
 async function finishLogin(baseUrl: string, activeClient: MatrixClient): Promise<void> {
   const active = activeClient;
   const session: SavedSession = {
+    oauth: active.oauth,
     baseUrl,
     userId: active.userId,
     accessToken: active.accessToken ?? "",
     deviceId: active.deviceId,
   };
   await storage.saveSession(session);
+  active.onSessionChanged = () => persistSession(active);
   client = active;
   await attachCrypto(active);
   startShell(true);
@@ -1535,6 +1582,9 @@ async function boot(): Promise<void> {
            layer needs the token's device id, not a stale client-generated
            one from an old store */
         client.deviceId = saved.deviceId ?? null;
+        client.oauth = saved.oauth ?? null;
+        const restored = client;
+        client.onSessionChanged = () => persistSession(restored);
         startupScreen.show("Checking your session…");
         return client
           .whoami()

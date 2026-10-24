@@ -25,6 +25,12 @@ if (SMOKE && process.env.GRUNGUS_SMOKE_PROFILE) app.setPath("userData", process.
 const DEBUG = process.argv.includes("--debug");
 const SESSION_FILE = "grungus-session.json";
 
+ipcMain.handle("oauth:open-browser", async (_event, value: string): Promise<void> => {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || url.username || url.password) throw new Error("Invalid sign-in URL");
+  await shell.openExternal(url.href);
+});
+
 function sessionPath(): string {
   return path.join(app.getPath("userData"), SESSION_FILE);
 }

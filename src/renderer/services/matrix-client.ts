@@ -1,5 +1,6 @@
 import type { TimelineItem } from "./matrix-types.ts";
 import { RoomFeatures } from "./room-features.ts";
+import { oauthRequest, validateTokens, type OAuthSession, type OAuthTokens } from "./oauth.ts";
 /*
  * Grungus — Matrix client facade and sync orchestration (TypeScript).
  *
@@ -61,6 +62,25 @@ function isLocalHost(host: string): boolean {
 /* --------------------------------- client -------------------------------- */
 
 export class MatrixClient {
+  oauth: OAuthSession | null = null;
+  onSessionChanged: (() => Promise<void>) | null = null;
+  private _refreshPromise: Promise<void> | null = null;
+
+  private async refreshOAuth(): Promise<void> {
+    if (this._refreshPromise) return this._refreshPromise;
+    const session = this.oauth;
+    if (!session?.refreshToken) return;
+    this._refreshPromise = (async () => {
+      const tokens = await oauthRequest<OAuthTokens>(session.tokenEndpoint, new URLSearchParams({
+        grant_type: "refresh_token", client_id: session.clientId, refresh_token: session.refreshToken!,
+      }));
+      validateTokens(tokens);
+      this.accessToken = tokens.access_token;
+      this.oauth = { ...session, refreshToken: tokens.refresh_token ?? session.refreshToken, expiresAt: Date.now() + tokens.expires_in * 1000 };
+      await this.onSessionChanged?.();
+    })().finally(() => { this._refreshPromise = null; });
+    return this._refreshPromise;
+  }
   readonly baseUrl: string;
   accessToken: string | null;
   userId: string | null;
@@ -254,6 +274,7 @@ export class MatrixClient {
     opts: ApiOptions = {}
   ): Promise<T> {
     const { body, auth = true, signal, timeoutMs = 35_000 } = opts;
+    if (auth && this.oauth && this.oauth.expiresAt <= Date.now() + 30_000) await this.refreshOAuth();
     const url = new URL(this.baseUrl + path);
     if (opts.query) {
       for (const [key, value] of Object.entries(opts.query)) {
@@ -488,11 +509,14 @@ export class MatrixClient {
 
   async logout(): Promise<void> {
     this.stopSync();
-    await this.api("POST", `${CLIENT_PREFIX}/logout`, { body: {} }).catch(() => {
+    this.onSessionChanged = null;
+    await this._refreshPromise?.catch(() => {});
+    await (this.oauth ? Promise.resolve() : this.api("POST", `${CLIENT_PREFIX}/logout`, { body: {} })).catch(() => {
       /* best effort — the token is being discarded anyway */
     });
     this.clearMediaCache();
     this.accessToken = null;
+    this.oauth = null;
     this._since = null;
   }
 

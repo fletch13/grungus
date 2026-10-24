@@ -517,6 +517,17 @@ same way Element signs them.
 
 ## Getting started
 
+OAuth-only homeservers are supported through browser device authorization
+(RFC 8628). After entering your homeserver, choose **Continue in browser**,
+check the displayed code, and approve sign-in with your account provider
+(for example Keycloak). Electron opens the system browser; web previews
+provide an **Open browser sign-in** link. You can cancel a pending sign-in.
+The server must advertise device authorization and dynamic client registration
+in `/_matrix/client/v1/auth_metadata`. Access tokens refresh automatically,
+and refresh tokens are saved with the existing session store.
+OAuth sign-out currently clears the local session; revoke the device in your
+server's account settings to invalidate its tokens on the server.
+
 ```bash
 npm install
 npm start        # production build + launch the desktop app

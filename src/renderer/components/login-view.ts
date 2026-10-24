@@ -31,6 +31,26 @@ export interface RegisterDetail {
 
 export class LoginView extends HTMLElement {
   private _busy = false;
+  private _oauth = false;
+
+  showOAuth(): void {
+    this._oauth = true;
+    this._busy = false;
+    this._render();
+  }
+
+  showDeviceAuthorization(url: string, code: string): void {
+    this.setStatus(`Enter code ${code} in your browser, then approve sign-in.`, false);
+    const status = this.querySelector(".login-status");
+    const link = el("a", { href: url, target: "_blank", rel: "noopener noreferrer", text: "Open browser sign-in" });
+    link.addEventListener("click", event => {
+      if (window.grungusPlatform?.openAuthBrowser) {
+        event.preventDefault();
+        void window.grungusPlatform.openAuthBrowser(url).catch(() => this.setStatus("Could not open your browser. Please try again.", true));
+      }
+    });
+    status?.append(el("p", {}, link));
+  }
   private _tokenMode = false;
   /** step 2 state, once the server's flows are known */
   private _flows: LoginFlow[] | null = null;
@@ -64,6 +84,7 @@ export class LoginView extends HTMLElement {
 
   /** Back to step 1 (e.g. after an error). */
   showServerStep(): void {
+    this._oauth = false;
     this._flows = null;
     this._baseUrl = null;
     this._register = null;
@@ -108,6 +129,17 @@ export class LoginView extends HTMLElement {
 
     if (this._register) {
       this._renderRegisterStep(form);
+    } else if (this._oauth) {
+      form.append(el("p", { class: "hint", text: "This homeserver uses browser sign-in. Continue to sign in with your account provider." }));
+      const button = el("button", { type: "button", class: "btn-primary", disabled: this._busy, text: this._busy ? "Waiting for browser sign-in…" : "Continue in browser" });
+      button.addEventListener("click", () => this.dispatchEvent(new CustomEvent("grungus:oauth", { bubbles: true })));
+      const back = el("button", { type: "button", class: "btn-sso", text: this._busy ? "Cancel sign-in" : "Use a different homeserver" });
+      back.addEventListener("click", () => {
+        this.dispatchEvent(new CustomEvent("grungus:oauth-cancel", { bubbles: true }));
+        this._busy = false;
+        this.showServerStep();
+      });
+      form.append(button, back);
     } else if (!this._flows) {
       this._renderServerStep(form);
     } else {
